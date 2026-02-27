@@ -1,0 +1,21 @@
+# Lefthook configuration for Rust project
+# https://lefthook.dev/configuration/
+pre-commit:
+  parallel: true
+  jobs:
+    - name: format
+      glob: "*.rs"
+      run: cargo fmt -- --check
+    - name: clippy
+      glob: "*.rs"
+      run: cargo clippy --all-targets -- -D warnings
+    - name: typos
+      run: typos
+pre-push:
+  parallel: true
+  jobs:
+    - name: test
+      run: cargo test
+    - name: clippy-pedantic
+      glob: "*.rs"
+      run: cargo clippy -- -W clippy::pedantic
