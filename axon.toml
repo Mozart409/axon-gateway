@@ -1,0 +1,55 @@
+# MCP Gateway Configuration
+#
+# This config defines which MCP servers to aggregate and how to connect to them.
+
+[gateway]
+# Address to bind the gateway server
+bind = "0.0.0.0:8080"
+
+# Optional: require Bearer token auth
+# auth_token = "your-secret-token-here"
+
+# --- Backend MCP Servers ---
+# Each backend gets a namespace prefix for its tools.
+# e.g., homeassistant's "turn_on" becomes "homeassistant_turn_on"
+
+[[backends]]
+name = "homeassistant"
+url = "http://localhost:3001/mcp/sse"
+transport = "sse"
+enabled = true
+
+[[backends]]
+name = "jellyfin"
+url = "http://localhost:3002/mcp"
+transport = "http"
+enabled = true
+
+[[backends]]
+name = "proxmox"
+url = "http://localhost:3003/mcp/sse"
+transport = "sse"
+enabled = true
+
+# Example: stdio-based MCP server (local binary)
+# [[backends]]
+# name = "filesystem"
+# command = "/usr/local/bin/mcp-filesystem"
+# args = ["--root", "/data"]
+# transport = "stdio"
+# enabled = true
+
+# Example: disabled backend (kept for reference)
+# [[backends]]
+# name = "experimental"
+# url = "http://localhost:9999/mcp"
+# transport = "http"
+# enabled = false
+
+# Example: backend with tool filtering
+# [[backends]]
+# name = "docker"
+# url = "http://localhost:3004/mcp"
+# transport = "http"
+# allowed_tools = ["list_containers", "get_logs"]  # only expose these
+# enabled = true
