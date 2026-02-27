@@ -8,9 +8,8 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 
 # MCP protocol
-rmcp = { version = "0.1", features = ["client", "server", "transport-sse", "transport-http"] }
+rmcp = { version = "0.17.0", features = ["client", "server", "transport-io", "transport-streamable-http-server", "schemars" ]}
 
-# Actor framework (your preference)
 kameo = "0.13"
 
 # Web framework for SSE endpoint
@@ -31,7 +30,8 @@ dashmap = "6"           # Concurrent hashmap for registry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-anyhow = "1"
 futures = "0.3"
 async-stream = "0.3"
-uuid = { version = "1", features = ["v4"] }
+ulid = { version = "1.2.1", features = ["serde"] }
+color-eyre = "0.6.5"
+chrono = { version = "0.4.44", features = ["serde"] }
