@@ -23,6 +23,7 @@
 //! transport = "stdio"
 //! ```
 
+use crate::error::ConfigError;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -55,6 +56,7 @@ pub struct BackendConfig {
 
     /// Optional: only expose specific tools (empty = all)
     #[serde(default)]
+    #[allow(dead_code)]
     pub allowed_tools: Vec<String>,
 
     /// Optional: disable this backend without removing from config
@@ -85,31 +87,29 @@ pub enum TransportType {
 }
 
 impl Config {
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         config.validate()?;
         Ok(config)
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    fn validate(&self) -> Result<(), ConfigError> {
         for backend in &self.backends {
             match backend.transport {
                 TransportType::Sse | TransportType::Http => {
                     if backend.url.is_none() {
-                        anyhow::bail!(
-                            "Backend '{}' uses {:?} transport but has no url",
-                            backend.name,
-                            backend.transport
-                        );
+                        return Err(ConfigError::MissingUrl {
+                            name: backend.name.clone(),
+                            transport: backend.transport,
+                        });
                     }
                 }
                 TransportType::Stdio => {
                     if backend.command.is_none() {
-                        anyhow::bail!(
-                            "Backend '{}' uses stdio transport but has no command",
-                            backend.name
-                        );
+                        return Err(ConfigError::MissingCommand {
+                            name: backend.name.clone(),
+                        });
                     }
                 }
             }

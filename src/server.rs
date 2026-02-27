@@ -6,6 +6,7 @@
 //! - GET /health - Health check
 //! - GET /status - Gateway status
 
+use crate::error::ServerError;
 use crate::gateway::{GatewayActor, GetStatus, HandleRequest};
 use crate::types::JsonRpcRequest;
 use axum::{
@@ -19,10 +20,9 @@ use axum::{
     routing::{get, post},
 };
 use futures::stream::{self, Stream};
-use kameo::prelude::*;
+use kameo::actor::ActorRef;
 use serde_json::json;
-use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio::sync::broadcast;
+use std::{convert::Infallible, time::Duration};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -78,7 +78,7 @@ async fn handle_mcp_request(
         .ask(HandleRequest { request })
         .await
         .map_err(|e| {
-            tracing::error!("Gateway error: {}", e);
+            tracing::error!("Gateway error: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -117,7 +117,7 @@ async fn health_check() -> impl IntoResponse {
 /// Gateway status endpoint
 async fn get_status(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
     let status = state.gateway.ask(GetStatus).await.map_err(|e| {
-        tracing::error!("Failed to get status: {}", e);
+        tracing::error!("Failed to get status: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -125,10 +125,15 @@ async fn get_status(State(state): State<AppState>) -> Result<impl IntoResponse, 
 }
 
 /// Start the HTTP server
-pub async fn serve(state: AppState, bind: &str) -> anyhow::Result<()> {
+pub async fn serve(state: AppState, bind: &str) -> Result<(), ServerError> {
     let router = create_router(state);
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|source| ServerError::BindFailed {
+            address: bind.to_string(),
+            source,
+        })?;
     tracing::info!("MCP Gateway listening on {}", bind);
 
     axum::serve(listener, router).await?;

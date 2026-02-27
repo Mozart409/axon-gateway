@@ -7,9 +7,10 @@
 
 use crate::config::{BackendConfig, TransportType};
 use crate::registry::{RegistryActor, UpdateBackend};
-use crate::types::{BackendState, JsonRpcRequest, JsonRpcResponse, ToolDefinition};
-use kameo::prelude::*;
-use std::time::Duration;
+use crate::types::{BackendState, ToolDefinition};
+use kameo::actor::{Actor, ActorRef};
+use kameo::error::BoxError;
+use kameo::message::{Context, Message};
 
 /// Actor managing a single backend MCP server connection
 pub struct BackendActor {
@@ -30,7 +31,7 @@ impl BackendActor {
     }
 
     /// Connect to the backend MCP server
-    async fn connect(&mut self) -> anyhow::Result<()> {
+    async fn connect(&mut self) -> Result<(), BoxError> {
         self.state = BackendState::Connecting;
         tracing::info!("Connecting to backend: {}", self.config.name);
 
@@ -69,13 +70,14 @@ impl BackendActor {
                 tools,
                 error: None,
             })
-            .await?;
+            .await
+            .map_err(|e| Box::new(e) as BoxError)?;
 
         Ok(())
     }
 
     /// Fetch tool list from the backend
-    async fn fetch_tools(&self) -> anyhow::Result<Vec<ToolDefinition>> {
+    async fn fetch_tools(&self) -> Result<Vec<ToolDefinition>, BoxError> {
         // TODO: Replace with actual MCP tools/list call
         // let response = self.client.request("tools/list", json!({})).await?;
 
@@ -153,7 +155,7 @@ impl BackendActor {
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> Result<serde_json::Value, BoxError> {
         // TODO: Replace with actual MCP tools/call
         // let response = self.client.request("tools/call", json!({
         //     "name": tool_name,
@@ -178,9 +180,9 @@ impl BackendActor {
 }
 
 impl Actor for BackendActor {
-    type Error = anyhow::Error;
+    type Mailbox = kameo::mailbox::unbounded::UnboundedMailbox<Self>;
 
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), Self::Error> {
+    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         tracing::info!("Backend actor started: {}", self.config.name);
 
         // Initial connection
@@ -194,7 +196,8 @@ impl Actor for BackendActor {
                     tools: vec![],
                     error: Some(e.to_string()),
                 })
-                .await?;
+                .await
+                .map_err(|e| Box::new(e) as BoxError)?;
 
             // Schedule reconnect
             // actor_ref.tell_delayed(Reconnect, Duration::from_secs(5)).await;
@@ -216,21 +219,14 @@ pub struct CallTool {
 impl Message<CallTool> for BackendActor {
     type Reply = Result<serde_json::Value, String>;
 
-    async fn handle(
-        &mut self,
-        msg: CallTool,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
+    async fn handle(&mut self, msg: CallTool, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         if self.state != BackendState::Connected {
-            return Ok(Err(format!(
-                "Backend '{}' is not connected",
-                self.config.name
-            )));
+            return Err(format!("Backend '{}' is not connected", self.config.name));
         }
 
         match self.call_tool(&msg.tool_name, msg.arguments).await {
-            Ok(result) => Ok(Ok(result)),
-            Err(e) => Ok(Err(e.to_string())),
+            Ok(result) => Ok(result),
+            Err(e) => Err(e.to_string()),
         }
     }
 }
@@ -244,15 +240,14 @@ impl Message<Reconnect> for BackendActor {
     async fn handle(
         &mut self,
         _msg: Reconnect,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
-        if self.state != BackendState::Connected {
-            if let Err(e) = self.connect().await {
-                tracing::warn!("Reconnect failed for {}: {}", self.config.name, e);
-                // Would schedule another reconnect here
-            }
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.state != BackendState::Connected
+            && let Err(e) = self.connect().await
+        {
+            tracing::warn!("Reconnect failed for {}: {}", self.config.name, e);
+            // Would schedule another reconnect here
         }
-        Ok(())
     }
 }
 
@@ -265,8 +260,8 @@ impl Message<HealthCheck> for BackendActor {
     async fn handle(
         &mut self,
         _msg: HealthCheck,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
-        Ok(self.state)
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.state
     }
 }

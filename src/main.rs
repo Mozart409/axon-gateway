@@ -8,11 +8,13 @@
 
 mod backend;
 mod config;
+mod error;
 mod gateway;
 mod registry;
 mod server;
 mod types;
 
+use color_eyre::eyre::{Result, WrapErr};
 use config::Config;
 use gateway::GatewayActor;
 use registry::RegistryActor;
@@ -20,7 +22,10 @@ use server::AppState;
 use std::env;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
+    // Install color_eyre for pretty error reporting
+    color_eyre::install()?;
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -39,7 +44,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "config.toml".to_string());
 
     tracing::info!("Loading config from: {}", config_path);
-    let config = Config::load(&config_path)?;
+    let config = Config::load(&config_path)
+        .wrap_err_with(|| format!("failed to load config from '{}'", config_path))?;
 
     let bind_addr = config.gateway.bind.clone();
     let auth_token = config.gateway.auth_token.clone();
@@ -59,7 +65,9 @@ async fn main() -> anyhow::Result<()> {
         auth_token,
     };
 
-    server::serve(state, &bind_addr).await?;
+    server::serve(state, &bind_addr)
+        .await
+        .wrap_err_with(|| format!("failed to start server on '{}'", bind_addr))?;
 
     Ok(())
 }

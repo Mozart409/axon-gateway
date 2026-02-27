@@ -7,7 +7,9 @@
 
 use crate::types::{BackendInfo, BackendState, NamespacedTool, ToolDefinition};
 use dashmap::DashMap;
-use kameo::prelude::*;
+use kameo::actor::{Actor, ActorRef};
+use kameo::error::BoxError;
+use kameo::message::{Context, Message};
 use std::sync::Arc;
 
 /// The registry actor
@@ -28,9 +30,9 @@ impl RegistryActor {
 }
 
 impl Actor for RegistryActor {
-    type Error = anyhow::Error;
+    type Mailbox = kameo::mailbox::unbounded::UnboundedMailbox<Self>;
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), Self::Error> {
+    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         tracing::info!("Registry actor started");
         Ok(())
     }
@@ -50,8 +52,8 @@ impl Message<RegisterBackend> for RegistryActor {
     async fn handle(
         &mut self,
         msg: RegisterBackend,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
         self.backends.insert(
             msg.name.clone(),
             BackendInfo {
@@ -61,7 +63,6 @@ impl Message<RegisterBackend> for RegistryActor {
                 last_error: None,
             },
         );
-        Ok(())
     }
 }
 
@@ -80,8 +81,8 @@ impl Message<UpdateBackend> for RegistryActor {
     async fn handle(
         &mut self,
         msg: UpdateBackend,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
         // Remove old tool routes for this backend
         self.tool_routing.retain(|_, backend| backend != &msg.name);
 
@@ -107,8 +108,6 @@ impl Message<UpdateBackend> for RegistryActor {
                 last_error: msg.error,
             },
         );
-
-        Ok(())
     }
 }
 
@@ -121,17 +120,22 @@ impl Message<ListTools> for RegistryActor {
     async fn handle(
         &mut self,
         _msg: ListTools,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
         let tools: Vec<ToolDefinition> = self
             .backends
             .iter()
             .filter(|b| b.state == BackendState::Connected)
-            .flat_map(|b| b.tools.iter().map(|t| t.definition.clone()))
+            .flat_map(|b| {
+                b.tools
+                    .iter()
+                    .map(|t| t.definition.clone())
+                    .collect::<Vec<_>>()
+            })
             .collect();
 
         tracing::debug!("Listing {} tools from all backends", tools.len());
-        Ok(tools)
+        tools
     }
 }
 
@@ -152,25 +156,22 @@ impl Message<ResolveToolBackend> for RegistryActor {
     async fn handle(
         &mut self,
         msg: ResolveToolBackend,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
         // Find the backend for this tool
-        if let Some(backend_name) = self.tool_routing.get(&msg.namespaced_tool_name) {
-            // Find the original tool name
-            if let Some(backend) = self.backends.get(backend_name.value()) {
-                if let Some(tool) = backend
-                    .tools
-                    .iter()
-                    .find(|t| t.namespaced_name == msg.namespaced_tool_name)
-                {
-                    return Ok(Some(ToolRoute {
-                        backend_name: backend_name.clone(),
-                        original_tool_name: tool.original_name.clone(),
-                    }));
-                }
-            }
+        if let Some(backend_name) = self.tool_routing.get(&msg.namespaced_tool_name)
+            && let Some(backend) = self.backends.get(backend_name.value())
+            && let Some(tool) = backend
+                .tools
+                .iter()
+                .find(|t| t.namespaced_name == msg.namespaced_tool_name)
+        {
+            return Some(ToolRoute {
+                backend_name: backend_name.clone(),
+                original_tool_name: tool.original_name.clone(),
+            });
         }
-        Ok(None)
+        None
     }
 }
 
@@ -183,8 +184,8 @@ impl Message<GetBackendStatus> for RegistryActor {
     async fn handle(
         &mut self,
         _msg: GetBackendStatus,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
-        Ok(self.backends.iter().map(|r| r.value().clone()).collect())
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.backends.iter().map(|r| r.value().clone()).collect()
     }
 }

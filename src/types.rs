@@ -1,7 +1,7 @@
 //! Core types for the MCP Gateway
 
+use kameo::Reply;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// A tool definition as returned by MCP servers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +14,7 @@ pub struct ToolDefinition {
 
 /// A namespaced tool with routing info
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NamespacedTool {
     /// Original tool name from backend
     pub original_name: String,
@@ -51,7 +52,7 @@ pub struct JsonRpcRequest {
 }
 
 /// MCP JSON-RPC response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Reply)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
     pub id: serde_json::Value,
@@ -94,7 +95,7 @@ impl JsonRpcResponse {
 }
 
 /// Backend connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Reply)]
 pub enum BackendState {
     Disconnected,
     Connecting,
@@ -104,6 +105,7 @@ pub enum BackendState {
 
 /// Info about a connected backend
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BackendInfo {
     pub name: String,
     pub state: BackendState,

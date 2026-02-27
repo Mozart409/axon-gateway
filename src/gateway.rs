@@ -8,8 +8,10 @@
 use crate::backend::{BackendActor, CallTool};
 use crate::config::Config;
 use crate::registry::{ListTools, RegisterBackend, RegistryActor, ResolveToolBackend, ToolRoute};
-use crate::types::{JsonRpcRequest, JsonRpcResponse, ToolDefinition};
-use kameo::prelude::*;
+use crate::types::{JsonRpcRequest, JsonRpcResponse};
+use kameo::actor::{Actor, ActorRef};
+use kameo::error::BoxError;
+use kameo::message::{Context, Message};
 use std::collections::HashMap;
 
 /// The main gateway actor
@@ -29,7 +31,7 @@ impl GatewayActor {
     }
 
     /// Initialize all backends from config
-    async fn init_backends(&mut self) -> anyhow::Result<()> {
+    async fn init_backends(&mut self) -> Result<(), BoxError> {
         for backend_config in &self.config.backends {
             if !backend_config.enabled {
                 tracing::info!("Skipping disabled backend: {}", backend_config.name);
@@ -41,7 +43,8 @@ impl GatewayActor {
                 .tell(RegisterBackend {
                     name: backend_config.name.clone(),
                 })
-                .await?;
+                .await
+                .map_err(|e| Box::new(e) as BoxError)?;
 
             // Spawn backend actor
             let backend_actor = BackendActor::new(backend_config.clone(), self.registry.clone());
@@ -57,9 +60,9 @@ impl GatewayActor {
 }
 
 impl Actor for GatewayActor {
-    type Error = anyhow::Error;
+    type Mailbox = kameo::mailbox::unbounded::UnboundedMailbox<Self>;
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), Self::Error> {
+    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         tracing::info!("Gateway actor starting...");
         self.init_backends().await?;
         tracing::info!("Gateway ready with {} backends", self.backends.len());
@@ -81,13 +84,13 @@ impl Message<HandleRequest> for GatewayActor {
     async fn handle(
         &mut self,
         msg: HandleRequest,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
         let request = msg.request;
 
         tracing::debug!("Handling MCP request: {}", request.method);
 
-        let response = match request.method.as_str() {
+        match request.method.as_str() {
             // Initialize handshake
             "initialize" => JsonRpcResponse::success(
                 request.id,
@@ -104,16 +107,19 @@ impl Message<HandleRequest> for GatewayActor {
             ),
 
             // List all tools from all backends
-            "tools/list" => {
-                let tools: Vec<ToolDefinition> = self.registry.ask(ListTools).await?;
-
-                JsonRpcResponse::success(
+            "tools/list" => match self.registry.ask(ListTools).await {
+                Ok(tools) => JsonRpcResponse::success(
                     request.id,
                     serde_json::json!({
                         "tools": tools
                     }),
-                )
-            }
+                ),
+                Err(e) => JsonRpcResponse::error(
+                    request.id,
+                    -32000,
+                    format!("Failed to list tools: {}", e),
+                ),
+            },
 
             // Execute a tool
             "tools/call" => {
@@ -129,12 +135,22 @@ impl Message<HandleRequest> for GatewayActor {
                     .unwrap_or(serde_json::json!({}));
 
                 // Resolve which backend handles this tool
-                let route = self
+                let route = match self
                     .registry
                     .ask(ResolveToolBackend {
                         namespaced_tool_name: tool_name.clone(),
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(route) => route,
+                    Err(e) => {
+                        return JsonRpcResponse::error(
+                            request.id,
+                            -32000,
+                            format!("Failed to resolve tool: {}", e),
+                        );
+                    }
+                };
 
                 match route {
                     Some(ToolRoute {
@@ -144,16 +160,19 @@ impl Message<HandleRequest> for GatewayActor {
                         // Get the backend actor
                         if let Some(backend) = self.backends.get(&backend_name) {
                             // Forward the call
-                            let result = backend
+                            match backend
                                 .ask(CallTool {
                                     tool_name: original_tool_name,
                                     arguments,
                                 })
-                                .await?;
-
-                            match result {
+                                .await
+                            {
                                 Ok(content) => JsonRpcResponse::success(request.id, content),
-                                Err(e) => JsonRpcResponse::error(request.id, -32000, e),
+                                Err(e) => JsonRpcResponse::error(
+                                    request.id,
+                                    -32000,
+                                    format!("Failed to call backend: {}", e),
+                                ),
                             }
                         } else {
                             JsonRpcResponse::error(
@@ -182,16 +201,14 @@ impl Message<HandleRequest> for GatewayActor {
                 -32601,
                 format!("Method not found: {}", request.method),
             ),
-        };
-
-        Ok(response)
+        }
     }
 }
 
 /// Get gateway status
 pub struct GetStatus;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, kameo::Reply)]
 pub struct GatewayStatus {
     pub backend_count: usize,
     pub backends: Vec<String>,
@@ -203,11 +220,11 @@ impl Message<GetStatus> for GatewayActor {
     async fn handle(
         &mut self,
         _msg: GetStatus,
-        _ctx: &mut Context<Self>,
-    ) -> Result<Self::Reply, Self::Error> {
-        Ok(GatewayStatus {
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        GatewayStatus {
             backend_count: self.backends.len(),
             backends: self.backends.keys().cloned().collect(),
-        })
+        }
     }
 }
