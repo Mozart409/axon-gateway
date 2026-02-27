@@ -44,6 +44,7 @@
           docker-compose
           sqlx-cli
           opencode
+          typos
         ];
         shellHook = ''
           lefthook install
