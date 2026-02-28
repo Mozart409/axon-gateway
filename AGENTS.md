@@ -1,0 +1,125 @@
+# Agent Guidelines for Axon Gateway
+
+## Project Overview
+
+A self-hosted MCP (Model Context Protocol) gateway written in Rust that aggregates multiple MCP servers into a single endpoint. Uses actor-based architecture with kameo.
+
+## Build/Test Commands
+
+```bash
+# Build the project
+cargo build
+
+# Run all tests
+cargo test
+
+# Run a single test
+cargo test <test_name>
+
+# Run clippy (standard)
+cargo clippy
+
+# Run clippy with pedantic warnings (as configured in lefthook.yml)
+cargo clippy -- -W clippy::pedantic
+
+# Format code
+cargo fmt
+
+# Check all targets with clippy
+cargo clippy --all-targets -- -D warnings
+
+# Run bacon (background code checker)
+bacon
+# or with specific job:
+bacon clippy-all
+bacon pedantic
+```
+
+## Code Style Guidelines
+
+### Imports
+- Group imports: std library, external crates, internal modules
+- Use `use crate::` for internal modules
+- Prefer explicit imports over `use super::*` or glob imports
+- Order: std → external crates → internal (separated by blank lines)
+
+### Formatting
+- Use `cargo fmt` for automatic formatting
+- 4 spaces for indentation
+- Line length: standard Rust (100 chars recommended)
+- Trailing commas in multi-line structs/arrays
+- Comments: `//` for single line, `//!` for module docs, `///` for item docs
+
+### Naming Conventions
+- **Types**: PascalCase (`GatewayActor`, `BackendConfig`)
+- **Functions/Methods**: snake_case (`handle_request`, `fetch_tools`)
+- **Variables**: snake_case (`tool_name`, `backend_config`)
+- **Constants**: UPPER_SNAKE_CASE (if any)
+- **Actors**: Suffix with `Actor` (`GatewayActor`, `BackendActor`, `RegistryActor`)
+- **Messages**: PascalCase verb/noun (`HandleRequest`, `RegisterBackend`, `CallTool`)
+
+### Types & Error Handling
+- Use `color_eyre::eyre::Result` for main application errors
+- Use `thiserror` for structured internal error types
+- Return `Result<T, String>` for actor message replies that may fail
+- Use `BoxError` (from kameo) for actor lifecycle errors
+- Format strings: inline variables (`format!("{tool_name}")` not `format!("{}", tool_name)`)
+- Clone with `clone_from()` instead of assignment when applicable
+
+### Actor Pattern (kameo)
+- Each actor implements `Actor` trait with `Mailbox` type
+- Messages implement `Message<M>` trait with associated `Reply` type
+- Use `ask()` for requests needing reply, `tell()` for fire-and-forget
+- Actor handlers: `async fn handle(&mut self, msg: M, _ctx: Context) -> Self::Reply`
+- Implement `on_start()` for initialization logic
+- Allow clippy exceptions where needed: `#[allow(clippy::too_many_lines)]`
+
+### Architecture
+- **main.rs**: Entry point, CLI parsing, actor spawning
+- **gateway.rs**: GatewayActor - orchestrates MCP protocol handling
+- **backend.rs**: BackendActor - per-MCP-server connection management
+- **registry.rs**: RegistryActor - tool aggregation and routing
+- **server.rs**: HTTP server (axum) - endpoints and request handling
+- **config.rs**: Config types and TOML parsing
+- **types.rs**: Core domain types (ToolDefinition, JsonRpc, etc.)
+- **error.rs**: Error types using thiserror
+
+### Code Patterns
+- Use `#[serde(rename_all = "lowercase")]` for enums in configs
+- Use `#[serde(default)]` for optional config fields with defaults
+- Implement `Default` for config structs with sensible defaults
+- Use `DashMap` for concurrent access in registry
+- Use `tracing` for structured logging
+- Comments for modules use `//!`, items use `///`
+- Backticks around code identifiers in docs: `` `BackendInfo` ``
+
+### Testing
+- Unit tests: inline in source files with `#[cfg(test)]`
+- Integration tests: in `tests/` directory
+- Run single test: `cargo test test_name`
+
+### Pre-commit Checks
+Lefthook runs automatically on commit:
+- `cargo fmt` - format code
+- `cargo clippy --all-targets -- -D warnings` - lint check
+- `typos` - spell check
+
+Pre-push:
+- `cargo test` - run all tests
+- `cargo clippy -- -W clippy::pedantic` - pedantic lint check
+
+### Dependencies
+- **Async**: tokio (full features)
+- **Actors**: kameo (0.13)
+- **MCP Protocol**: rmcp (0.17.0)
+- **Web**: axum (0.8), tower-http (0.6)
+- **Serialization**: serde, serde_json, toml
+- **Errors**: thiserror, color-eyre
+- **Logging**: tracing, tracing-subscriber
+- **Utils**: dashmap, futures, chrono, ulid
+
+## Important Notes
+- Edition 2024 is used
+- No lib.rs - this is a binary-only crate
+- Mock implementations in backend.rs need to be replaced with real rmcp client
+- Config file is TOML format with sections `[gateway]` and `[[backends]]`
