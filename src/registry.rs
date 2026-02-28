@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 /// The registry actor
 pub struct RegistryActor {
-    /// Backend name -> BackendInfo
+    /// Backend name -> `BackendInfo`
     backends: Arc<DashMap<String, BackendInfo>>,
     /// Namespaced tool name -> backend name (for routing)
     tool_routing: Arc<DashMap<String, String>>,

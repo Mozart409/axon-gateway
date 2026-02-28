@@ -60,7 +60,7 @@ impl BackendActor {
         self.state = BackendState::Connected;
 
         // Fetch tools from backend
-        let tools = self.fetch_tools().await?;
+        let tools = self.fetch_tools();
 
         // Update registry
         self.registry
@@ -77,7 +77,7 @@ impl BackendActor {
     }
 
     /// Fetch tool list from the backend
-    async fn fetch_tools(&self) -> Result<Vec<ToolDefinition>, BoxError> {
+    fn fetch_tools(&self) -> Vec<ToolDefinition> {
         // TODO: Replace with actual MCP tools/list call
         // let response = self.client.request("tools/list", json!({})).await?;
 
@@ -147,15 +147,11 @@ impl BackendActor {
             self.config.name,
             mock_tools.len()
         );
-        Ok(mock_tools)
+        mock_tools
     }
 
     /// Forward a tool call to this backend
-    async fn call_tool(
-        &self,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> Result<serde_json::Value, BoxError> {
+    fn call_tool(&self, tool_name: &str, arguments: &serde_json::Value) -> serde_json::Value {
         // TODO: Replace with actual MCP tools/call
         // let response = self.client.request("tools/call", json!({
         //     "name": tool_name,
@@ -170,12 +166,12 @@ impl BackendActor {
             arguments
         );
 
-        Ok(serde_json::json!({
+        serde_json::json!({
             "content": [{
                 "type": "text",
                 "text": format!("Mock result from {}::{}", self.config.name, tool_name)
             }]
-        }))
+        })
     }
 }
 
@@ -224,10 +220,7 @@ impl Message<CallTool> for BackendActor {
             return Err(format!("Backend '{}' is not connected", self.config.name));
         }
 
-        match self.call_tool(&msg.tool_name, msg.arguments).await {
-            Ok(result) => Ok(result),
-            Err(e) => Err(e.to_string()),
-        }
+        Ok(self.call_tool(&msg.tool_name, &msg.arguments))
     }
 }
 

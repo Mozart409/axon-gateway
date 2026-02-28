@@ -49,7 +49,7 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 /// Verify auth token if configured
-fn verify_auth(headers: &HeaderMap, expected: &Option<String>) -> Result<(), StatusCode> {
+fn verify_auth(headers: &HeaderMap, expected: Option<&String>) -> Result<(), StatusCode> {
     if let Some(token) = expected {
         let auth_header = headers
             .get("authorization")
@@ -71,7 +71,7 @@ async fn handle_mcp_request(
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, state.auth_token.as_ref())?;
 
     let response = state
         .gateway
@@ -96,7 +96,7 @@ async fn handle_mcp_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    verify_auth(&headers, &state.auth_token)?;
+    verify_auth(&headers, state.auth_token.as_ref())?;
 
     // For SSE transport, we send an initial "endpoint" message
     // Real implementation would maintain a session and stream responses

@@ -30,7 +30,7 @@ impl NamespacedTool {
     pub fn new(backend_name: &str, tool: ToolDefinition) -> Self {
         let namespaced_name = format!("{}_{}", backend_name, tool.name);
         let mut namespaced_def = tool.clone();
-        namespaced_def.name = namespaced_name.clone();
+        namespaced_def.name.clone_from(&namespaced_name);
 
         Self {
             original_name: tool.name,

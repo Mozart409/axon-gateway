@@ -81,6 +81,7 @@ pub struct HandleRequest {
 impl Message<HandleRequest> for GatewayActor {
     type Reply = JsonRpcResponse;
 
+    #[allow(clippy::too_many_lines)]
     async fn handle(
         &mut self,
         msg: HandleRequest,
@@ -114,11 +115,9 @@ impl Message<HandleRequest> for GatewayActor {
                         "tools": tools
                     }),
                 ),
-                Err(e) => JsonRpcResponse::error(
-                    request.id,
-                    -32000,
-                    format!("Failed to list tools: {}", e),
-                ),
+                Err(e) => {
+                    JsonRpcResponse::error(request.id, -32000, format!("Failed to list tools: {e}"))
+                }
             },
 
             // Execute a tool
@@ -147,7 +146,7 @@ impl Message<HandleRequest> for GatewayActor {
                         return JsonRpcResponse::error(
                             request.id,
                             -32000,
-                            format!("Failed to resolve tool: {}", e),
+                            format!("Failed to resolve tool: {e}"),
                         );
                     }
                 };
@@ -171,21 +170,21 @@ impl Message<HandleRequest> for GatewayActor {
                                 Err(e) => JsonRpcResponse::error(
                                     request.id,
                                     -32000,
-                                    format!("Failed to call backend: {}", e),
+                                    format!("Failed to call backend: {e}"),
                                 ),
                             }
                         } else {
                             JsonRpcResponse::error(
                                 request.id,
                                 -32000,
-                                format!("Backend '{}' not available", backend_name),
+                                format!("Backend '{backend_name}' not available"),
                             )
                         }
                     }
                     None => JsonRpcResponse::error(
                         request.id,
                         -32601,
-                        format!("Unknown tool: {}", tool_name),
+                        format!("Unknown tool: {tool_name}"),
                     ),
                 }
             }

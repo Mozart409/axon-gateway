@@ -4,7 +4,7 @@
 //!   mcp-gateway --config config.toml
 //!
 //! Or with environment variable:
-//!   MCP_GATEWAY_CONFIG=config.toml mcp-gateway
+//!   `MCP_GATEWAY_CONFIG=config.toml` mcp-gateway
 
 mod backend;
 mod config;
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("Loading config from: {}", config_path);
     let config = Config::load(&config_path)
-        .wrap_err_with(|| format!("failed to load config from '{}'", config_path))?;
+        .wrap_err_with(|| format!("failed to load config from '{config_path}'"))?;
 
     let bind_addr = config.gateway.bind.clone();
     let auth_token = config.gateway.auth_token.clone();
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
 
     server::serve(state, &bind_addr)
         .await
-        .wrap_err_with(|| format!("failed to start server on '{}'", bind_addr))?;
+        .wrap_err_with(|| format!("failed to start server on '{bind_addr}'"))?;
 
     Ok(())
 }
