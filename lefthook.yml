@@ -5,7 +5,7 @@ pre-commit:
   jobs:
     - name: format
       glob: "*.rs"
-      run: cargo fmt -- --check
+      run: cargo fmt
     - name: clippy
       glob: "*.rs"
       run: cargo clippy --all-targets -- -D warnings
