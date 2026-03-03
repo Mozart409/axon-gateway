@@ -8,13 +8,20 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 
 # MCP protocol
-rmcp = { version = "0.17.0", features = ["client", "server", "transport-io", "transport-streamable-http-server", "schemars" ]}
+rmcp = { version = "0.17.0", features = [
+    "client",
+    "server",
+    "transport-io",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+    "schemars",
+]}
 
 kameo = "0.13"
 
 # Web framework for SSE endpoint
 axum = { version = "0.8", features = ["macros"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
@@ -31,7 +38,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 futures = "0.3"
-async-stream = "0.3"
-ulid = { version = "1.2.1", features = ["serde"] }
 color-eyre = "0.6.5"
-chrono = { version = "0.4.44", features = ["serde"] }
