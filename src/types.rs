@@ -109,20 +109,46 @@ impl JsonRpcResponse {
 }
 
 /// Backend connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Reply)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Reply, Serialize)]
 pub enum BackendState {
     Disconnected,
     Connecting,
     Connected,
     Failed,
+    /// Circuit breaker is open due to repeated failures
+    CircuitOpen,
+    /// Reconnecting after failure with exponential backoff
+    Reconnecting,
 }
 
 /// Info about a connected backend
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BackendInfo {
     pub name: String,
     pub state: BackendState,
+    #[serde(skip_serializing)]
     pub tools: Vec<NamespacedTool>,
+    /// Number of tools (serialized instead of full tool list)
+    #[serde(rename = "tool_count")]
+    pub tool_count: usize,
     pub last_error: Option<String>,
+}
+
+impl BackendInfo {
+    /// Create a new `BackendInfo` with computed tool count
+    pub fn new(
+        name: String,
+        state: BackendState,
+        tools: Vec<NamespacedTool>,
+        last_error: Option<String>,
+    ) -> Self {
+        let tool_count = tools.len();
+        Self {
+            name,
+            state,
+            tools,
+            tool_count,
+            last_error,
+        }
+    }
 }

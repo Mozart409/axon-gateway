@@ -4,11 +4,14 @@
 //! - Spawn and manage backend actors
 //! - Handle incoming MCP requests
 //! - Route tool calls to appropriate backends
+//! - Graceful error handling when backends fail
 
-use crate::backend::{BackendActor, CallTool};
+use crate::backend::{BackendActor, CallTool, ForceReconnect, GetBackendInfo};
 use crate::config::Config;
-use crate::registry::{ListTools, RegisterBackend, RegistryActor, ResolveToolBackend, ToolRoute};
-use crate::types::{JsonRpcRequest, JsonRpcResponse};
+use crate::registry::{
+    GetBackendStatus, ListTools, RegisterBackend, RegistryActor, ResolveToolBackend, ToolRoute,
+};
+use crate::types::{BackendInfo, JsonRpcRequest, JsonRpcResponse};
 use kameo::actor::{Actor, ActorRef};
 use kameo::error::BoxError;
 use kameo::message::{Context, Message};
@@ -224,6 +227,88 @@ impl Message<GetStatus> for GatewayActor {
         GatewayStatus {
             backend_count: self.backends.len(),
             backends: self.backends.keys().cloned().collect(),
+        }
+    }
+}
+
+/// Get detailed status of all backends
+pub struct GetDetailedStatus;
+
+#[derive(Debug, Clone, serde::Serialize, kameo::Reply)]
+pub struct DetailedGatewayStatus {
+    pub backend_count: usize,
+    pub backends: Vec<BackendInfo>,
+}
+
+impl Message<GetDetailedStatus> for GatewayActor {
+    type Reply = DetailedGatewayStatus;
+
+    async fn handle(
+        &mut self,
+        _msg: GetDetailedStatus,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let backends: Vec<BackendInfo> = self
+            .registry
+            .ask(GetBackendStatus)
+            .await
+            .unwrap_or_default();
+
+        DetailedGatewayStatus {
+            backend_count: self.backends.len(),
+            backends,
+        }
+    }
+}
+
+/// Force reconnect a specific backend
+pub struct ForceBackendReconnect {
+    pub backend_name: String,
+}
+
+impl Message<ForceBackendReconnect> for GatewayActor {
+    type Reply = Result<(), String>;
+
+    async fn handle(
+        &mut self,
+        msg: ForceBackendReconnect,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let backend = self
+            .backends
+            .get(&msg.backend_name)
+            .ok_or_else(|| format!("Backend '{}' not found", msg.backend_name))?;
+
+        // When Reply = Result<T, E>, ask().await returns Result<T, SendError<M, E>>
+        // So ask().await returns Result<(), SendError<ForceReconnect, String>>
+        backend
+            .ask(ForceReconnect)
+            .await
+            .map_err(|e| format!("Failed to reconnect: {e:?}"))
+    }
+}
+
+/// Get info for a specific backend
+pub struct GetBackendInfoMsg {
+    pub backend_name: String,
+}
+
+impl Message<GetBackendInfoMsg> for GatewayActor {
+    type Reply = Result<crate::backend::BackendInfoResponse, String>;
+
+    async fn handle(
+        &mut self,
+        msg: GetBackendInfoMsg,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let backend = self
+            .backends
+            .get(&msg.backend_name)
+            .ok_or_else(|| format!("Backend '{}' not found", msg.backend_name))?;
+
+        match backend.ask(GetBackendInfo).await {
+            Ok(info) => Ok(info),
+            Err(e) => Err(format!("Failed to get backend info: {e:?}")),
         }
     }
 }

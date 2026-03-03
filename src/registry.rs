@@ -56,12 +56,7 @@ impl Message<RegisterBackend> for RegistryActor {
     ) -> Self::Reply {
         self.backends.insert(
             msg.name.clone(),
-            BackendInfo {
-                name: msg.name,
-                state: BackendState::Disconnected,
-                tools: Vec::new(),
-                last_error: None,
-            },
+            BackendInfo::new(msg.name, BackendState::Disconnected, Vec::new(), None),
         );
     }
 }
@@ -101,12 +96,7 @@ impl Message<UpdateBackend> for RegistryActor {
         // Update backend info
         self.backends.insert(
             msg.name.clone(),
-            BackendInfo {
-                name: msg.name,
-                state: msg.state,
-                tools: namespaced_tools,
-                last_error: msg.error,
-            },
+            BackendInfo::new(msg.name, msg.state, namespaced_tools, msg.error),
         );
     }
 }
@@ -122,6 +112,7 @@ impl Message<ListTools> for RegistryActor {
         _msg: ListTools,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
+        // Only include tools from connected backends (not circuit-open or reconnecting)
         let tools: Vec<ToolDefinition> = self
             .backends
             .iter()

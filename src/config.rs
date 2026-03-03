@@ -62,11 +62,47 @@ pub struct BackendConfig {
     /// Optional: disable this backend without removing from config
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Optional: timeout for tool calls in seconds (default: 30)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Optional: health check interval in seconds (default: 30, 0 = disabled)
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+
+    /// Optional: max consecutive failures before circuit breaker opens (default: 3)
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+
+    /// Optional: circuit breaker cooldown in seconds (default: 60)
+    #[serde(default = "default_circuit_breaker_cooldown_secs")]
+    pub circuit_breaker_cooldown_secs: u64,
 }
 
 /// Default value for the `enabled` field when omitted from config
 const fn default_enabled() -> bool {
     true
+}
+
+/// Default value for the `timeout_secs` field
+const fn default_timeout_secs() -> u64 {
+    30
+}
+
+/// Default value for the `health_check_interval_secs` field
+const fn default_health_check_interval_secs() -> u64 {
+    30
+}
+
+/// Default value for the `max_consecutive_failures` field
+const fn default_max_consecutive_failures() -> u32 {
+    3
+}
+
+/// Default value for the `circuit_breaker_cooldown_secs` field
+const fn default_circuit_breaker_cooldown_secs() -> u64 {
+    60
 }
 
 impl Default for BackendConfig {
@@ -79,6 +115,10 @@ impl Default for BackendConfig {
             transport: TransportType::Sse,
             allowed_tools: Vec::new(),
             enabled: true,
+            timeout_secs: default_timeout_secs(),
+            health_check_interval_secs: default_health_check_interval_secs(),
+            max_consecutive_failures: default_max_consecutive_failures(),
+            circuit_breaker_cooldown_secs: default_circuit_breaker_cooldown_secs(),
         }
     }
 }

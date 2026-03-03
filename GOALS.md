@@ -48,15 +48,15 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
   - [x] HTTP client transport (via `StreamableHttpClientTransport`)
   - [x] Stdio client transport (`TokioChildProcess` spawns subprocess)
 - [x] **Real tool forwarding** — Forward `tools/call` to backend, return actual result
-- [ ] **Error handling** — Graceful handling when backends fail mid-request
+- [x] **Error handling** — Graceful handling when backends fail mid-request
 
-### Phase 2: Reliability
+### Phase 2: Reliability ✅
 
-- [ ] **Reconnection logic** — Exponential backoff reconnect on connection loss
-- [ ] **Health checks** — Periodic pings to detect dead backends
-- [ ] **Connection pooling** — Reuse connections for HTTP backends
-- [ ] **Timeouts** — Configurable per-backend timeouts for tool calls
-- [ ] **Circuit breaker** — Stop routing to consistently failing backends
+- [x] **Reconnection logic** — Exponential backoff reconnect on connection loss
+- [x] **Health checks** — Periodic pings to detect dead backends
+- [x] **Connection pooling** — Reuse connections for HTTP backends (via rmcp/reqwest)
+- [x] **Timeouts** — Configurable per-backend timeouts for tool calls
+- [x] **Circuit breaker** — Stop routing to consistently failing backends
 
 ### Phase 3: Features
 
@@ -141,7 +141,10 @@ args = ["--flag", "value"]  # Optional: args for stdio
 transport = "sse"           # Required: sse | http | stdio
 enabled = true              # Optional: default true
 allowed_tools = ["tool1"]   # Optional: filter tools (empty = all)
-timeout_secs = 30           # Optional: per-backend timeout
+timeout_secs = 30           # Optional: per-backend timeout (default: 30)
+health_check_interval_secs = 30  # Optional: health check interval (default: 30, 0 = disabled)
+max_consecutive_failures = 3     # Optional: failures before circuit breaker opens (default: 3)
+circuit_breaker_cooldown_secs = 60  # Optional: cooldown before retry (default: 60)
 ```
 
 ### MCP Protocol Methods to Handle

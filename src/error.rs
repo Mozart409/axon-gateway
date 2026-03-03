@@ -38,3 +38,26 @@ pub enum ServerError {
     #[error("server error")]
     Serve(#[from] std::io::Error),
 }
+
+/// Backend errors
+#[derive(Error, Debug)]
+#[allow(dead_code)]
+pub enum BackendError {
+    #[error("backend '{name}' connection failed: {reason}")]
+    ConnectionFailed { name: String, reason: String },
+
+    #[error("backend '{name}' tool call timed out after {timeout_secs}s")]
+    Timeout { name: String, timeout_secs: u64 },
+
+    #[error("backend '{name}' circuit breaker is open")]
+    CircuitBreakerOpen { name: String },
+
+    #[error("backend '{name}' is not connected (state: {state:?})")]
+    NotConnected {
+        name: String,
+        state: crate::types::BackendState,
+    },
+
+    #[error("backend '{name}' tool call failed: {reason}")]
+    ToolCallFailed { name: String, reason: String },
+}

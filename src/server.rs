@@ -5,13 +5,17 @@
 //! - GET /mcp/sse - SSE endpoint for streaming
 //! - GET /health - Health check
 //! - GET /status - Gateway status
+//! - GET /status/detailed - Detailed backend status
+//! - POST /admin/backends/{name}/reconnect - Force reconnect a backend
 
 use crate::error::ServerError;
-use crate::gateway::{GatewayActor, GetStatus, HandleRequest};
+use crate::gateway::{
+    ForceBackendReconnect, GatewayActor, GetDetailedStatus, GetStatus, HandleRequest,
+};
 use crate::types::JsonRpcRequest;
 use axum::{
     Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Json,
@@ -42,6 +46,12 @@ pub fn create_router(state: AppState) -> Router {
         // Status endpoints
         .route("/health", get(health_check))
         .route("/status", get(get_status))
+        .route("/status/detailed", get(get_detailed_status))
+        // Admin endpoints
+        .route(
+            "/admin/backends/{name}/reconnect",
+            post(force_backend_reconnect),
+        )
         // Middleware
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -122,6 +132,50 @@ async fn get_status(State(state): State<AppState>) -> Result<impl IntoResponse, 
     })?;
 
     Ok(Json(status))
+}
+
+/// Detailed gateway status endpoint
+async fn get_detailed_status(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
+        tracing::error!("Failed to get detailed status: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(status))
+}
+
+/// Force reconnect a backend
+async fn force_backend_reconnect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    // Admin endpoints require auth
+    verify_auth(&headers, state.auth_token.as_ref())?;
+
+    // When Reply = Result<T, E>, ask().await returns Result<T, SendError<M, E>>
+    let result = state
+        .gateway
+        .ask(ForceBackendReconnect {
+            backend_name: name.clone(),
+        })
+        .await;
+
+    match result {
+        Ok(()) => Ok(Json(json!({
+            "status": "ok",
+            "message": format!("Backend '{}' reconnect initiated", name)
+        }))),
+        Err(e) => {
+            tracing::warn!("Force reconnect failed for '{}': {:?}", name, e);
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("{:?}", e)
+            })))
+        }
+    }
 }
 
 /// Start the HTTP server
