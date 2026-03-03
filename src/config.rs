@@ -60,8 +60,13 @@ pub struct BackendConfig {
     pub allowed_tools: Vec<String>,
 
     /// Optional: disable this backend without removing from config
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+/// Default value for the `enabled` field when omitted from config
+const fn default_enabled() -> bool {
+    true
 }
 
 impl Default for BackendConfig {

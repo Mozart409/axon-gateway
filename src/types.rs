@@ -1,15 +1,29 @@
 //! Core types for the MCP Gateway
 
 use kameo::Reply;
+use std::borrow::Cow;
+
+use rmcp::model::Tool;
 use serde::{Deserialize, Serialize};
 
 /// A tool definition as returned by MCP servers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+}
+
+impl From<Tool> for ToolDefinition {
+    fn from(tool: Tool) -> Self {
+        Self {
+            name: tool.name.into_owned(),
+            description: tool.description.map(Cow::into_owned),
+            input_schema: serde_json::to_value(&*tool.input_schema).unwrap_or_default(),
+        }
+    }
 }
 
 /// A namespaced tool with routing info

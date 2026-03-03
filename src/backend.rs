@@ -5,20 +5,56 @@
 //! - Fetches tool list on connect
 //! - Forwards tool calls and returns results
 
-use crate::config::{BackendConfig, TransportType};
-use crate::registry::{RegistryActor, UpdateBackend};
-use crate::types::{BackendState, ToolDefinition};
+use std::borrow::Cow;
+
 use kameo::actor::{Actor, ActorRef};
 use kameo::error::BoxError;
 use kameo::message::{Context, Message};
+use rmcp::ServiceExt;
+use rmcp::model::CallToolRequestParams;
+use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+use tokio::process::Command;
+
+use crate::config::{BackendConfig, TransportType};
+use crate::registry::{RegistryActor, UpdateBackend};
+use crate::types::{BackendState, ToolDefinition};
+
+/// Wrapper enum for different MCP client types
+///
+/// Each transport type produces a different `RunningService` type, so we wrap them
+/// in an enum to store in the actor.
+enum McpClient {
+    /// Client connected via streamable HTTP (used for both SSE and HTTP transports)
+    Http(RunningService<RoleClient, ()>),
+    /// Client connected via child process stdio
+    Stdio(RunningService<RoleClient, ()>),
+}
+
+impl McpClient {
+    /// Get a reference to the peer for making requests
+    fn peer(&self) -> &Peer<RoleClient> {
+        match self {
+            Self::Http(service) | Self::Stdio(service) => service.peer(),
+        }
+    }
+
+    /// Cancel the client connection gracefully
+    async fn cancel(self) {
+        match self {
+            Self::Http(service) | Self::Stdio(service) => {
+                let _ = service.cancel().await;
+            }
+        }
+    }
+}
 
 /// Actor managing a single backend MCP server connection
 pub struct BackendActor {
     config: BackendConfig,
     registry: ActorRef<RegistryActor>,
     state: BackendState,
-    // In real impl: actual MCP client connection
-    // client: Option<McpClient>,
+    client: Option<McpClient>,
 }
 
 impl BackendActor {
@@ -27,6 +63,7 @@ impl BackendActor {
             config,
             registry,
             state: BackendState::Disconnected,
+            client: None,
         }
     }
 
@@ -35,32 +72,65 @@ impl BackendActor {
         self.state = BackendState::Connecting;
         tracing::info!("Connecting to backend: {}", self.config.name);
 
-        // TODO: Replace with actual rmcp client connection
-        // This is where you'd use rmcp's client transport
-        match self.config.transport {
-            TransportType::Sse => {
-                let url = self.config.url.as_ref().unwrap();
-                tracing::info!("Would connect via SSE to: {}", url);
-                // let client = rmcp::client::SseClient::connect(url).await?;
-            }
-            TransportType::Http => {
-                let url = self.config.url.as_ref().unwrap();
-                tracing::info!("Would connect via HTTP to: {}", url);
-                // let client = rmcp::client::HttpClient::connect(url).await?;
+        let client = match self.config.transport {
+            TransportType::Sse | TransportType::Http => {
+                let url = self.config.url.as_ref().ok_or("Missing URL for backend")?;
+                tracing::info!(
+                    "Connecting via streamable HTTP to: {} (transport: {:?})",
+                    url,
+                    self.config.transport
+                );
+
+                let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                let service =
+                    ().serve(transport)
+                        .await
+                        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+
+                tracing::info!(
+                    "Connected to backend '{}', server info: {:?}",
+                    self.config.name,
+                    service.peer().peer_info()
+                );
+
+                McpClient::Http(service)
             }
             TransportType::Stdio => {
-                let cmd = self.config.command.as_ref().unwrap();
+                let cmd = self
+                    .config
+                    .command
+                    .as_ref()
+                    .ok_or("Missing command for stdio backend")?;
                 let args = self.config.args.as_deref().unwrap_or(&[]);
-                tracing::info!("Would spawn stdio process: {} {:?}", cmd, args);
-                // let client = rmcp::client::StdioClient::spawn(cmd, args).await?;
-            }
-        }
 
-        // Simulate successful connection
+                tracing::info!("Spawning stdio process: {} {:?}", cmd, args);
+
+                let mut command = Command::new(cmd);
+                command.args(args);
+
+                let transport = TokioChildProcess::new(command)
+                    .map_err(|e| format!("Failed to spawn process {cmd}: {e}"))?;
+
+                let service = ()
+                    .serve(transport)
+                    .await
+                    .map_err(|e| format!("Failed to initialize MCP client for {cmd}: {e}"))?;
+
+                tracing::info!(
+                    "Connected to stdio backend '{}', server info: {:?}",
+                    self.config.name,
+                    service.peer().peer_info()
+                );
+
+                McpClient::Stdio(service)
+            }
+        };
+
+        self.client = Some(client);
         self.state = BackendState::Connected;
 
         // Fetch tools from backend
-        let tools = self.fetch_tools();
+        let tools = self.fetch_tools().await?;
 
         // Update registry
         self.registry
@@ -77,88 +147,44 @@ impl BackendActor {
     }
 
     /// Fetch tool list from the backend
-    fn fetch_tools(&self) -> Vec<ToolDefinition> {
-        // TODO: Replace with actual MCP tools/list call
-        // let response = self.client.request("tools/list", json!({})).await?;
+    async fn fetch_tools(&self) -> Result<Vec<ToolDefinition>, BoxError> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("No client connection available")?;
 
-        // For PoC, return mock tools based on backend name
-        let mock_tools = match self.config.name.as_str() {
-            "homeassistant" => vec![
-                ToolDefinition {
-                    name: "turn_on".to_string(),
-                    description: Some("Turn on a device".to_string()),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "entity_id": { "type": "string" }
-                        },
-                        "required": ["entity_id"]
-                    }),
-                },
-                ToolDefinition {
-                    name: "turn_off".to_string(),
-                    description: Some("Turn off a device".to_string()),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "entity_id": { "type": "string" }
-                        },
-                        "required": ["entity_id"]
-                    }),
-                },
-            ],
-            "jellyfin" => vec![
-                ToolDefinition {
-                    name: "search_media".to_string(),
-                    description: Some("Search for media".to_string()),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string" }
-                        },
-                        "required": ["query"]
-                    }),
-                },
-                ToolDefinition {
-                    name: "play".to_string(),
-                    description: Some("Play media on a device".to_string()),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "media_id": { "type": "string" },
-                            "device_id": { "type": "string" }
-                        },
-                        "required": ["media_id"]
-                    }),
-                },
-            ],
-            _ => vec![ToolDefinition {
-                name: "ping".to_string(),
-                description: Some("Ping the service".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }),
-            }],
-        };
+        let tools = client
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| format!("Failed to list tools: {e}"))?;
+
+        let tool_defs: Vec<ToolDefinition> = tools.into_iter().map(ToolDefinition::from).collect();
 
         tracing::info!(
             "Backend '{}' provides {} tools",
             self.config.name,
-            mock_tools.len()
+            tool_defs.len()
         );
-        mock_tools
+
+        for tool in &tool_defs {
+            tracing::debug!("  - {}: {:?}", tool.name, tool.description);
+        }
+
+        Ok(tool_defs)
     }
 
     /// Forward a tool call to this backend
-    fn call_tool(&self, tool_name: &str, arguments: &serde_json::Value) -> serde_json::Value {
-        // TODO: Replace with actual MCP tools/call
-        // let response = self.client.request("tools/call", json!({
-        //     "name": tool_name,
-        //     "arguments": arguments
-        // })).await?;
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| "No client connection available".to_string())?;
 
-        // Mock response
         tracing::info!(
             "Backend '{}' executing tool '{}' with args: {}",
             self.config.name,
@@ -166,12 +192,34 @@ impl BackendActor {
             arguments
         );
 
-        serde_json::json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Mock result from {}::{}", self.config.name, tool_name)
-            }]
-        })
+        // Convert arguments to JsonObject if it's an object, otherwise use empty
+        let arguments_obj = arguments.as_object().cloned();
+
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: Cow::Owned(tool_name.to_string()),
+                arguments: arguments_obj,
+                task: None,
+            })
+            .await
+            .map_err(|e| format!("Tool call failed: {e}"))?;
+
+        // Convert CallToolResult to JSON
+        let response = serde_json::to_value(&result)
+            .map_err(|e| format!("Failed to serialize tool result: {e}"))?;
+
+        Ok(response)
+    }
+
+    /// Disconnect from the backend
+    async fn disconnect(&mut self) {
+        if let Some(client) = self.client.take() {
+            tracing::info!("Disconnecting from backend: {}", self.config.name);
+            client.cancel().await;
+        }
+        self.state = BackendState::Disconnected;
     }
 }
 
@@ -195,10 +243,20 @@ impl Actor for BackendActor {
                 .await
                 .map_err(|e| Box::new(e) as BoxError)?;
 
-            // Schedule reconnect
+            // TODO: Schedule reconnect with exponential backoff
             // actor_ref.tell_delayed(Reconnect, Duration::from_secs(5)).await;
         }
 
+        Ok(())
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: kameo::actor::WeakActorRef<Self>,
+        _reason: kameo::error::ActorStopReason,
+    ) -> Result<(), BoxError> {
+        tracing::info!("Backend actor stopping: {}", self.config.name);
+        self.disconnect().await;
         Ok(())
     }
 }
@@ -220,7 +278,7 @@ impl Message<CallTool> for BackendActor {
             return Err(format!("Backend '{}' is not connected", self.config.name));
         }
 
-        Ok(self.call_tool(&msg.tool_name, &msg.arguments))
+        self.call_tool(&msg.tool_name, &msg.arguments).await
     }
 }
 
@@ -235,11 +293,14 @@ impl Message<Reconnect> for BackendActor {
         _msg: Reconnect,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        if self.state != BackendState::Connected
-            && let Err(e) = self.connect().await
-        {
-            tracing::warn!("Reconnect failed for {}: {}", self.config.name, e);
-            // Would schedule another reconnect here
+        if self.state != BackendState::Connected {
+            // Disconnect existing (possibly broken) connection
+            self.disconnect().await;
+
+            if let Err(e) = self.connect().await {
+                tracing::warn!("Reconnect failed for {}: {}", self.config.name, e);
+                // TODO: Schedule another reconnect with exponential backoff
+            }
         }
     }
 }
@@ -256,5 +317,39 @@ impl Message<HealthCheck> for BackendActor {
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         self.state
+    }
+}
+
+/// Refresh tool list from backend
+pub struct RefreshTools;
+
+impl Message<RefreshTools> for BackendActor {
+    type Reply = Result<(), String>;
+
+    async fn handle(
+        &mut self,
+        _msg: RefreshTools,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.state != BackendState::Connected {
+            return Err(format!("Backend '{}' is not connected", self.config.name));
+        }
+
+        let tools = self
+            .fetch_tools()
+            .await
+            .map_err(|e| format!("Failed to refresh tools: {e}"))?;
+
+        self.registry
+            .tell(UpdateBackend {
+                name: self.config.name.clone(),
+                state: BackendState::Connected,
+                tools,
+                error: None,
+            })
+            .await
+            .map_err(|e| format!("Failed to update registry: {e}"))?;
+
+        Ok(())
     }
 }
