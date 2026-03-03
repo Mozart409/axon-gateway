@@ -110,11 +110,19 @@ auth_token = "your-secret-token"
 
 Clients must include `Authorization: Bearer your-secret-token` header.
 
+## Current Status
+
+Phase 1 (MVP) is complete:
+
+- [x] **Real rmcp integration**: Backend actors connect to real MCP servers
+- [x] **Multiple transports**: SSE, HTTP (via streamable HTTP), and stdio supported
+- [x] **Tool aggregation**: Tools fetched from backends and namespaced
+- [x] **Tool forwarding**: `tools/call` forwarded to correct backend with real results
+
 ## TODO / Next Steps
 
-This is a PoC. To make it production-ready:
+To make it production-ready:
 
-- [ ] **Real rmcp integration**: Replace mock connections with actual rmcp client
 - [ ] **Reconnection logic**: Automatic reconnect with exponential backoff
 - [ ] **Health checks**: Periodic pings to detect dead backends
 - [ ] **Hot reload**: Watch config file and update backends without restart
@@ -129,11 +137,11 @@ This is a PoC. To make it production-ready:
 ```
 src/
 ├── main.rs      # Entry point
-├── lib.rs       # Library exports
 ├── config.rs    # Config parsing
 ├── types.rs     # Core types (Tool, JsonRpc, etc.)
+├── error.rs     # Error types (thiserror)
 ├── registry.rs  # Registry actor (tool aggregation)
-├── backend.rs   # Backend actor (per-server connection)
+├── backend.rs   # Backend actor (per-server connection via rmcp)
 ├── gateway.rs   # Gateway actor (orchestration)
 └── server.rs    # HTTP/SSE server (axum)
 ```

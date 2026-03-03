@@ -35,7 +35,7 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
 
 ## Implementation Tasks
 
-### Phase 1: Core Functionality (MVP)
+### Phase 1: Core Functionality (MVP) ✅
 
 - [x] Project structure with kameo actors
 - [x] Config parsing (TOML)
@@ -43,11 +43,11 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
 - [x] Backend actor skeleton
 - [x] Gateway actor with MCP protocol handling
 - [x] HTTP server with `/mcp` endpoint
-- [ ] **Wire up rmcp client** — Replace mock connections with real rmcp transports
-  - [ ] SSE client transport
-  - [ ] HTTP client transport
-  - [ ] Stdio client transport (spawn subprocess)
-- [ ] **Real tool forwarding** — Forward `tools/call` to backend, return actual result
+- [x] **Wire up rmcp client** — Real rmcp transports integrated
+  - [x] SSE client transport (via `StreamableHttpClientTransport`)
+  - [x] HTTP client transport (via `StreamableHttpClientTransport`)
+  - [x] Stdio client transport (`TokioChildProcess` spawns subprocess)
+- [x] **Real tool forwarding** — Forward `tools/call` to backend, return actual result
 - [ ] **Error handling** — Graceful handling when backends fail mid-request
 
 ### Phase 2: Reliability
@@ -93,33 +93,37 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
 
 ## Technical Notes
 
-### rmcp Integration Points
+### rmcp Integration (Implemented)
 
-The main integration points with rmcp are in `backend.rs`:
+The rmcp integration is in `backend.rs`. Key patterns:
 
 ```rust
-// In BackendActor::connect()
-// Replace mock connection with:
-match self.config.transport {
-    TransportType::Sse => {
-        let transport = SseClientTransport::new(url);
-        let client = McpClient::new(transport).await?;
-        self.client = Some(client);
-    }
-    // ... similar for HTTP and stdio
+// McpClient enum wraps different transport types
+enum McpClient {
+    Http(RunningService<RoleClient, ()>),
+    Stdio(RunningService<RoleClient, ()>),
 }
 
-// In BackendActor::fetch_tools()
-// Replace mock with:
-let response = self.client.request("tools/list", json!({})).await?;
-let tools: Vec<ToolDefinition> = serde_json::from_value(response["tools"])?;
+// In BackendActor::connect() - SSE/HTTP use streamable HTTP transport
+let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+let service = ().serve(transport).await?;
+self.client = Some(McpClient::Http(service));
 
-// In BackendActor::call_tool()
-// Replace mock with:
-let response = self.client.request("tools/call", json!({
-    "name": tool_name,
-    "arguments": arguments
-})).await?;
+// In BackendActor::connect() - Stdio spawns child process
+let transport = TokioChildProcess::new(Command::new(cmd))?;
+let service = ().serve(transport).await?;
+self.client = Some(McpClient::Stdio(service));
+
+// In BackendActor::fetch_tools() - uses rmcp peer API
+let tools = client.peer().list_all_tools().await?;
+let tool_defs: Vec<ToolDefinition> = tools.into_iter().map(ToolDefinition::from).collect();
+
+// In BackendActor::call_tool() - forwards to backend
+let result = client.peer().call_tool(CallToolRequestParams {
+    name: Cow::Owned(tool_name.to_string()),
+    arguments: arguments_obj,
+    ..Default::default()
+}).await?;
 ```
 
 ### Config Schema
@@ -169,18 +173,19 @@ timeout_secs = 30           # Optional: per-backend timeout
 ## File Structure
 
 ```
-mcp-gateway/
+axon-gateway/
 ├── Cargo.toml
-├── config.toml          # Example config
+├── axon.toml            # Example config
 ├── GOALS.md             # This file
 ├── README.md
+├── AGENTS.md            # Agent guidelines
 └── src/
     ├── main.rs          # Entry point, arg parsing
-    ├── lib.rs           # Library exports
     ├── config.rs        # Config types and parsing
     ├── types.rs         # Core types (Tool, JsonRpc, etc.)
+    ├── error.rs         # Error types (thiserror)
     ├── registry.rs      # Registry actor
-    ├── backend.rs       # Backend actor (per-server)
+    ├── backend.rs       # Backend actor (rmcp client)
     ├── gateway.rs       # Gateway actor (orchestrator)
     └── server.rs        # HTTP/SSE server
 ```

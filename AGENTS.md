@@ -111,15 +111,20 @@ Pre-push:
 ### Dependencies
 - **Async**: tokio (full features)
 - **Actors**: kameo (0.13)
-- **MCP Protocol**: rmcp (0.17.0)
+- **MCP Protocol**: rmcp (0.17.0) with features:
+  - `client` - Client service types
+  - `transport-child-process` - Stdio transport via child process
+  - `transport-streamable-http-client-reqwest` - HTTP/SSE client transport
 - **Web**: axum (0.8), tower-http (0.6)
 - **Serialization**: serde, serde_json, toml
 - **Errors**: thiserror, color-eyre
 - **Logging**: tracing, tracing-subscriber
-- **Utils**: dashmap, futures, chrono, ulid
+- **Utils**: dashmap, futures
 
 ## Important Notes
 - Edition 2024 is used
 - No lib.rs - this is a binary-only crate
-- Mock implementations in backend.rs need to be replaced with real rmcp client
+- Backend actors use real rmcp client connections (not mocks)
 - Config file is TOML format with sections `[gateway]` and `[[backends]]`
+- SSE and HTTP transports both use rmcp's `StreamableHttpClientTransport`
+- Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
