@@ -491,11 +491,11 @@ impl Message<AddBackend> for GatewayActor {
         let name = msg.config.name.clone();
 
         if self.backends.contains_key(&name) {
-            return Err(format!("Backend '{}' already exists", name));
+            return Err(format!("Backend '{name}' already exists",));
         }
 
         if !msg.config.enabled {
-            return Err(format!("Backend '{}' is disabled", name));
+            return Err(format!("Backend '{name}' is disabled",));
         }
 
         // Register in registry
@@ -509,7 +509,7 @@ impl Message<AddBackend> for GatewayActor {
         let actor_ref = kameo::spawn(backend_actor);
 
         self.backends.insert(name.clone(), actor_ref);
-        tracing::info!("Added backend: {}", name);
+        tracing::info!("Added backend: {name}",);
 
         Ok(())
     }
@@ -582,7 +582,7 @@ impl Message<ReloadConfig> for GatewayActor {
         for name in current_names.difference(&new_names) {
             if let Some(actor_ref) = self.backends.remove(name) {
                 if let Err(e) = actor_ref.stop_gracefully().await {
-                    errors.push(format!("Failed to stop '{}': {e:?}", name));
+                    errors.push(format!("Failed to stop '{name}': {e:?}",));
                 }
                 let _ = self
                     .registry

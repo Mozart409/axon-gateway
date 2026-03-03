@@ -93,8 +93,7 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .map_or_else(|| Uuid::new_v4().to_string(), String::from);
 
     // Store in request extensions for later use
     request
