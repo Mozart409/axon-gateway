@@ -58,13 +58,13 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
 - [x] **Timeouts** — Configurable per-backend timeouts for tool calls
 - [x] **Circuit breaker** — Stop routing to consistently failing backends
 
-### Phase 3: Features
+### Phase 3: Features ✅
 
-- [ ] **Hot reload** — Watch config file, add/remove backends without restart
-- [ ] **Tool filtering** — `allowed_tools` config to expose subset of backend tools
-- [ ] **Resource proxying** — Forward MCP `resources/list` and `resources/read`
-- [ ] **Prompt proxying** — Forward MCP `prompts/list` and `prompts/get`
-- [ ] **Logging/tracing** — Structured logging with request IDs, OpenTelemetry support
+- [x] **Hot reload** — Watch config file, add/remove backends without restart
+- [x] **Tool filtering** — `allowed_tools` config to expose subset of backend tools
+- [x] **Resource proxying** — Forward MCP `resources/list` and `resources/read`
+- [x] **Prompt proxying** — Forward MCP `prompts/list` and `prompts/get`
+- [x] **Logging/tracing** — Structured logging with request IDs, JSON logging support
 
 ### Phase 4: Auth & Security
 

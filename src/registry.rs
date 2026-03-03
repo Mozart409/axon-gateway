@@ -180,3 +180,25 @@ impl Message<GetBackendStatus> for RegistryActor {
         self.backends.iter().map(|r| r.value().clone()).collect()
     }
 }
+
+/// Remove a backend from the registry
+#[derive(Clone)]
+pub struct RemoveBackend {
+    pub name: String,
+}
+
+impl Message<RemoveBackend> for RegistryActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: RemoveBackend,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Remove tool routes for this backend
+        self.tool_routing.retain(|_, backend| backend != &msg.name);
+        // Remove the backend
+        self.backends.remove(&msg.name);
+        tracing::info!("Removed backend '{}' from registry", msg.name);
+    }
+}

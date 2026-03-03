@@ -1,9 +1,9 @@
 //! Core types for the MCP Gateway
 
-use kameo::Reply;
 use std::borrow::Cow;
 
-use rmcp::model::Tool;
+use kameo::Reply;
+use rmcp::model::{Prompt, Resource, Tool};
 use serde::{Deserialize, Serialize};
 
 /// A tool definition as returned by MCP servers
@@ -48,6 +48,125 @@ impl NamespacedTool {
 
         Self {
             original_name: tool.name,
+            namespaced_name,
+            backend_name: backend_name.to_string(),
+            definition: namespaced_def,
+        }
+    }
+}
+
+/// A resource definition as returned by MCP servers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceDefinition {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+impl From<Resource> for ResourceDefinition {
+    fn from(resource: Resource) -> Self {
+        Self {
+            uri: resource.uri.clone(),
+            name: Some(resource.name.clone()),
+            description: resource.description.clone(),
+            mime_type: resource.mime_type.clone(),
+        }
+    }
+}
+
+/// A namespaced resource with routing info
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct NamespacedResource {
+    /// Original URI from backend
+    pub original_uri: String,
+    /// Namespaced URI: `{backend}://{original_path}`
+    pub namespaced_uri: String,
+    /// Which backend owns this resource
+    pub backend_name: String,
+    /// The resource definition (with namespaced URI)
+    pub definition: ResourceDefinition,
+}
+
+impl NamespacedResource {
+    pub fn new(backend_name: &str, resource: ResourceDefinition) -> Self {
+        // Namespace by prefixing with backend name
+        let namespaced_uri = format!("{backend_name}://{}", resource.uri);
+        let mut namespaced_def = resource.clone();
+        namespaced_def.uri.clone_from(&namespaced_uri);
+
+        Self {
+            original_uri: resource.uri,
+            namespaced_uri,
+            backend_name: backend_name.to_string(),
+            definition: namespaced_def,
+        }
+    }
+}
+
+/// A prompt definition as returned by MCP servers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<PromptArgument>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+impl From<Prompt> for PromptDefinition {
+    fn from(prompt: Prompt) -> Self {
+        Self {
+            name: prompt.name,
+            description: prompt.description,
+            arguments: prompt.arguments.map(|args| {
+                args.into_iter()
+                    .map(|arg| PromptArgument {
+                        name: arg.name,
+                        description: arg.description,
+                        required: arg.required,
+                    })
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// A namespaced prompt with routing info
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct NamespacedPrompt {
+    /// Original prompt name from backend
+    pub original_name: String,
+    /// Namespaced name: "{backend}_{original}"
+    pub namespaced_name: String,
+    /// Which backend owns this prompt
+    pub backend_name: String,
+    /// The prompt definition (with namespaced name)
+    pub definition: PromptDefinition,
+}
+
+impl NamespacedPrompt {
+    pub fn new(backend_name: &str, prompt: PromptDefinition) -> Self {
+        let namespaced_name = format!("{backend_name}_{}", prompt.name);
+        let mut namespaced_def = prompt.clone();
+        namespaced_def.name.clone_from(&namespaced_name);
+
+        Self {
+            original_name: prompt.name,
             namespaced_name,
             backend_name: backend_name.to_string(),
             definition: namespaced_def,

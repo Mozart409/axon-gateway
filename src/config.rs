@@ -56,7 +56,6 @@ pub struct BackendConfig {
 
     /// Optional: only expose specific tools (empty = all)
     #[serde(default)]
-    #[allow(dead_code)]
     pub allowed_tools: Vec<String>,
 
     /// Optional: disable this backend without removing from config

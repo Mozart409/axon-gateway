@@ -2,8 +2,8 @@
 //!
 //! Each backend server gets its own actor that:
 //! - Maintains the connection (reconnects on failure with exponential backoff)
-//! - Fetches tool list on connect
-//! - Forwards tool calls and returns results
+//! - Fetches tool, resource, and prompt lists on connect
+//! - Forwards tool calls, resource reads, and prompt gets
 //! - Performs periodic health checks
 //! - Implements circuit breaker pattern for failing backends
 
@@ -14,7 +14,7 @@ use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::BoxError;
 use kameo::message::{Context, Message};
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use tokio::process::Command;
@@ -22,7 +22,7 @@ use tokio::time::timeout;
 
 use crate::config::{BackendConfig, TransportType};
 use crate::registry::{RegistryActor, UpdateBackend};
-use crate::types::{BackendState, ToolDefinition};
+use crate::types::{BackendState, PromptDefinition, ResourceDefinition, ToolDefinition};
 
 /// Maximum backoff duration for reconnection attempts
 const MAX_BACKOFF_SECS: u64 = 300; // 5 minutes
@@ -263,17 +263,120 @@ impl BackendActor {
 
         let tool_defs: Vec<ToolDefinition> = tools.into_iter().map(ToolDefinition::from).collect();
 
+        // Apply tool filtering if allowed_tools is configured
+        let filtered_tools = self.filter_tools(tool_defs);
+
         tracing::info!(
-            "Backend '{}' provides {} tools",
+            "Backend '{}' provides {} tools (after filtering)",
             self.config.name,
-            tool_defs.len()
+            filtered_tools.len()
         );
 
-        for tool in &tool_defs {
+        for tool in &filtered_tools {
             tracing::debug!("  - {}: {:?}", tool.name, tool.description);
         }
 
-        Ok(tool_defs)
+        Ok(filtered_tools)
+    }
+
+    /// Filter tools based on `allowed_tools` configuration
+    fn filter_tools(&self, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+        if self.config.allowed_tools.is_empty() {
+            // No filtering - expose all tools
+            return tools;
+        }
+
+        let allowed: std::collections::HashSet<&str> = self
+            .config
+            .allowed_tools
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        let (filtered, excluded): (Vec<_>, Vec<_>) = tools
+            .into_iter()
+            .partition(|t| allowed.contains(t.name.as_str()));
+
+        if !excluded.is_empty() {
+            tracing::debug!(
+                "Backend '{}' filtered out {} tools: {:?}",
+                self.config.name,
+                excluded.len(),
+                excluded.iter().map(|t| &t.name).collect::<Vec<_>>()
+            );
+        }
+
+        filtered
+    }
+
+    /// Fetch resource list from the backend with timeout
+    async fn fetch_resources(&self) -> Result<Vec<ResourceDefinition>, BoxError> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("No client connection available")?;
+
+        let fetch_timeout = Duration::from_secs(self.config.timeout_secs);
+        let resources = timeout(fetch_timeout, client.peer().list_all_resources())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Resource list fetch timeout after {}s",
+                    self.config.timeout_secs
+                )
+            })?
+            .map_err(|e| format!("Failed to list resources: {e}"))?;
+
+        let resource_defs: Vec<ResourceDefinition> = resources
+            .into_iter()
+            .map(ResourceDefinition::from)
+            .collect();
+
+        tracing::info!(
+            "Backend '{}' provides {} resources",
+            self.config.name,
+            resource_defs.len()
+        );
+
+        for resource in &resource_defs {
+            tracing::debug!("  - {}: {:?}", resource.uri, resource.name);
+        }
+
+        Ok(resource_defs)
+    }
+
+    /// Fetch prompt list from the backend with timeout
+    async fn fetch_prompts(&self) -> Result<Vec<PromptDefinition>, BoxError> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or("No client connection available")?;
+
+        let fetch_timeout = Duration::from_secs(self.config.timeout_secs);
+        let prompts = timeout(fetch_timeout, client.peer().list_all_prompts())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Prompt list fetch timeout after {}s",
+                    self.config.timeout_secs
+                )
+            })?
+            .map_err(|e| format!("Failed to list prompts: {e}"))?;
+
+        let prompt_defs: Vec<PromptDefinition> =
+            prompts.into_iter().map(PromptDefinition::from).collect();
+
+        tracing::info!(
+            "Backend '{}' provides {} prompts",
+            self.config.name,
+            prompt_defs.len()
+        );
+
+        for prompt in &prompt_defs {
+            tracing::debug!("  - {}: {:?}", prompt.name, prompt.description);
+        }
+
+        Ok(prompt_defs)
     }
 
     /// Forward a tool call to this backend with timeout and error handling
@@ -343,6 +446,118 @@ impl BackendActor {
             Err(_) => {
                 // Timeout
                 let error_msg = format!("Tool call timeout after {}s", self.config.timeout_secs);
+                self.handle_call_failure(&error_msg).await;
+                Err(error_msg)
+            }
+        }
+    }
+
+    /// Read a resource from this backend
+    async fn read_resource(&mut self, uri: &str) -> Result<serde_json::Value, String> {
+        // Check circuit breaker
+        if self.circuit_breaker.is_open() && !self.circuit_breaker.should_attempt_close() {
+            return Err(format!(
+                "Backend '{}' circuit breaker is open",
+                self.config.name
+            ));
+        }
+
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| "No client connection available".to_string())?;
+
+        tracing::info!("Backend '{}' reading resource '{}'", self.config.name, uri);
+
+        let call_timeout = Duration::from_secs(self.config.timeout_secs);
+        let result = timeout(
+            call_timeout,
+            client.peer().read_resource(ReadResourceRequestParams {
+                uri: uri.to_string(),
+                meta: None,
+            }),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(read_result)) => {
+                self.circuit_breaker.record_success();
+                let response = serde_json::to_value(&read_result)
+                    .map_err(|e| format!("Failed to serialize resource result: {e}"))?;
+                Ok(response)
+            }
+            Ok(Err(e)) => {
+                let error_msg = format!("Resource read failed: {e}");
+                self.handle_call_failure(&error_msg).await;
+                Err(error_msg)
+            }
+            Err(_) => {
+                let error_msg =
+                    format!("Resource read timeout after {}s", self.config.timeout_secs);
+                self.handle_call_failure(&error_msg).await;
+                Err(error_msg)
+            }
+        }
+    }
+
+    /// Get a prompt from this backend
+    async fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<serde_json::Value, String> {
+        // Check circuit breaker
+        if self.circuit_breaker.is_open() && !self.circuit_breaker.should_attempt_close() {
+            return Err(format!(
+                "Backend '{}' circuit breaker is open",
+                self.config.name
+            ));
+        }
+
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| "No client connection available".to_string())?;
+
+        tracing::info!(
+            "Backend '{}' getting prompt '{}' with args: {:?}",
+            self.config.name,
+            name,
+            arguments
+        );
+
+        // Convert HashMap<String, String> to serde_json::Map<String, Value>
+        let args_map = arguments.map(|args| {
+            args.into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect()
+        });
+
+        let call_timeout = Duration::from_secs(self.config.timeout_secs);
+        let result = timeout(
+            call_timeout,
+            client.peer().get_prompt(GetPromptRequestParams {
+                name: name.to_string(),
+                arguments: args_map,
+                meta: None,
+            }),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(prompt_result)) => {
+                self.circuit_breaker.record_success();
+                let response = serde_json::to_value(&prompt_result)
+                    .map_err(|e| format!("Failed to serialize prompt result: {e}"))?;
+                Ok(response)
+            }
+            Ok(Err(e)) => {
+                let error_msg = format!("Prompt get failed: {e}");
+                self.handle_call_failure(&error_msg).await;
+                Err(error_msg)
+            }
+            Err(_) => {
+                let error_msg = format!("Prompt get timeout after {}s", self.config.timeout_secs);
                 self.handle_call_failure(&error_msg).await;
                 Err(error_msg)
             }
@@ -584,6 +799,119 @@ impl Message<CallTool> for BackendActor {
             )),
             _ => Err(format!("Backend '{}' is not connected", self.config.name)),
         }
+    }
+}
+
+/// Read a resource from this backend
+#[derive(Clone)]
+pub struct ReadResource {
+    pub uri: String,
+}
+
+impl Message<ReadResource> for BackendActor {
+    type Reply = Result<serde_json::Value, String>;
+
+    async fn handle(
+        &mut self,
+        msg: ReadResource,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        match self.state {
+            BackendState::Connected => self.read_resource(&msg.uri).await,
+            BackendState::CircuitOpen => {
+                if self.circuit_breaker.should_attempt_close() {
+                    self.read_resource(&msg.uri).await
+                } else {
+                    Err(format!(
+                        "Backend '{}' circuit breaker is open",
+                        self.config.name
+                    ))
+                }
+            }
+            BackendState::Reconnecting => Err(format!(
+                "Backend '{}' is reconnecting (attempt {})",
+                self.config.name, self.reconnect_attempts
+            )),
+            _ => Err(format!("Backend '{}' is not connected", self.config.name)),
+        }
+    }
+}
+
+/// Get a prompt from this backend
+#[derive(Clone)]
+pub struct GetPrompt {
+    pub name: String,
+    pub arguments: Option<std::collections::HashMap<String, String>>,
+}
+
+impl Message<GetPrompt> for BackendActor {
+    type Reply = Result<serde_json::Value, String>;
+
+    async fn handle(
+        &mut self,
+        msg: GetPrompt,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        match self.state {
+            BackendState::Connected => self.get_prompt(&msg.name, msg.arguments).await,
+            BackendState::CircuitOpen => {
+                if self.circuit_breaker.should_attempt_close() {
+                    self.get_prompt(&msg.name, msg.arguments).await
+                } else {
+                    Err(format!(
+                        "Backend '{}' circuit breaker is open",
+                        self.config.name
+                    ))
+                }
+            }
+            BackendState::Reconnecting => Err(format!(
+                "Backend '{}' is reconnecting (attempt {})",
+                self.config.name, self.reconnect_attempts
+            )),
+            _ => Err(format!("Backend '{}' is not connected", self.config.name)),
+        }
+    }
+}
+
+/// List resources from this backend
+pub struct ListResources;
+
+impl Message<ListResources> for BackendActor {
+    type Reply = Result<Vec<ResourceDefinition>, String>;
+
+    async fn handle(
+        &mut self,
+        _msg: ListResources,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.state != BackendState::Connected {
+            return Err(format!("Backend '{}' is not connected", self.config.name));
+        }
+
+        self.fetch_resources()
+            .await
+            .map_err(|e| format!("Failed to fetch resources: {e}"))
+    }
+}
+
+/// List prompts from this backend
+pub struct ListPrompts;
+
+impl Message<ListPrompts> for BackendActor {
+    type Reply = Result<Vec<PromptDefinition>, String>;
+
+    async fn handle(
+        &mut self,
+        _msg: ListPrompts,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.state != BackendState::Connected {
+            return Err(format!("Backend '{}' is not connected", self.config.name));
+        }
+
+        self.fetch_prompts()
+            .await
+            .map_err(|e| format!("Failed to fetch prompts: {e}"))
     }
 }
 

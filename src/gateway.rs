@@ -3,19 +3,28 @@
 //! Responsibilities:
 //! - Spawn and manage backend actors
 //! - Handle incoming MCP requests
-//! - Route tool calls to appropriate backends
+//! - Route tool calls, resource reads, and prompt gets to appropriate backends
 //! - Graceful error handling when backends fail
 
-use crate::backend::{BackendActor, CallTool, ForceReconnect, GetBackendInfo};
-use crate::config::Config;
-use crate::registry::{
-    GetBackendStatus, ListTools, RegisterBackend, RegistryActor, ResolveToolBackend, ToolRoute,
-};
-use crate::types::{BackendInfo, JsonRpcRequest, JsonRpcResponse};
+use std::collections::HashMap;
+
 use kameo::actor::{Actor, ActorRef};
 use kameo::error::BoxError;
 use kameo::message::{Context, Message};
-use std::collections::HashMap;
+
+use crate::backend::{
+    BackendActor, CallTool, ForceReconnect, GetBackendInfo, GetPrompt, ListPrompts, ListResources,
+    ReadResource,
+};
+use crate::config::{BackendConfig, Config};
+use crate::registry::{
+    GetBackendStatus, ListTools, RegisterBackend, RegistryActor, RemoveBackend, ResolveToolBackend,
+    ToolRoute,
+};
+use crate::types::{
+    BackendInfo, JsonRpcRequest, JsonRpcResponse, NamespacedPrompt, NamespacedResource,
+    PromptDefinition, ResourceDefinition,
+};
 
 /// The main gateway actor
 pub struct GatewayActor {
@@ -101,11 +110,13 @@ impl Message<HandleRequest> for GatewayActor {
                 serde_json::json!({
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {
-                        "name": "mcp-gateway",
+                        "name": "axon-gateway",
                         "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
-                        "tools": {}
+                        "tools": {},
+                        "resources": {},
+                        "prompts": {}
                     }
                 }),
             ),
@@ -189,6 +200,157 @@ impl Message<HandleRequest> for GatewayActor {
                         -32601,
                         format!("Unknown tool: {tool_name}"),
                     ),
+                }
+            }
+
+            // List all resources from all backends
+            "resources/list" => {
+                let mut all_resources: Vec<ResourceDefinition> = Vec::new();
+
+                for (backend_name, backend) in &self.backends {
+                    // ask() returns Result<T, SendError<M, E>> when Reply = Result<T, E>
+                    match backend.ask(ListResources).await {
+                        Ok(resources) => {
+                            // Namespace the resources
+                            for resource in resources {
+                                let namespaced = NamespacedResource::new(backend_name, resource);
+                                all_resources.push(namespaced.definition);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to list resources from backend '{}': {:?}",
+                                backend_name,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                JsonRpcResponse::success(
+                    request.id,
+                    serde_json::json!({
+                        "resources": all_resources
+                    }),
+                )
+            }
+
+            // Read a specific resource
+            "resources/read" => {
+                let params = request.params;
+                let uri = params
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Parse the namespaced URI to find backend and original URI
+                // Format: "{backend}://{original_uri}"
+                if let Some((backend_name, original_uri)) = uri.split_once("://") {
+                    if let Some(backend) = self.backends.get(backend_name) {
+                        match backend
+                            .ask(ReadResource {
+                                uri: original_uri.to_string(),
+                            })
+                            .await
+                        {
+                            Ok(result) => JsonRpcResponse::success(request.id, result),
+                            Err(e) => JsonRpcResponse::error(
+                                request.id,
+                                -32000,
+                                format!("Failed to read resource: {e:?}"),
+                            ),
+                        }
+                    } else {
+                        JsonRpcResponse::error(
+                            request.id,
+                            -32000,
+                            format!("Backend '{backend_name}' not found"),
+                        )
+                    }
+                } else {
+                    JsonRpcResponse::error(
+                        request.id,
+                        -32602,
+                        format!("Invalid resource URI format: {uri}"),
+                    )
+                }
+            }
+
+            // List all prompts from all backends
+            "prompts/list" => {
+                let mut all_prompts: Vec<PromptDefinition> = Vec::new();
+
+                for (backend_name, backend) in &self.backends {
+                    match backend.ask(ListPrompts).await {
+                        Ok(prompts) => {
+                            // Namespace the prompts
+                            for prompt in prompts {
+                                let namespaced = NamespacedPrompt::new(backend_name, prompt);
+                                all_prompts.push(namespaced.definition);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to list prompts from backend '{}': {:?}",
+                                backend_name,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                JsonRpcResponse::success(
+                    request.id,
+                    serde_json::json!({
+                        "prompts": all_prompts
+                    }),
+                )
+            }
+
+            // Get a specific prompt
+            "prompts/get" => {
+                let params = request.params;
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let arguments: Option<HashMap<String, String>> = params
+                    .get("arguments")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+                // Parse the namespaced name to find backend and original name
+                // Format: "{backend}_{original_name}"
+                if let Some((backend_name, original_name)) = name.split_once('_') {
+                    if let Some(backend) = self.backends.get(backend_name) {
+                        match backend
+                            .ask(GetPrompt {
+                                name: original_name.to_string(),
+                                arguments,
+                            })
+                            .await
+                        {
+                            Ok(result) => JsonRpcResponse::success(request.id, result),
+                            Err(e) => JsonRpcResponse::error(
+                                request.id,
+                                -32000,
+                                format!("Failed to get prompt: {e:?}"),
+                            ),
+                        }
+                    } else {
+                        JsonRpcResponse::error(
+                            request.id,
+                            -32000,
+                            format!("Backend '{backend_name}' not found"),
+                        )
+                    }
+                } else {
+                    JsonRpcResponse::error(
+                        request.id,
+                        -32602,
+                        format!("Invalid prompt name format (expected 'backend_name'): {name}"),
+                    )
                 }
             }
 
@@ -311,4 +473,176 @@ impl Message<GetBackendInfoMsg> for GatewayActor {
             Err(e) => Err(format!("Failed to get backend info: {e:?}")),
         }
     }
+}
+
+/// Add a new backend dynamically (for hot reload)
+pub struct AddBackend {
+    pub config: BackendConfig,
+}
+
+impl Message<AddBackend> for GatewayActor {
+    type Reply = Result<(), String>;
+
+    async fn handle(
+        &mut self,
+        msg: AddBackend,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let name = msg.config.name.clone();
+
+        if self.backends.contains_key(&name) {
+            return Err(format!("Backend '{}' already exists", name));
+        }
+
+        if !msg.config.enabled {
+            return Err(format!("Backend '{}' is disabled", name));
+        }
+
+        // Register in registry
+        self.registry
+            .tell(RegisterBackend { name: name.clone() })
+            .await
+            .map_err(|e| format!("Failed to register backend: {e:?}"))?;
+
+        // Spawn backend actor
+        let backend_actor = BackendActor::new(msg.config, self.registry.clone());
+        let actor_ref = kameo::spawn(backend_actor);
+
+        self.backends.insert(name.clone(), actor_ref);
+        tracing::info!("Added backend: {}", name);
+
+        Ok(())
+    }
+}
+
+/// Remove a backend dynamically (for hot reload)
+pub struct RemoveBackendMsg {
+    pub name: String,
+}
+
+impl Message<RemoveBackendMsg> for GatewayActor {
+    type Reply = Result<(), String>;
+
+    async fn handle(
+        &mut self,
+        msg: RemoveBackendMsg,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let actor_ref = self
+            .backends
+            .remove(&msg.name)
+            .ok_or_else(|| format!("Backend '{}' not found", msg.name))?;
+
+        // Stop the backend actor
+        if let Err(e) = actor_ref.stop_gracefully().await {
+            tracing::warn!("Failed to stop backend '{}' gracefully: {:?}", msg.name, e);
+        }
+
+        // Remove from registry
+        self.registry
+            .tell(RemoveBackend {
+                name: msg.name.clone(),
+            })
+            .await
+            .map_err(|e| format!("Failed to remove from registry: {e:?}"))?;
+
+        tracing::info!("Removed backend: {}", msg.name);
+        Ok(())
+    }
+}
+
+/// Reload configuration (for hot reload)
+pub struct ReloadConfig {
+    pub config: Config,
+}
+
+impl Message<ReloadConfig> for GatewayActor {
+    type Reply = Result<ReloadResult, String>;
+
+    async fn handle(
+        &mut self,
+        msg: ReloadConfig,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let new_config = msg.config;
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut errors = Vec::new();
+
+        // Find backends to add (in new config but not current)
+        let current_names: std::collections::HashSet<_> = self.backends.keys().cloned().collect();
+        let new_names: std::collections::HashSet<_> = new_config
+            .backends
+            .iter()
+            .filter(|b| b.enabled)
+            .map(|b| b.name.clone())
+            .collect();
+
+        // Remove backends that are no longer in config
+        for name in current_names.difference(&new_names) {
+            if let Some(actor_ref) = self.backends.remove(name) {
+                if let Err(e) = actor_ref.stop_gracefully().await {
+                    errors.push(format!("Failed to stop '{}': {e:?}", name));
+                }
+                let _ = self
+                    .registry
+                    .tell(RemoveBackend { name: name.clone() })
+                    .await;
+                removed.push(name.clone());
+            }
+        }
+
+        // Add new backends
+        for backend_config in &new_config.backends {
+            if !backend_config.enabled {
+                continue;
+            }
+            if !current_names.contains(&backend_config.name) {
+                // Register in registry
+                if let Err(e) = self
+                    .registry
+                    .tell(RegisterBackend {
+                        name: backend_config.name.clone(),
+                    })
+                    .await
+                {
+                    errors.push(format!(
+                        "Failed to register '{}': {e:?}",
+                        backend_config.name
+                    ));
+                    continue;
+                }
+
+                // Spawn backend actor
+                let backend_actor =
+                    BackendActor::new(backend_config.clone(), self.registry.clone());
+                let actor_ref = kameo::spawn(backend_actor);
+                self.backends.insert(backend_config.name.clone(), actor_ref);
+                added.push(backend_config.name.clone());
+            }
+        }
+
+        // Update internal config
+        self.config = new_config;
+
+        tracing::info!(
+            "Config reloaded: {} added, {} removed, {} errors",
+            added.len(),
+            removed.len(),
+            errors.len()
+        );
+
+        Ok(ReloadResult {
+            added,
+            removed,
+            errors,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, kameo::Reply)]
+pub struct ReloadResult {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub errors: Vec<String>,
 }

@@ -13,34 +13,52 @@ mod gateway;
 mod registry;
 mod server;
 mod types;
+mod watcher;
+
+use std::env;
 
 use color_eyre::eyre::{Result, WrapErr};
-use config::Config;
-use gateway::GatewayActor;
-use registry::RegistryActor;
-use server::AppState;
-use std::env;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+use crate::config::Config;
+use crate::gateway::GatewayActor;
+use crate::registry::RegistryActor;
+use crate::server::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install color_eyre for pretty error reporting
     color_eyre::install()?;
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mcp_gateway=debug".parse()?)
-                .add_directive("info".parse()?),
-        )
-        .init();
+    // Check if JSON logging is requested
+    let json_logging = env::var("AXON_LOG_JSON").is_ok();
 
-    tracing::info!("Starting MCP Gateway v{}", env!("CARGO_PKG_VERSION"));
+    // Initialize logging
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("axon_gateway=debug".parse()?)
+        .add_directive("info".parse()?);
+
+    if json_logging {
+        // JSON logging for production/structured log aggregation
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        // Pretty logging for development
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
+
+    tracing::info!("Starting Axon Gateway v{}", env!("CARGO_PKG_VERSION"));
 
     // Load config
     let config_path = env::args()
         .nth(1)
-        .or_else(|| env::var("MCP_GATEWAY_CONFIG").ok())
+        .or_else(|| env::var("AXON_GATEWAY_CONFIG").ok())
         .unwrap_or_else(|| "config.toml".to_string());
 
     tracing::info!("Loading config from: {}", config_path);
@@ -59,10 +77,19 @@ async fn main() -> Result<()> {
     // Give actors time to initialize
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+    // Start config file watcher for hot reload
+    if let Err(e) = watcher::start_config_watcher(&config_path, gateway.clone()) {
+        tracing::warn!(
+            "Failed to start config watcher: {}. Hot reload disabled.",
+            e
+        );
+    }
+
     // Start HTTP server
     let state = AppState {
         gateway,
         auth_token,
+        config_path: Some(config_path),
     };
 
     server::serve(state, &bind_addr)
