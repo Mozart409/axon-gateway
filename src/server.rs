@@ -3,9 +3,11 @@
 //! Provides:
 //! - POST /mcp - JSON-RPC endpoint (Streamable HTTP)
 //! - GET /mcp/sse - SSE endpoint for streaming
+//! - POST /mcp/group/{name} - JSON-RPC scoped to a tool group
 //! - GET /health - Health check
 //! - GET /status - Gateway status
 //! - GET /status/detailed - Detailed backend status
+//! - GET /status/groups - List tool groups
 //! - GET /metrics - Prometheus metrics
 //! - POST /admin/backends/{name}/reconnect - Force reconnect a backend
 //! - POST /admin/backends/{name}/disable - Disable a backend
@@ -39,7 +41,7 @@ use crate::config::Config;
 use crate::error::ServerError;
 use crate::gateway::{
     DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect, GatewayActor, GetDetailedStatus,
-    GetStatus, HandleRequest, ReloadConfig,
+    GetStatus, HandleGroupRequest, HandleRequest, ReloadConfig,
 };
 use crate::types::JsonRpcRequest;
 
@@ -63,6 +65,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/status", get(get_status))
         .route("/status/detailed", get(get_detailed_status))
+        // Tool group endpoints (subset of tools via named groups)
+        .route("/mcp/group/{group_name}", post(handle_group_request))
+        .route("/status/groups", get(list_tool_groups))
         // Metrics endpoint
         .route("/metrics", get(prometheus_metrics))
         // Admin endpoints
@@ -212,6 +217,57 @@ async fn handle_mcp_sse(
             .interval(Duration::from_secs(30))
             .text("ping"),
     ))
+}
+
+/// Handle tool group endpoint - JSON-RPC scoped to a tool group
+///
+/// Same as `/mcp` but only lists tools in the specified group.
+/// Tool calls are forwarded normally (no restriction to group tools at call time).
+async fn handle_group_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_name): Path<String>,
+    Json(request): Json<JsonRpcRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let identity = verify_auth(&headers, &state.auth_manager)?;
+
+    // For tool calls, check tool-level permissions
+    if request.method == "tools/call"
+        && let Some(tool_name) = request.params.get("name").and_then(|v| v.as_str())
+        && let Err(e) = AuthManager::check_tool_permission(identity.as_ref(), tool_name)
+    {
+        tracing::warn!("Tool permission denied: {e}");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let response = state
+        .gateway
+        .ask(HandleGroupRequest {
+            request,
+            identity: identity.map(Arc::new),
+            group_name,
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("Gateway error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(response))
+}
+
+/// List available tool groups
+async fn list_tool_groups(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
+    let groups = state
+        .gateway
+        .ask(crate::gateway::GetToolGroups)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to list tool groups: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(json!({ "groups": groups })))
 }
 
 /// Health check endpoint

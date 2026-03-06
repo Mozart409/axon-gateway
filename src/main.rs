@@ -86,8 +86,16 @@ async fn main() -> Result<()> {
         tracing::warn!("No authentication configured - gateway is open");
     }
 
-    // Spawn registry actor
-    let registry = kameo::spawn(RegistryActor::new());
+    // Spawn registry actor (with tool groups if configured)
+    let registry = if config.groups.is_empty() {
+        kameo::spawn(RegistryActor::new())
+    } else {
+        tracing::info!(
+            "Tool groups configured: {:?}",
+            config.groups.iter().map(|g| &g.name).collect::<Vec<_>>()
+        );
+        kameo::spawn(RegistryActor::with_groups(config.groups.clone()))
+    };
 
     // Spawn gateway actor
     let gateway = kameo::spawn(GatewayActor::new(config, registry));

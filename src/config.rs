@@ -37,6 +37,27 @@ pub struct Config {
     /// Named API tokens with permissions
     #[serde(default)]
     pub tokens: Vec<TokenConfig>,
+    /// Tool groups: expose subsets of tools via different path prefixes
+    #[serde(default)]
+    pub groups: Vec<ToolGroupConfig>,
+}
+
+/// Tool group configuration
+///
+/// Expose subsets of tools via different endpoints, e.g. `/mcp/coding`
+/// only exposes tools matching the configured patterns.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolGroupConfig {
+    /// Group name used as path suffix: `/mcp/{name}`
+    pub name: String,
+    /// Tool name patterns to include (supports `"backend_*"` globs)
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Backends to include (empty = all)
+    #[serde(default)]
+    pub backends: Vec<String>,
+    /// Optional description for this group
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

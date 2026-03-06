@@ -20,8 +20,8 @@ use crate::backend::{
 };
 use crate::config::{BackendConfig, Config};
 use crate::registry::{
-    GetBackendStatus, ListTools, RegisterBackend, RegistryActor, RemoveBackend, ResolveToolBackend,
-    ToolRoute,
+    GetBackendStatus, ListToolGroup, ListToolGroups, ListTools, RegisterBackend, RegistryActor,
+    RemoveBackend, ResolveToolBackend, ToolRoute,
 };
 use crate::types::{
     BackendInfo, JsonRpcRequest, JsonRpcResponse, NamespacedPrompt, NamespacedResource,
@@ -430,6 +430,74 @@ impl Message<GetStatus> for GatewayActor {
             backend_count: self.backends.len(),
             backends: self.backends.keys().cloned().collect(),
         }
+    }
+}
+
+/// Handle a JSON-RPC request scoped to a tool group
+///
+/// For `tools/list`, returns only tools in the specified group.
+/// Other methods are handled the same as regular requests.
+#[derive(Clone)]
+pub struct HandleGroupRequest {
+    pub request: JsonRpcRequest,
+    pub identity: Option<Arc<TokenIdentity>>,
+    pub group_name: String,
+}
+
+impl Message<HandleGroupRequest> for GatewayActor {
+    type Reply = JsonRpcResponse;
+
+    async fn handle(
+        &mut self,
+        msg: HandleGroupRequest,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let request = msg.request.clone();
+
+        // For tools/list, return group-filtered tools
+        if request.method == "tools/list" {
+            return match self
+                .registry
+                .ask(ListToolGroup {
+                    group_name: msg.group_name.clone(),
+                })
+                .await
+            {
+                Ok(tools) => {
+                    JsonRpcResponse::success(request.id, serde_json::json!({ "tools": tools }))
+                }
+                Err(e) => JsonRpcResponse::error(
+                    request.id,
+                    -32000,
+                    format!("Failed to list tools for group '{}': {e}", msg.group_name),
+                ),
+            };
+        }
+
+        // For all other methods, delegate to the normal handler
+        self.handle(
+            HandleRequest {
+                request: msg.request,
+                identity: msg.identity,
+            },
+            ctx,
+        )
+        .await
+    }
+}
+
+/// Get available tool groups
+pub struct GetToolGroups;
+
+impl Message<GetToolGroups> for GatewayActor {
+    type Reply = Vec<crate::registry::ToolGroupInfo>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetToolGroups,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.registry.ask(ListToolGroups).await.unwrap_or_default()
     }
 }
 

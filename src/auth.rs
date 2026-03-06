@@ -218,7 +218,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// - Exact match: `"backend_tool_name"`
 /// - Prefix wildcard: `"backend_*"` (matches all tools from backend)
 /// - Wildcard only: `"*"` (matches everything)
-fn tool_matches_pattern(tool_name: &str, pattern: &str) -> bool {
+pub fn tool_matches_pattern(tool_name: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
