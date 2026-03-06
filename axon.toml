@@ -6,8 +6,11 @@
 # Address to bind the gateway server
 bind = "0.0.0.0:8080"
 
-# Optional: require Bearer token auth
+# Optional: simple shared Bearer token auth
 # auth_token = "your-secret-token-here"
+
+# Optional: global rate limit (requests per minute per token, 0 = unlimited)
+# rate_limit_per_minute = 0
 
 # --- Backend MCP Servers ---
 # Each backend gets a namespace prefix for its tools.
@@ -53,3 +56,38 @@ enabled = true
 # transport = "http"
 # allowed_tools = ["list_containers", "get_logs"]  # only expose these
 # enabled = true
+
+# Example: backend with auth token forwarding
+# [[backends]]
+# name = "secure-api"
+# url = "http://localhost:3005/mcp"
+# transport = "http"
+# auth_token = "backend-secret-token"  # forwarded as Bearer token
+# enabled = true
+
+# Example: backend with custom environment variables (stdio)
+# [[backends]]
+# name = "local-tool"
+# command = "/usr/local/bin/mcp-tool"
+# transport = "stdio"
+# env = { API_KEY = "key123", DEBUG = "true" }
+# enabled = true
+
+# --- Named API Tokens with Permissions ---
+# Define multiple tokens with different access levels
+
+# Example: agent with full access
+# [[tokens]]
+# name = "claude-agent"
+# token = "tok_claude_abc123"
+# # allowed_tools = []  # empty = all tools
+# # allowed_backends = []  # empty = all backends
+# # rate_limit_per_minute = 0  # 0 = unlimited
+
+# Example: restricted agent
+# [[tokens]]
+# name = "limited-agent"
+# token = "tok_limited_xyz789"
+# allowed_tools = ["homeassistant_*", "jellyfin_search"]
+# allowed_backends = ["homeassistant", "jellyfin"]
+# rate_limit_per_minute = 60

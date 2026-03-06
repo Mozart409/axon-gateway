@@ -23,20 +23,53 @@
 //! transport = "stdio"
 //! ```
 
-use crate::error::ConfigError;
-use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
+
+use serde::Deserialize;
+
+use crate::error::ConfigError;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub gateway: GatewayConfig,
     pub backends: Vec<BackendConfig>,
+    /// Named API tokens with permissions
+    #[serde(default)]
+    pub tokens: Vec<TokenConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
     pub bind: String,
+    /// Simple shared auth token (for backward compat)
     pub auth_token: Option<String>,
+    /// Rate limit: max requests per minute per token (0 = unlimited)
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
+}
+
+/// Per-token configuration with permissions
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenConfig {
+    /// Display name for this token
+    pub name: String,
+    /// The secret token value
+    pub token: String,
+    /// Allowed tool patterns (empty = all tools allowed)
+    /// Supports glob-like patterns: `"backend_*"` or specific `"backend_tool_name"`
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Allowed backends (empty = all backends allowed)
+    #[serde(default)]
+    pub allowed_backends: Vec<String>,
+    /// Rate limit override for this token (0 = use global default)
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
+    /// Custom metadata for this token (for future use)
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +110,17 @@ pub struct BackendConfig {
     /// Optional: circuit breaker cooldown in seconds (default: 60)
     #[serde(default = "default_circuit_breaker_cooldown_secs")]
     pub circuit_breaker_cooldown_secs: u64,
+
+    /// Optional: auth token to send to this backend (Bearer token)
+    pub auth_token: Option<String>,
+
+    /// Optional: custom headers to send to this backend
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+
+    /// Optional: environment variables to set for stdio backends
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Default value for the `enabled` field when omitted from config
@@ -118,6 +162,9 @@ impl Default for BackendConfig {
             health_check_interval_secs: default_health_check_interval_secs(),
             max_consecutive_failures: default_max_consecutive_failures(),
             circuit_breaker_cooldown_secs: default_circuit_breaker_cooldown_secs(),
+            auth_token: None,
+            headers: HashMap::new(),
+            env: HashMap::new(),
         }
     }
 }

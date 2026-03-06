@@ -41,3 +41,14 @@ futures = "0.3"
 color-eyre = "0.6.5"
 notify = "7"            # File watching for hot reload
 uuid = { version = "1", features = ["v4"] }  # For request IDs
+
+# Auth & Security
+subtle = "2"            # Constant-time comparison for auth tokens
+http = "1"              # HTTP types for custom headers
+
+# Observability
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }

@@ -16,6 +16,7 @@ use kameo::message::{Context, Message};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
 use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -166,7 +167,27 @@ impl BackendActor {
                 );
 
                 let connect_timeout = Duration::from_secs(self.config.timeout_secs);
-                let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+
+                // Build transport config with optional auth and custom headers
+                let mut transport_config =
+                    StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                if let Some(token) = &self.config.auth_token {
+                    transport_config = transport_config.auth_header(token.clone());
+                }
+                if !self.config.headers.is_empty() {
+                    let custom_headers = self
+                        .config
+                        .headers
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            let name = k.parse::<http::HeaderName>().ok()?;
+                            let value = http::HeaderValue::from_str(v).ok()?;
+                            Some((name, value))
+                        })
+                        .collect();
+                    transport_config = transport_config.custom_headers(custom_headers);
+                }
+                let transport = StreamableHttpClientTransport::from_config(transport_config);
 
                 let service = timeout(connect_timeout, ().serve(transport))
                     .await
@@ -193,6 +214,11 @@ impl BackendActor {
 
                 let mut command = Command::new(cmd);
                 command.args(args);
+
+                // Set environment variables for stdio backends
+                for (key, value) in &self.config.env {
+                    command.env(key, value);
+                }
 
                 let transport = TokioChildProcess::new(command)
                     .map_err(|e| format!("Failed to spawn process {cmd}: {e}"))?;

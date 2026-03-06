@@ -6,6 +6,7 @@
 //! Or with environment variable:
 //!   `MCP_GATEWAY_CONFIG=config.toml` mcp-gateway
 
+mod auth;
 mod backend;
 mod config;
 mod error;
@@ -16,11 +17,13 @@ mod types;
 mod watcher;
 
 use std::env;
+use std::sync::Arc;
 
 use color_eyre::eyre::{Result, WrapErr};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::auth::AuthManager;
 use crate::config::Config;
 use crate::gateway::GatewayActor;
 use crate::registry::RegistryActor;
@@ -66,7 +69,14 @@ async fn main() -> Result<()> {
         .wrap_err_with(|| format!("failed to load config from '{config_path}'"))?;
 
     let bind_addr = config.gateway.bind.clone();
-    let auth_token = config.gateway.auth_token.clone();
+
+    // Initialize auth manager
+    let auth_manager = Arc::new(AuthManager::new(&config.gateway, &config.tokens));
+    if auth_manager.auth_required() {
+        tracing::info!("Authentication enabled");
+    } else {
+        tracing::warn!("No authentication configured - gateway is open");
+    }
 
     // Spawn registry actor
     let registry = kameo::spawn(RegistryActor::new());
@@ -88,7 +98,7 @@ async fn main() -> Result<()> {
     // Start HTTP server
     let state = AppState {
         gateway,
-        auth_token,
+        auth_manager,
         config_path: Some(config_path),
     };
 

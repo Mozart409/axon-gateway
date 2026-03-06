@@ -7,11 +7,13 @@
 //! - Graceful error handling when backends fail
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use kameo::actor::{Actor, ActorRef};
 use kameo::error::BoxError;
 use kameo::message::{Context, Message};
 
+use crate::auth::{AuthManager, TokenIdentity};
 use crate::backend::{
     BackendActor, CallTool, ForceReconnect, GetBackendInfo, GetPrompt, ListPrompts, ListResources,
     ReadResource,
@@ -88,6 +90,8 @@ impl Actor for GatewayActor {
 #[derive(Clone)]
 pub struct HandleRequest {
     pub request: JsonRpcRequest,
+    /// Resolved token identity (None = shared token or no auth)
+    pub identity: Option<Arc<TokenIdentity>>,
 }
 
 impl Message<HandleRequest> for GatewayActor {
@@ -170,6 +174,18 @@ impl Message<HandleRequest> for GatewayActor {
                         backend_name,
                         original_tool_name,
                     }) => {
+                        // Check backend permission
+                        if let Err(e) = AuthManager::check_backend_permission(
+                            msg.identity.as_deref(),
+                            &backend_name,
+                        ) {
+                            return JsonRpcResponse::error(
+                                request.id,
+                                -32000,
+                                format!("Permission denied: {e}"),
+                            );
+                        }
+
                         // Get the backend actor
                         if let Some(backend) = self.backends.get(&backend_name) {
                             // Forward the call

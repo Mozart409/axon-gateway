@@ -9,7 +9,9 @@
 //! - POST /admin/backends/{name}/reconnect - Force reconnect a backend
 //! - POST /admin/reload - Reload configuration
 
-use std::{convert::Infallible, time::Duration};
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -29,6 +31,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+use crate::auth::{AuthError, AuthManager, TokenIdentity};
 use crate::config::Config;
 use crate::error::ServerError;
 use crate::gateway::{
@@ -40,7 +43,7 @@ use crate::types::JsonRpcRequest;
 #[derive(Clone)]
 pub struct AppState {
     pub gateway: ActorRef<GatewayActor>,
-    pub auth_token: Option<String>,
+    pub auth_manager: Arc<AuthManager>,
     pub config_path: Option<String>,
 }
 
@@ -109,21 +112,34 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
     response
 }
 
-/// Verify auth token if configured
-fn verify_auth(headers: &HeaderMap, expected: Option<&String>) -> Result<(), StatusCode> {
-    if let Some(token) = expected {
-        let auth_header = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let provided_token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
-
-        if provided_token != token {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+/// Extract and validate auth token from request headers.
+///
+/// Returns `Ok(Some(identity))` for named tokens, `Ok(None)` for shared
+/// token or no auth configured, or `Err(StatusCode)` on auth failure.
+fn verify_auth(
+    headers: &HeaderMap,
+    auth_manager: &AuthManager,
+) -> Result<Option<TokenIdentity>, StatusCode> {
+    if !auth_manager.auth_required() {
+        return Ok(None);
     }
-    Ok(())
+
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let provided_token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
+
+    if provided_token.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    match auth_manager.validate_token(provided_token) {
+        Ok(identity) => Ok(identity),
+        Err(AuthError::RateLimited { .. }) => Err(StatusCode::TOO_MANY_REQUESTS),
+        Err(_) => Err(StatusCode::UNAUTHORIZED),
+    }
 }
 
 /// Handle POST /mcp - JSON-RPC over HTTP
@@ -132,11 +148,23 @@ async fn handle_mcp_request(
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    verify_auth(&headers, state.auth_token.as_ref())?;
+    let identity = verify_auth(&headers, &state.auth_manager)?;
+
+    // For tool calls, check tool-level permissions
+    if request.method == "tools/call"
+        && let Some(tool_name) = request.params.get("name").and_then(|v| v.as_str())
+        && let Err(e) = AuthManager::check_tool_permission(identity.as_ref(), tool_name)
+    {
+        tracing::warn!("Tool permission denied: {e}");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let response = state
         .gateway
-        .ask(HandleRequest { request })
+        .ask(HandleRequest {
+            request,
+            identity: identity.map(Arc::new),
+        })
         .await
         .map_err(|e| {
             tracing::error!("Gateway error: {:?}", e);
@@ -157,7 +185,7 @@ async fn handle_mcp_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    verify_auth(&headers, state.auth_token.as_ref())?;
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
 
     // For SSE transport, we send an initial "endpoint" message
     // Real implementation would maintain a session and stream responses
@@ -204,7 +232,7 @@ async fn force_backend_reconnect(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Admin endpoints require auth
-    verify_auth(&headers, state.auth_token.as_ref())?;
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
 
     // When Reply = Result<T, E>, ask().await returns Result<T, SendError<M, E>>
     let result = state
@@ -235,7 +263,7 @@ async fn reload_config(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Admin endpoints require auth
-    verify_auth(&headers, state.auth_token.as_ref())?;
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
 
     let config_path = state.config_path.as_ref().ok_or_else(|| {
         tracing::error!("Config path not set, cannot reload");
