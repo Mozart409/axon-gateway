@@ -66,27 +66,27 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
 - [x] **Prompt proxying** — Forward MCP `prompts/list` and `prompts/get`
 - [x] **Logging/tracing** — Structured logging with request IDs, JSON logging support
 
-### Phase 4: Auth & Security
+### Phase 4: Auth & Security ✅
 
-- [ ] **Bearer token auth** — Simple token auth (already scaffolded)
-- [ ] **Per-backend auth** — Pass auth headers to backends that need them
+- [x] **Bearer token auth** — Constant-time comparison with subtle crate
+- [x] **Per-backend auth** — Forward auth tokens/headers to backends via rmcp config
 - [ ] **OIDC integration** — Integrate with PocketID for SSO
-- [ ] **Tool-level permissions** — ACLs for which tools different tokens can access
-- [ ] **Rate limiting** — Per-token rate limits
+- [x] **Tool-level permissions** — Per-token ACLs with glob patterns (e.g., `backend_*`)
+- [x] **Rate limiting** — Per-token and global rate limits (requests/minute)
 
-### Phase 5: Observability & Operations
+### Phase 5: Observability & Operations ✅
 
-- [ ] **Prometheus metrics** — Tool call counts, latencies, error rates per backend
-- [ ] **Status API** — Detailed backend health, last error, tool counts
-- [ ] **Admin API** — Endpoints to reload config, force reconnect, disable backends
+- [x] **Prometheus metrics** — Tool call counts, latencies, error rates per backend at `/metrics`
+- [x] **Status API** — Detailed backend health via `/status/detailed`
+- [x] **Admin API** — Reload config, force reconnect, disable/enable backends
 - [ ] **Systemd unit** — Service file for running as daemon
 - [ ] **NixOS module** — Declarative config for your NixOS setup
 - [ ] **Docker image** — Multi-stage build, minimal image
 
-### Phase 6: Advanced
+### Phase 6: Advanced ✅
 
-- [ ] **Tool groups** — Expose subsets of tools via different endpoints (like MCPJungle)
-- [ ] **Caching** — Cache tool lists, invalidate on backend reconnect
+- [x] **Tool groups** — Expose subsets of tools via `/mcp/group/{name}` endpoints
+- [x] **Caching** — Cache tool lists with TTL, auto-invalidate on backend reconnect
 - [ ] **Streaming responses** — Properly proxy streaming tool results
 - [ ] **Multi-tenant** — Different configs/permissions per API key
 - [ ] **Web UI** — Simple dashboard showing backends, tools, recent calls
@@ -132,6 +132,7 @@ let result = client.peer().call_tool(CallToolRequestParams {
 [gateway]
 bind = "0.0.0.0:8080"      # Required: listen address
 auth_token = "secret"       # Optional: enable bearer auth
+rate_limit_per_minute = 0   # Optional: global rate limit (0 = unlimited)
 
 [[backends]]
 name = "unique-name"        # Required: used as namespace prefix
@@ -145,6 +146,22 @@ timeout_secs = 30           # Optional: per-backend timeout (default: 30)
 health_check_interval_secs = 30  # Optional: health check interval (default: 30, 0 = disabled)
 max_consecutive_failures = 3     # Optional: failures before circuit breaker opens (default: 3)
 circuit_breaker_cooldown_secs = 60  # Optional: cooldown before retry (default: 60)
+auth_token = "backend-secret"  # Optional: auth token forwarded to backend
+headers = { X-Custom = "value" }  # Optional: custom headers for backend
+env = { API_KEY = "key" }  # Optional: env vars for stdio backends
+
+[[tokens]]
+name = "agent-name"         # Required: display name
+token = "tok_secret123"     # Required: the token value
+allowed_tools = ["backend_*"]  # Optional: tool patterns (empty = all)
+allowed_backends = ["name"] # Optional: backend names (empty = all)
+rate_limit_per_minute = 60  # Optional: per-token rate limit
+
+[[groups]]
+name = "home"               # Required: group name (used in /mcp/group/{name})
+description = "Home tools"  # Optional: description
+backends = ["homeassistant"]  # Optional: filter by backend (empty = all)
+tools = ["homeassistant_*"] # Optional: tool patterns (empty = all)
 ```
 
 ### MCP Protocol Methods to Handle
@@ -187,10 +204,13 @@ axon-gateway/
     ├── config.rs        # Config types and parsing
     ├── types.rs         # Core types (Tool, JsonRpc, etc.)
     ├── error.rs         # Error types (thiserror)
-    ├── registry.rs      # Registry actor
+    ├── auth.rs          # Auth manager (tokens, ACLs, rate limiting)
+    ├── metrics.rs       # Prometheus metrics recording
+    ├── registry.rs      # Registry actor (with caching)
     ├── backend.rs       # Backend actor (rmcp client)
     ├── gateway.rs       # Gateway actor (orchestrator)
-    └── server.rs        # HTTP/SSE server
+    ├── server.rs        # HTTP/SSE server
+    └── watcher.rs       # Config file hot-reload watcher
 ```
 
 ## References
