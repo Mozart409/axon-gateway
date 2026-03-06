@@ -6,7 +6,10 @@
 //! - GET /health - Health check
 //! - GET /status - Gateway status
 //! - GET /status/detailed - Detailed backend status
+//! - GET /metrics - Prometheus metrics
 //! - POST /admin/backends/{name}/reconnect - Force reconnect a backend
+//! - POST /admin/backends/{name}/disable - Disable a backend
+//! - POST /admin/backends/{name}/enable - Enable a backend
 //! - POST /admin/reload - Reload configuration
 
 use std::convert::Infallible;
@@ -35,7 +38,8 @@ use crate::auth::{AuthError, AuthManager, TokenIdentity};
 use crate::config::Config;
 use crate::error::ServerError;
 use crate::gateway::{
-    ForceBackendReconnect, GatewayActor, GetDetailedStatus, GetStatus, HandleRequest, ReloadConfig,
+    DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect, GatewayActor, GetDetailedStatus,
+    GetStatus, HandleRequest, ReloadConfig,
 };
 use crate::types::JsonRpcRequest;
 
@@ -45,6 +49,8 @@ pub struct AppState {
     pub gateway: ActorRef<GatewayActor>,
     pub auth_manager: Arc<AuthManager>,
     pub config_path: Option<String>,
+    /// Prometheus metrics handle for rendering
+    pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 /// Create the Axum router
@@ -57,11 +63,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/status", get(get_status))
         .route("/status/detailed", get(get_detailed_status))
+        // Metrics endpoint
+        .route("/metrics", get(prometheus_metrics))
         // Admin endpoints
         .route(
             "/admin/backends/{name}/reconnect",
             post(force_backend_reconnect),
         )
+        .route("/admin/backends/{name}/disable", post(disable_backend))
+        .route("/admin/backends/{name}/enable", post(enable_backend))
         .route("/admin/reload", post(reload_config))
         // Middleware
         .layer(middleware::from_fn(request_id_middleware))
@@ -89,7 +99,7 @@ pub fn create_router(state: AppState) -> Router {
 #[derive(Clone)]
 struct RequestId(String);
 
-/// Middleware to add request ID to all requests
+/// Middleware to add request ID and record HTTP metrics
 async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Next) -> Response {
     // Check for existing request ID in header, or generate a new one
     let request_id = request
@@ -97,6 +107,9 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map_or_else(|| Uuid::new_v4().to_string(), String::from);
+
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
 
     // Store in request extensions for later use
     request
@@ -108,6 +121,9 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
     response
         .headers_mut()
         .insert("x-request-id", request_id.parse().unwrap());
+
+    // Record HTTP request metrics
+    crate::metrics::record_http_request(&method, &path, response.status().as_u16());
 
     response
 }
@@ -289,6 +305,69 @@ async fn reload_config(
             Ok(Json(json!({
                 "status": "error",
                 "message": format!("{:?}", e)
+            })))
+        }
+    }
+}
+
+/// Prometheus metrics endpoint
+async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    state.metrics_handle.render()
+}
+
+/// Disable a backend (stop routing traffic to it)
+async fn disable_backend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+
+    match state
+        .gateway
+        .ask(DisableBackendMsg {
+            backend_name: name.clone(),
+        })
+        .await
+    {
+        Ok(()) => Ok(Json(json!({
+            "status": "ok",
+            "message": format!("Backend '{name}' disabled")
+        }))),
+        Err(e) => {
+            tracing::warn!("Failed to disable backend '{}': {:?}", name, e);
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("{e:?}")
+            })))
+        }
+    }
+}
+
+/// Enable a previously disabled backend
+async fn enable_backend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+
+    match state
+        .gateway
+        .ask(EnableBackendMsg {
+            backend_name: name.clone(),
+        })
+        .await
+    {
+        Ok(()) => Ok(Json(json!({
+            "status": "ok",
+            "message": format!("Backend '{name}' enabled")
+        }))),
+        Err(e) => {
+            tracing::warn!("Failed to enable backend '{}': {:?}", name, e);
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("{e:?}")
             })))
         }
     }

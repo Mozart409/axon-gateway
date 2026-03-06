@@ -11,6 +11,7 @@ mod backend;
 mod config;
 mod error;
 mod gateway;
+mod metrics;
 mod registry;
 mod server;
 mod types;
@@ -70,6 +71,13 @@ async fn main() -> Result<()> {
 
     let bind_addr = config.gateway.bind.clone();
 
+    // Initialize Prometheus metrics exporter
+    let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let metrics_handle = prometheus_builder
+        .install_recorder()
+        .wrap_err("failed to install Prometheus metrics recorder")?;
+    tracing::info!("Prometheus metrics available at /metrics");
+
     // Initialize auth manager
     let auth_manager = Arc::new(AuthManager::new(&config.gateway, &config.tokens));
     if auth_manager.auth_required() {
@@ -100,6 +108,7 @@ async fn main() -> Result<()> {
         gateway,
         auth_manager,
         config_path: Some(config_path),
+        metrics_handle,
     };
 
     server::serve(state, &bind_addr)

@@ -188,20 +188,42 @@ impl Message<HandleRequest> for GatewayActor {
 
                         // Get the backend actor
                         if let Some(backend) = self.backends.get(&backend_name) {
+                            // Record metrics
+                            crate::metrics::record_tool_call(&backend_name, &original_tool_name);
+                            let start = std::time::Instant::now();
+
                             // Forward the call
                             match backend
                                 .ask(CallTool {
-                                    tool_name: original_tool_name,
+                                    tool_name: original_tool_name.clone(),
                                     arguments,
                                 })
                                 .await
                             {
-                                Ok(content) => JsonRpcResponse::success(request.id, content),
-                                Err(e) => JsonRpcResponse::error(
-                                    request.id,
-                                    -32000,
-                                    format!("Failed to call backend: {e}"),
-                                ),
+                                Ok(content) => {
+                                    crate::metrics::record_tool_call_duration(
+                                        &backend_name,
+                                        &original_tool_name,
+                                        start.elapsed().as_secs_f64(),
+                                    );
+                                    JsonRpcResponse::success(request.id, content)
+                                }
+                                Err(e) => {
+                                    crate::metrics::record_tool_call_error(
+                                        &backend_name,
+                                        &original_tool_name,
+                                    );
+                                    crate::metrics::record_tool_call_duration(
+                                        &backend_name,
+                                        &original_tool_name,
+                                        start.elapsed().as_secs_f64(),
+                                    );
+                                    JsonRpcResponse::error(
+                                        request.id,
+                                        -32000,
+                                        format!("Failed to call backend: {e}"),
+                                    )
+                                }
                             }
                         } else {
                             JsonRpcResponse::error(
@@ -264,6 +286,7 @@ impl Message<HandleRequest> for GatewayActor {
                 // Format: "{backend}://{original_uri}"
                 if let Some((backend_name, original_uri)) = uri.split_once("://") {
                     if let Some(backend) = self.backends.get(backend_name) {
+                        crate::metrics::record_resource_read(backend_name);
                         match backend
                             .ask(ReadResource {
                                 uri: original_uri.to_string(),
@@ -340,6 +363,7 @@ impl Message<HandleRequest> for GatewayActor {
                 // Format: "{backend}_{original_name}"
                 if let Some((backend_name, original_name)) = name.split_once('_') {
                     if let Some(backend) = self.backends.get(backend_name) {
+                        crate::metrics::record_prompt_get(backend_name);
                         match backend
                             .ask(GetPrompt {
                                 name: original_name.to_string(),
@@ -563,6 +587,95 @@ impl Message<RemoveBackendMsg> for GatewayActor {
             .map_err(|e| format!("Failed to remove from registry: {e:?}"))?;
 
         tracing::info!("Removed backend: {}", msg.name);
+        Ok(())
+    }
+}
+
+/// Disable a backend (stop it but keep in config)
+pub struct DisableBackendMsg {
+    pub backend_name: String,
+}
+
+impl Message<DisableBackendMsg> for GatewayActor {
+    type Reply = Result<(), String>;
+
+    async fn handle(
+        &mut self,
+        msg: DisableBackendMsg,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let actor_ref = self
+            .backends
+            .remove(&msg.backend_name)
+            .ok_or_else(|| format!("Backend '{}' not found", msg.backend_name))?;
+
+        // Stop the backend actor gracefully
+        if let Err(e) = actor_ref.stop_gracefully().await {
+            tracing::warn!(
+                "Failed to stop backend '{}' gracefully: {:?}",
+                msg.backend_name,
+                e
+            );
+        }
+
+        // Update registry to mark as disconnected (but don't remove)
+        let _ = self
+            .registry
+            .tell(crate::registry::UpdateBackend {
+                name: msg.backend_name.clone(),
+                state: crate::types::BackendState::Disconnected,
+                tools: vec![],
+                error: Some("Disabled by admin".to_string()),
+            })
+            .await;
+
+        crate::metrics::record_backend_state(&msg.backend_name, "disconnected");
+        tracing::info!("Disabled backend: {}", msg.backend_name);
+        Ok(())
+    }
+}
+
+/// Enable a previously disabled backend
+pub struct EnableBackendMsg {
+    pub backend_name: String,
+}
+
+impl Message<EnableBackendMsg> for GatewayActor {
+    type Reply = Result<(), String>;
+
+    async fn handle(
+        &mut self,
+        msg: EnableBackendMsg,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Check if already running
+        if self.backends.contains_key(&msg.backend_name) {
+            return Err(format!("Backend '{}' is already enabled", msg.backend_name));
+        }
+
+        // Find the backend config
+        let backend_config = self
+            .config
+            .backends
+            .iter()
+            .find(|b| b.name == msg.backend_name)
+            .ok_or_else(|| format!("Backend '{}' not found in config", msg.backend_name))?
+            .clone();
+
+        // Register in registry
+        self.registry
+            .tell(RegisterBackend {
+                name: msg.backend_name.clone(),
+            })
+            .await
+            .map_err(|e| format!("Failed to register backend: {e:?}"))?;
+
+        // Spawn backend actor
+        let backend_actor = BackendActor::new(backend_config, self.registry.clone());
+        let actor_ref = kameo::spawn(backend_actor);
+        self.backends.insert(msg.backend_name.clone(), actor_ref);
+
+        tracing::info!("Enabled backend: {}", msg.backend_name);
         Ok(())
     }
 }

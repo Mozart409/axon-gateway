@@ -249,6 +249,9 @@ impl BackendActor {
         self.reconnect_attempts = 0;
         self.circuit_breaker.reset();
 
+        // Record connected state in metrics
+        crate::metrics::record_backend_state(&self.config.name, "connected");
+
         // Fetch tools from backend
         let tools = self.fetch_tools().await?;
 
@@ -602,6 +605,7 @@ impl BackendActor {
                 self.circuit_breaker.consecutive_failures
             );
             self.state = BackendState::CircuitOpen;
+            crate::metrics::record_backend_state(&self.config.name, "circuit_open");
 
             // Update registry with circuit open state
             let _ = self
@@ -643,6 +647,7 @@ impl BackendActor {
             let backoff = self.calculate_backoff();
             self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
             self.state = BackendState::Reconnecting;
+            crate::metrics::record_backend_state(&self.config.name, "reconnecting");
 
             tracing::info!(
                 "Backend '{}' scheduling reconnect in {:?} (attempt {})",
@@ -736,16 +741,19 @@ impl BackendActor {
         match result {
             Ok(Ok(_)) => {
                 tracing::debug!("Backend '{}' health check passed", self.config.name);
+                crate::metrics::record_health_check(&self.config.name, true);
                 Ok(())
             }
             Ok(Err(e)) => {
                 let error_msg = format!("Health check failed: {e}");
                 tracing::warn!("Backend '{}' {}", self.config.name, error_msg);
+                crate::metrics::record_health_check(&self.config.name, false);
                 Err(error_msg)
             }
             Err(_) => {
                 let error_msg = "Health check timeout".to_string();
                 tracing::warn!("Backend '{}' {}", self.config.name, error_msg);
+                crate::metrics::record_health_check(&self.config.name, false);
                 Err(error_msg)
             }
         }
