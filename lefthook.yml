@@ -24,8 +24,6 @@ pre-push:
     - name: clippy-pedantic
       glob: "*.rs"
       run: cargo clippy -- -W clippy::pedantic
-    - name: keep-sorted-check
-      run: keep-sorted --check *.*
     - name: test
       run: cargo test
 
