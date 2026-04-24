@@ -17,6 +17,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use axum::{
@@ -34,7 +35,9 @@ use chrono::{DateTime, Utc};
 use futures::stream::{self, Stream};
 use kameo::actor::ActorRef;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use serde::Serialize;
 use serde_json::json;
+use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeFile;
 use tower_http::trace::TraceLayer;
@@ -56,10 +59,36 @@ pub struct AppState {
     pub gateway: ActorRef<GatewayActor>,
     pub auth_manager: Arc<AuthManager>,
     pub config_path: Option<String>,
+    pub ui_events: broadcast::Sender<UiEvent>,
+    pub sse_clients: Arc<AtomicU64>,
     pub started_at: SystemTime,
     pub process_id: u32,
     /// Prometheus metrics handle for rendering
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+}
+
+#[derive(Clone, Debug)]
+pub enum UiEvent {
+    BackendStatusChanged(DetailedGatewayStatus),
+    ConfigReloaded {
+        added: Vec<String>,
+        removed: Vec<String>,
+        errors: Vec<String>,
+    },
+    Flash(FlashMessage),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub enum FlashLevel {
+    Success,
+    Error,
+    Info,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FlashMessage {
+    pub level: FlashLevel,
+    pub message: String,
 }
 
 /// Create the Axum router
@@ -75,6 +104,19 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ui", get(handle_ui))
         .route("/ui/events", get(handle_ui_events))
         .route("/ui/partials/backends", get(handle_ui_backends_partial))
+        .route(
+            "/ui/actions/backends/{name}/reconnect",
+            post(handle_ui_reconnect_backend),
+        )
+        .route(
+            "/ui/actions/backends/{name}/disable",
+            post(handle_ui_disable_backend),
+        )
+        .route(
+            "/ui/actions/backends/{name}/enable",
+            post(handle_ui_enable_backend),
+        )
+        .route("/ui/actions/reload", post(handle_ui_reload_config))
         // Status endpoints
         .route("/health", get(health_check))
         .route("/build", get(get_build_info))
@@ -252,29 +294,48 @@ async fn handle_ui_events(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     let _identity = verify_auth(&headers, &state.auth_manager)?;
 
-    let stream = stream::unfold(
-        (tokio::time::interval(Duration::from_secs(5)), state),
-        |(mut interval, state)| async move {
-            interval.tick().await;
+    let initial_status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
+        tracing::error!("Failed to load initial UI status for SSE: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-            let event = match state.gateway.ask(GetDetailedStatus).await {
-                Ok(status) => {
-                    let html = render_backend_panel(&status).into_string();
-                    Ok(Event::default().event("backends").data(html))
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to refresh dashboard from SSE: {:?}", e);
-                    let html = html! {
-                        div class="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
-                            "Unable to refresh backend status."
-                        }
+    let active = state.sse_clients.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::metrics::record_ui_sse_lifecycle("connect");
+    crate::metrics::record_ui_sse_clients(active);
+    tracing::info!(active_clients = active, "UI SSE client connected");
+
+    let guard = SseClientGuard {
+        clients: Arc::clone(&state.sse_clients),
+    };
+    let stream = stream::unfold(
+        (
+            Some(UiEvent::BackendStatusChanged(initial_status)),
+            state.ui_events.subscribe(),
+            guard,
+        ),
+        |(initial, mut rx, guard)| async move {
+            let event = if let Some(event) = initial {
+                event
+            } else {
+                match rx.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        crate::metrics::record_ui_sse_dropped(skipped);
+                        tracing::warn!(skipped, "UI SSE client lagged behind event stream");
+                        UiEvent::Flash(FlashMessage {
+                            level: FlashLevel::Error,
+                            message: format!(
+                                "Live updates dropped ({skipped}). Dashboard will continue with latest state."
+                            ),
+                        })
                     }
-                    .into_string();
-                    Ok(Event::default().event("flash").data(html))
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
             };
 
-            Some((event, (interval, state)))
+            let event_name = ui_event_name(&event);
+            crate::metrics::record_ui_sse_event(event_name);
+            Some((Ok(ui_event_to_sse(event)), (None, rx, guard)))
         },
     );
 
@@ -283,6 +344,203 @@ async fn handle_ui_events(
             .interval(Duration::from_secs(30))
             .text("ping"),
     ))
+}
+
+async fn handle_ui_reconnect_backend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+
+    let flash = match state
+        .gateway
+        .ask(ForceBackendReconnect {
+            backend_name: name.clone(),
+        })
+        .await
+    {
+        Ok(()) => FlashMessage {
+            level: FlashLevel::Success,
+            message: format!("Reconnect started for backend '{name}'"),
+        },
+        Err(e) => FlashMessage {
+            level: FlashLevel::Error,
+            message: format!("Reconnect failed for '{name}': {e:?}"),
+        },
+    };
+
+    publish_ui_event(&state.ui_events, UiEvent::Flash(flash.clone()));
+    refresh_ui_backend_snapshot(&state).await;
+    Ok(Html(render_flash(&flash).into_string()))
+}
+
+async fn handle_ui_disable_backend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+
+    let flash = match state
+        .gateway
+        .ask(DisableBackendMsg {
+            backend_name: name.clone(),
+        })
+        .await
+    {
+        Ok(()) => FlashMessage {
+            level: FlashLevel::Success,
+            message: format!("Backend '{name}' disabled"),
+        },
+        Err(e) => FlashMessage {
+            level: FlashLevel::Error,
+            message: format!("Disable failed for '{name}': {e:?}"),
+        },
+    };
+
+    publish_ui_event(&state.ui_events, UiEvent::Flash(flash.clone()));
+    refresh_ui_backend_snapshot(&state).await;
+    Ok(Html(render_flash(&flash).into_string()))
+}
+
+async fn handle_ui_enable_backend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+
+    let flash = match state
+        .gateway
+        .ask(EnableBackendMsg {
+            backend_name: name.clone(),
+        })
+        .await
+    {
+        Ok(()) => FlashMessage {
+            level: FlashLevel::Success,
+            message: format!("Backend '{name}' enabled"),
+        },
+        Err(e) => FlashMessage {
+            level: FlashLevel::Error,
+            message: format!("Enable failed for '{name}': {e:?}"),
+        },
+    };
+
+    publish_ui_event(&state.ui_events, UiEvent::Flash(flash.clone()));
+    refresh_ui_backend_snapshot(&state).await;
+    Ok(Html(render_flash(&flash).into_string()))
+}
+
+async fn handle_ui_reload_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+
+    let config_path = state.config_path.as_ref().ok_or_else(|| {
+        tracing::error!("Config path not set, cannot reload from UI action");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let flash = match Config::load(config_path) {
+        Ok(new_config) => match state.gateway.ask(ReloadConfig { config: new_config }).await {
+            Ok(result) => {
+                publish_ui_event(
+                    &state.ui_events,
+                    UiEvent::ConfigReloaded {
+                        added: result.added.clone(),
+                        removed: result.removed.clone(),
+                        errors: result.errors.clone(),
+                    },
+                );
+                let message = format!(
+                    "Config reloaded (added: {}, removed: {}, errors: {})",
+                    result.added.len(),
+                    result.removed.len(),
+                    result.errors.len()
+                );
+                FlashMessage {
+                    level: if result.errors.is_empty() {
+                        FlashLevel::Success
+                    } else {
+                        FlashLevel::Info
+                    },
+                    message,
+                }
+            }
+            Err(e) => FlashMessage {
+                level: FlashLevel::Error,
+                message: format!("Config reload failed: {e:?}"),
+            },
+        },
+        Err(e) => FlashMessage {
+            level: FlashLevel::Error,
+            message: format!("Failed to read config: {e}"),
+        },
+    };
+
+    publish_ui_event(&state.ui_events, UiEvent::Flash(flash.clone()));
+    refresh_ui_backend_snapshot(&state).await;
+    Ok(Html(render_flash(&flash).into_string()))
+}
+
+fn publish_ui_event(sender: &broadcast::Sender<UiEvent>, event: UiEvent) {
+    if let Err(e) = sender.send(event) {
+        tracing::debug!("No UI subscribers for event broadcast: {e}");
+    }
+}
+
+async fn refresh_ui_backend_snapshot(state: &AppState) {
+    match state.gateway.ask(GetDetailedStatus).await {
+        Ok(status) => publish_ui_event(&state.ui_events, UiEvent::BackendStatusChanged(status)),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to refresh UI backend snapshot after action: {:?}",
+                e
+            );
+        }
+    }
+}
+
+fn ui_event_name(event: &UiEvent) -> &'static str {
+    match event {
+        UiEvent::BackendStatusChanged(_) => "backend_status_changed",
+        UiEvent::ConfigReloaded { .. } => "config_reloaded",
+        UiEvent::Flash(_) => "flash",
+    }
+}
+
+fn ui_event_to_sse(event: UiEvent) -> Event {
+    match event {
+        UiEvent::BackendStatusChanged(status) => Event::default()
+            .event("backend_status_changed")
+            .data(render_backend_panel(&status).into_string()),
+        UiEvent::ConfigReloaded {
+            added,
+            removed,
+            errors,
+        } => Event::default().event("config_reloaded").data(
+            render_flash(&FlashMessage {
+                level: if errors.is_empty() {
+                    FlashLevel::Success
+                } else {
+                    FlashLevel::Info
+                },
+                message: format!(
+                    "Config reloaded (added: {}, removed: {}, errors: {})",
+                    added.len(),
+                    removed.len(),
+                    errors.len()
+                ),
+            })
+            .into_string(),
+        ),
+        UiEvent::Flash(flash) => Event::default()
+            .event("flash")
+            .data(render_flash(&flash).into_string()),
+    }
 }
 
 fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -> Markup {
@@ -304,7 +562,17 @@ fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -> Markup {
                             "Axon Gateway"
                         }
                         p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
-                            "Server-rendered dashboard with SSE updates."
+                            "Server-rendered dashboard with SSE updates and HTMX actions."
+                        }
+                        div class="mt-4 flex flex-wrap gap-3" {
+                            button
+                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                                hx-post="/ui/actions/reload"
+                                hx-target="#flash"
+                                hx-swap="innerHTML"
+                            {
+                                "Reload Config"
+                            }
                         }
                     }
                     div
@@ -312,7 +580,7 @@ fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -> Markup {
                         sse-connect="/ui/events"
                     {
                         div id="flash" sse-swap="flash" {}
-                        div id="backend-panel" sse-swap="backends" {
+                        div id="backend-panel" sse-swap="backend_status_changed" {
                             (render_backend_panel(status))
                         }
                     }
@@ -337,6 +605,26 @@ fn build_fingerprint(state: &AppState) -> String {
     )
 }
 
+fn render_flash(flash: &FlashMessage) -> Markup {
+    let classes = match flash.level {
+        FlashLevel::Success => {
+            "rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300"
+        }
+        FlashLevel::Error => {
+            "rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"
+        }
+        FlashLevel::Info => {
+            "rounded-md border border-slate-200 bg-slate-100 px-4 py-3 text-sm text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+        }
+    };
+
+    html! {
+        div class=(classes) {
+            (flash.message)
+        }
+    }
+}
+
 fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
     html! {
         section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
@@ -348,10 +636,11 @@ fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
                 div class="mt-4 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800" {
                     table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800" {
                         thead class="bg-slate-50 dark:bg-slate-800/80" {
-                        tr {
+                            tr {
                                 th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Name" }
                                 th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "State" }
                                 th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Tools" }
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Actions" }
                                 th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Last Error" }
                             }
                         }
@@ -393,6 +682,34 @@ fn render_backend_row(backend: &BackendInfo) -> Markup {
             td class="px-4 py-3" { span class=(state_class) { (state_text) } }
             td class="px-4 py-3 text-slate-700 dark:text-slate-200" { (backend.tool_count) }
             td class="px-4 py-3" {
+                div class="flex flex-wrap gap-2" {
+                    button
+                        class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                        hx-post=(format!("/ui/actions/backends/{}/reconnect", backend.name))
+                        hx-target="#flash"
+                        hx-swap="innerHTML"
+                    {
+                        "Reconnect"
+                    }
+                    button
+                        class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                        hx-post=(format!("/ui/actions/backends/{}/disable", backend.name))
+                        hx-target="#flash"
+                        hx-swap="innerHTML"
+                    {
+                        "Disable"
+                    }
+                    button
+                        class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                        hx-post=(format!("/ui/actions/backends/{}/enable", backend.name))
+                        hx-target="#flash"
+                        hx-swap="innerHTML"
+                    {
+                        "Enable"
+                    }
+                }
+            }
+            td class="px-4 py-3" {
                 @if let Some(error) = &backend.last_error {
                     code class="text-xs text-red-700 dark:text-red-400" { (error) }
                 } @else {
@@ -400,6 +717,22 @@ fn render_backend_row(backend: &BackendInfo) -> Markup {
                 }
             }
         }
+    }
+}
+
+struct SseClientGuard {
+    clients: Arc<AtomicU64>,
+}
+
+impl Drop for SseClientGuard {
+    fn drop(&mut self) {
+        let active = self
+            .clients
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        crate::metrics::record_ui_sse_lifecycle("disconnect");
+        crate::metrics::record_ui_sse_clients(active);
+        tracing::info!(active_clients = active, "UI SSE client disconnected");
     }
 }
 
@@ -590,6 +923,7 @@ async fn get_build_info(State(state): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "git_sha": option_env!("AXON_GIT_SHA").unwrap_or("dev"),
         "pid": state.process_id,
+        "sse_clients": state.sse_clients.load(Ordering::SeqCst),
         "started_utc": started_utc.to_rfc3339(),
         "started_unix": started_unix,
     }))
@@ -749,8 +1083,34 @@ async fn enable_backend(
     }
 }
 
+fn start_ui_event_poller(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        let mut previous_snapshot = String::new();
+
+        loop {
+            interval.tick().await;
+
+            let status = match state.gateway.ask(GetDetailedStatus).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::warn!("UI event poller failed to fetch backend status: {:?}", e);
+                    continue;
+                }
+            };
+
+            let snapshot = serde_json::to_string(&status).unwrap_or_default();
+            if snapshot != previous_snapshot {
+                previous_snapshot.clone_from(&snapshot);
+                publish_ui_event(&state.ui_events, UiEvent::BackendStatusChanged(status));
+            }
+        }
+    });
+}
+
 /// Start the HTTP server
 pub async fn serve(state: AppState, bind: &str) -> Result<(), ServerError> {
+    start_ui_event_poller(state.clone());
     let router = create_router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -764,4 +1124,183 @@ pub async fn serve(state: AppState, bind: &str) -> Result<(), ServerError> {
     axum::serve(listener, router).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+    use std::time::SystemTime;
+
+    use axum::body::{Body, to_bytes};
+    use http::Request;
+    use kameo::spawn;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::{Config, GatewayConfig};
+    use crate::gateway::GatewayActor;
+    use crate::registry::RegistryActor;
+
+    fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+        static METRICS_HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+            OnceLock::new();
+
+        METRICS_HANDLE
+            .get_or_init(|| {
+                metrics_exporter_prometheus::PrometheusBuilder::new()
+                    .install_recorder()
+                    .expect("metrics recorder should install once in tests")
+            })
+            .clone()
+    }
+
+    fn test_state() -> AppState {
+        let config = Config {
+            gateway: GatewayConfig {
+                bind: String::from("127.0.0.1:0"),
+                auth_token: None,
+                rate_limit_per_minute: 0,
+            },
+            backends: Vec::new(),
+            tokens: Vec::new(),
+            groups: Vec::new(),
+        };
+
+        let registry = spawn(RegistryActor::new());
+        let gateway = spawn(GatewayActor::new(config, registry));
+
+        AppState {
+            gateway,
+            auth_manager: Arc::new(AuthManager::new(
+                &GatewayConfig {
+                    bind: String::from("127.0.0.1:0"),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                &[],
+            )),
+            config_path: None,
+            ui_events: broadcast::channel(64).0,
+            sse_clients: Arc::new(AtomicU64::new(0)),
+            started_at: SystemTime::now(),
+            process_id: std::process::id(),
+            metrics_handle: test_metrics_handle(),
+        }
+    }
+
+    #[test]
+    fn ui_event_names_are_stable() {
+        let flash = UiEvent::Flash(FlashMessage {
+            level: FlashLevel::Info,
+            message: String::from("test"),
+        });
+
+        assert_eq!(ui_event_name(&flash), "flash");
+    }
+
+    #[test]
+    fn render_flash_contains_message() {
+        let flash = FlashMessage {
+            level: FlashLevel::Success,
+            message: String::from("done"),
+        };
+
+        let markup = render_flash(&flash).into_string();
+        assert!(markup.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn landing_page_renders() {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .method(http::Method::GET)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let html = String::from_utf8(body.to_vec()).expect("html should be utf-8");
+        assert!(html.contains("Open Dashboard"));
+        assert!(html.contains("started:"));
+    }
+
+    #[tokio::test]
+    async fn ui_page_renders_with_backend_panel() {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui")
+                    .method(http::Method::GET)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let html = String::from_utf8(body.to_vec()).expect("html should be utf-8");
+        assert!(html.contains("Axon Gateway Dashboard"));
+        assert!(html.contains("backend-panel"));
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_returns_metadata() {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/build")
+                    .method(http::Method::GET)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("build payload should be json");
+
+        assert!(payload.get("version").is_some());
+        assert!(payload.get("pid").is_some());
+        assert!(payload.get("started_utc").is_some());
+        assert!(payload.get("sse_clients").is_some());
+    }
+
+    #[tokio::test]
+    async fn htmx_reconnect_action_returns_flash_fragment() {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/actions/backends/missing/reconnect")
+                    .method(http::Method::POST)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let html = String::from_utf8(body.to_vec()).expect("html should be utf-8");
+        assert!(html.contains("Reconnect failed"));
+    }
 }

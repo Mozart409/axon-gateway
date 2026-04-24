@@ -83,8 +83,70 @@ MCP_GATEWAY_CONFIG=config.toml cargo run
 |----------|--------|-------------|
 | `/mcp` | POST | JSON-RPC endpoint (Streamable HTTP transport) |
 | `/mcp/sse` | GET | SSE endpoint for streaming transport |
+| `/` | GET | Landing page |
+| `/ui` | GET | SSR dashboard page |
+| `/ui/events` | GET | Dashboard SSE stream (`text/event-stream`) |
+| `/ui/partials/backends` | GET | SSR backend panel fragment |
+| `/ui/actions/backends/{name}/reconnect` | POST | HTMX action: reconnect backend |
+| `/ui/actions/backends/{name}/disable` | POST | HTMX action: disable backend |
+| `/ui/actions/backends/{name}/enable` | POST | HTMX action: enable backend |
+| `/ui/actions/reload` | POST | HTMX action: reload config |
+| `/build` | GET | Build/runtime metadata (version, pid, startup time) |
 | `/health` | GET | Health check |
 | `/status` | GET | Gateway status (backend list, counts) |
+
+## Frontend Architecture
+
+The web UI is SSR-first and keeps all rendering server-side:
+
+- **Server framework**: `axum`
+- **Templating**: `maud`
+- **Live updates**: `htmx` + SSE extension (`/ui/events`)
+- **Styling**: Tailwind CSS v4 (compiled `styles/output.css` served by axum)
+
+Runtime update flow:
+
+1. Client loads `/ui` (fully rendered HTML works without JavaScript).
+2. If JS is available, HTMX opens SSE connection to `/ui/events`.
+3. Backend status updates and admin actions publish typed UI events.
+4. SSE events carry HTML fragments (`backend_status_changed`, `flash`) swapped into the DOM.
+
+## UI Authentication
+
+UI routes use the same bearer auth logic as MCP/admin routes:
+
+- If no auth is configured, `/ui` and `/ui/events` are open.
+- If auth is configured, callers must send `Authorization: Bearer <token>`.
+- HTMX action routes under `/ui/actions/*` require auth and return HTML fragments.
+
+## Local UI Development
+
+From the repository root:
+
+```bash
+# terminal 1: run gateway
+bacon run-long
+
+# terminal 2: rebuild Tailwind on change
+bacon css-watch
+```
+
+Useful checks:
+
+```bash
+curl http://127.0.0.1:8080/build
+curl -I http://127.0.0.1:8080/styles/output.css
+```
+
+`/build` helps detect stale processes (pid/start time/fingerprint mismatch).
+
+## UI Follow-Up Backlog
+
+- Backend filtering/search and grouped backend views
+- Action audit log / live event feed panel
+- Pagination and virtualized rows for large backend/tool lists
+- More granular SSE topics per widget
+- Integration snapshots for rendered fragments
 
 ## How Tool Namespacing Works
 

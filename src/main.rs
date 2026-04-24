@@ -19,7 +19,10 @@ mod watcher;
 
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
+
+use tokio::sync::broadcast;
 
 use color_eyre::eyre::{Result, WrapErr};
 use tracing_subscriber::layer::SubscriberExt;
@@ -117,6 +120,8 @@ async fn main() -> Result<()> {
         gateway,
         auth_manager,
         config_path: Some(config_path),
+        ui_events: broadcast::channel(256).0,
+        sse_clients: Arc::new(AtomicU64::new(0)),
         started_at: SystemTime::now(),
         process_id: std::process::id(),
         metrics_handle,
