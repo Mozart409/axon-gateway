@@ -27,24 +27,27 @@
       # nix develop . --command fish
       devShells.default = pkgs.mkShell {
         buildInputs = with pkgs; [
-          rust
-          lazydocker
+          # keep-sorted start
           bacon
           cargo-deny
-          lefthook
-          cocogitto
-          just
           cargo-workspaces
-          opentofu
+          cocogitto
           dbeaver-bin
-          postgresql_16
-          tailwindcss_4
           docker
           docker-buildx
           docker-compose
-          sqlx-cli
+          just
+          keep-sorted
+          lazydocker
+          lefthook
           opencode
+          opentofu
+          postgresql_16
+          rust
+          sqlx-cli
+          tailwindcss_4
           typos
+          # keep-sorted end
         ];
         shellHook = ''
           lefthook install
