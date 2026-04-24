@@ -5,6 +5,7 @@
 //! - GET /mcp/sse - SSE endpoint for streaming
 //! - POST /mcp/group/{name} - JSON-RPC scoped to a tool group
 //! - GET /health - Health check
+//! - GET /build - Build and process metadata
 //! - GET /status - Gateway status
 //! - GET /status/detailed - Detailed backend status
 //! - GET /status/groups - List tool groups
@@ -16,7 +17,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::{
     Router,
@@ -24,15 +25,18 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{
-        IntoResponse, Json, Response,
+        Html, IntoResponse, Json, Response,
         sse::{Event, Sse},
     },
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use futures::stream::{self, Stream};
 use kameo::actor::ActorRef;
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::json;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeFile;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -40,10 +44,11 @@ use crate::auth::{AuthError, AuthManager, TokenIdentity};
 use crate::config::Config;
 use crate::error::ServerError;
 use crate::gateway::{
-    DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect, GatewayActor, GetDetailedStatus,
-    GetStatus, HandleGroupRequest, HandleRequest, ReloadConfig,
+    DetailedGatewayStatus, DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect,
+    GatewayActor, GetDetailedStatus, GetStatus, HandleGroupRequest, HandleRequest, ReloadConfig,
 };
 use crate::types::JsonRpcRequest;
+use crate::types::{BackendInfo, BackendState};
 
 /// Shared state for the HTTP server
 #[derive(Clone)]
@@ -51,6 +56,8 @@ pub struct AppState {
     pub gateway: ActorRef<GatewayActor>,
     pub auth_manager: Arc<AuthManager>,
     pub config_path: Option<String>,
+    pub started_at: SystemTime,
+    pub process_id: u32,
     /// Prometheus metrics handle for rendering
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
@@ -58,11 +65,19 @@ pub struct AppState {
 /// Create the Axum router
 pub fn create_router(state: AppState) -> Router {
     Router::new()
+        // Landing page
+        .route("/", get(handle_landing))
         // MCP endpoints
         .route("/mcp", post(handle_mcp_request))
         .route("/mcp/sse", get(handle_mcp_sse))
+        .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
+        // UI endpoints
+        .route("/ui", get(handle_ui))
+        .route("/ui/events", get(handle_ui_events))
+        .route("/ui/partials/backends", get(handle_ui_backends_partial))
         // Status endpoints
         .route("/health", get(health_check))
+        .route("/build", get(get_build_info))
         .route("/status", get(get_status))
         .route("/status/detailed", get(get_detailed_status))
         // Tool group endpoints (subset of tools via named groups)
@@ -97,7 +112,295 @@ pub fn create_router(state: AppState) -> Router {
                 )
             }),
         )
+        .fallback(handle_not_found)
         .with_state(state)
+}
+
+/// Handle GET / - simple landing page
+async fn handle_landing(State(state): State<AppState>) -> Html<String> {
+    let page = html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Axon Gateway" }
+                link rel="stylesheet" href="/styles/output.css?v=1";
+            }
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+                main class="mx-auto flex min-h-screen max-w-4xl items-center px-6 py-12" {
+                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
+                            "Axon Gateway"
+                        }
+                        h1 class="mt-3 text-3xl font-semibold tracking-tight" {
+                            "One endpoint for your MCP backends"
+                        }
+                        p class="mt-3 text-slate-600 dark:text-slate-300" {
+                            "Use the dashboard for live backend health, and the MCP endpoint for agent calls."
+                        }
+                        div class="mt-6 flex flex-wrap gap-3" {
+                            a
+                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                                href="/ui"
+                            {
+                                "Open Dashboard"
+                            }
+                            a
+                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                                href="/status"
+                            {
+                                "Gateway Status"
+                            }
+                            a
+                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                                href="/health"
+                            {
+                                "Health"
+                            }
+                        }
+                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
+                            (build_fingerprint(&state))
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    Html(page.into_string())
+}
+
+/// Global 404 page for unmatched routes
+async fn handle_not_found(State(state): State<AppState>) -> impl IntoResponse {
+    let page = html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Page Not Found" }
+                link rel="stylesheet" href="/styles/output.css?v=1";
+            }
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+                main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
+                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" { "404" }
+                        h1 class="mt-3 text-3xl font-semibold tracking-tight" { "Route not found" }
+                        p class="mt-3 text-slate-600 dark:text-slate-300" {
+                            "The page you requested does not exist on this gateway instance."
+                        }
+                        div class="mt-6 flex justify-center gap-3" {
+                            a
+                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                                href="/"
+                            {
+                                "Go Home"
+                            }
+                            a
+                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                                href="/ui"
+                            {
+                                "Open Dashboard"
+                            }
+                        }
+                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
+                            (build_fingerprint(&state))
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    (StatusCode::NOT_FOUND, Html(page.into_string()))
+}
+
+/// Handle GET /ui - SSR dashboard
+async fn handle_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+    let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
+        tracing::error!("Failed to get UI backend status: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let page = render_ui_page(&status, &state);
+    Ok(Html(page.into_string()))
+}
+
+/// Handle GET /ui/partials/backends - HTML fragment for backend list
+async fn handle_ui_backends_partial(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+    let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
+        tracing::error!("Failed to get backend partial status: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Html(render_backend_panel(&status).into_string()))
+}
+
+/// Handle GET /ui/events - SSE stream for HTMX updates
+async fn handle_ui_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+
+    let stream = stream::unfold(
+        (tokio::time::interval(Duration::from_secs(5)), state),
+        |(mut interval, state)| async move {
+            interval.tick().await;
+
+            let event = match state.gateway.ask(GetDetailedStatus).await {
+                Ok(status) => {
+                    let html = render_backend_panel(&status).into_string();
+                    Ok(Event::default().event("backends").data(html))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to refresh dashboard from SSE: {:?}", e);
+                    let html = html! {
+                        div class="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" {
+                            "Unable to refresh backend status."
+                        }
+                    }
+                    .into_string();
+                    Ok(Event::default().event("flash").data(html))
+                }
+            };
+
+            Some((event, (interval, state)))
+        },
+    );
+
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("ping"),
+    ))
+}
+
+fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Axon Gateway Dashboard" }
+                script src="https://unpkg.com/htmx.org@2.0.4" defer {};
+                script src="https://unpkg.com/htmx-ext-sse@2.2.2" defer {};
+                link rel="stylesheet" href="/styles/output.css?v=1";
+            }
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+                main class="mx-auto max-w-6xl p-6" {
+                    section class="mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                            "Axon Gateway"
+                        }
+                        p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
+                            "Server-rendered dashboard with SSE updates."
+                        }
+                    }
+                    div
+                        hx-ext="sse"
+                        sse-connect="/ui/events"
+                    {
+                        div id="flash" sse-swap="flash" {}
+                        div id="backend-panel" sse-swap="backends" {
+                            (render_backend_panel(status))
+                        }
+                    }
+                    footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
+                        (build_fingerprint(state))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn build_fingerprint(state: &AppState) -> String {
+    let started_utc: DateTime<Utc> = state.started_at.into();
+    let started = started_utc.format("%Y-%m-%d %H:%M:%S UTC");
+    let git_sha = option_env!("AXON_GIT_SHA").unwrap_or("dev");
+
+    format!(
+        "v{} | {git_sha} | pid:{} | started:{started}",
+        env!("CARGO_PKG_VERSION"),
+        state.process_id
+    )
+}
+
+fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
+    html! {
+        section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Backends" }
+            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (status.backend_count) " active backend actors" }
+            @if status.backends.is_empty() {
+                p class="mt-4 text-sm text-slate-500 dark:text-slate-400" { "No backends currently connected." }
+            } @else {
+                div class="mt-4 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800" {
+                    table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800" {
+                        thead class="bg-slate-50 dark:bg-slate-800/80" {
+                        tr {
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Name" }
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "State" }
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Tools" }
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Last Error" }
+                            }
+                        }
+                        tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-900" {
+                            @for backend in &status.backends {
+                                (render_backend_row(backend))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_backend_row(backend: &BackendInfo) -> Markup {
+    let state_text = match backend.state {
+        BackendState::Disconnected => "Disconnected",
+        BackendState::Connecting => "Connecting",
+        BackendState::Connected => "Connected",
+        BackendState::Failed => "Failed",
+        BackendState::CircuitOpen => "Circuit Open",
+        BackendState::Reconnecting => "Reconnecting",
+    };
+
+    let state_class = match backend.state {
+        BackendState::Connected => "text-emerald-700 dark:text-emerald-400",
+        BackendState::Connecting | BackendState::Reconnecting => {
+            "text-amber-700 dark:text-amber-400"
+        }
+        BackendState::Failed | BackendState::CircuitOpen | BackendState::Disconnected => {
+            "text-red-700 dark:text-red-400"
+        }
+    };
+
+    html! {
+        tr class="align-top" {
+            td class="px-4 py-3" { code { (backend.name) } }
+            td class="px-4 py-3" { span class=(state_class) { (state_text) } }
+            td class="px-4 py-3 text-slate-700 dark:text-slate-200" { (backend.tool_count) }
+            td class="px-4 py-3" {
+                @if let Some(error) = &backend.last_error {
+                    code class="text-xs text-red-700 dark:text-red-400" { (error) }
+                } @else {
+                    (PreEscaped("&mdash;"))
+                }
+            }
+        }
+    }
 }
 
 /// Request ID for tracing
@@ -273,6 +576,23 @@ async fn list_tool_groups(State(state): State<AppState>) -> Result<impl IntoResp
 /// Health check endpoint
 async fn health_check() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+/// Build and process metadata endpoint
+async fn get_build_info(State(state): State<AppState>) -> impl IntoResponse {
+    let started_utc: DateTime<Utc> = state.started_at.into();
+    let started_unix = state
+        .started_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": option_env!("AXON_GIT_SHA").unwrap_or("dev"),
+        "pid": state.process_id,
+        "started_utc": started_utc.to_rfc3339(),
+        "started_unix": started_unix,
+    }))
 }
 
 /// Gateway status endpoint
