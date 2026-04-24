@@ -101,3 +101,24 @@ pub fn record_prompt_get(backend: &str) {
     )
     .increment(1);
 }
+
+/// Record an SSE client count update.
+#[allow(clippy::cast_precision_loss)]
+pub fn record_ui_sse_clients(active_clients: u64) {
+    gauge!("axon_ui_sse_clients").set(active_clients as f64);
+}
+
+/// Record an SSE stream lifecycle event.
+pub fn record_ui_sse_lifecycle(event: &str) {
+    counter!("axon_ui_sse_lifecycle_total", "event" => event.to_string()).increment(1);
+}
+
+/// Record an SSE event fanout.
+pub fn record_ui_sse_event(event: &str) {
+    counter!("axon_ui_sse_events_total", "event" => event.to_string()).increment(1);
+}
+
+/// Record dropped SSE events.
+pub fn record_ui_sse_dropped(count: u64) {
+    counter!("axon_ui_sse_dropped_total").increment(count);
+}
