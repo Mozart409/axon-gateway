@@ -108,6 +108,29 @@ background = false
 on_change_strategy = "kill_then_restart"
 # kill = ["pkill", "-TERM", "-P"]
 
+# Watch and build Tailwind CSS in development
+[jobs.css-watch]
+command = [
+    "tailwindcss",
+    "-i", "styles/input.css",
+    "-o", "styles/output.css",
+    "--watch",
+]
+need_stdout = true
+allow_warnings = true
+background = false
+
+# Convenience job to run server and css watch together
+[jobs.dev]
+command = [
+    "bash",
+    "-lc",
+    "cargo run & tailwindcss -i styles/input.css -o styles/output.css --watch",
+]
+need_stdout = true
+allow_warnings = true
+background = false
+
 # This parameterized job runs the example of your choice, as soon
 # as the code compiles.
 # Call it as
