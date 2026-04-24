@@ -32,6 +32,7 @@ serde_json = "1"
 # Config
 toml = "0.8"
 dotenvy = "0.15"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 # Utilities
 dashmap = "6"           # Concurrent hashmap for registry
