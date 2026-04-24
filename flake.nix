@@ -46,7 +46,6 @@
           rust
           sqlx-cli
           tailwindcss_4
-          typos
           # keep-sorted end
         ];
         shellHook = ''
