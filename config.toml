@@ -34,7 +34,7 @@ auth_token = "${NETALERTX_TOKEN}"  # from .env or process env
 name = "proxmox"
 url = "http://localhost:3003/mcp/sse"
 transport = "sse"
-enabled = true
+enabled = false 
 
 # Example: stdio-based MCP server (local binary)
 # [[backends]]
