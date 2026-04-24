@@ -200,10 +200,106 @@ pub enum TransportType {
 
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+
+        let env_vars = load_env_vars(path)?;
+        config.resolve_env_vars(&env_vars)?;
+
         config.validate()?;
         Ok(config)
+    }
+
+    fn resolve_env_vars(&mut self, env_vars: &HashMap<String, String>) -> Result<(), ConfigError> {
+        self.gateway.bind = resolve_placeholders(&self.gateway.bind, "gateway.bind", env_vars)?;
+        self.gateway.auth_token = resolve_option_placeholder(
+            self.gateway.auth_token.take(),
+            "gateway.auth_token",
+            env_vars,
+        )?;
+
+        for (index, token) in self.tokens.iter_mut().enumerate() {
+            token.name =
+                resolve_placeholders(&token.name, &format!("tokens[{index}].name"), env_vars)?;
+            token.token =
+                resolve_placeholders(&token.token, &format!("tokens[{index}].token"), env_vars)?;
+            resolve_vec_placeholders(
+                &mut token.allowed_tools,
+                &format!("tokens[{index}].allowed_tools"),
+                env_vars,
+            )?;
+            resolve_vec_placeholders(
+                &mut token.allowed_backends,
+                &format!("tokens[{index}].allowed_backends"),
+                env_vars,
+            )?;
+            resolve_map_value_placeholders(
+                &mut token.metadata,
+                &format!("tokens[{index}].metadata"),
+                env_vars,
+            )?;
+        }
+
+        for (index, backend) in self.backends.iter_mut().enumerate() {
+            backend.name =
+                resolve_placeholders(&backend.name, &format!("backends[{index}].name"), env_vars)?;
+            backend.url = resolve_option_placeholder(
+                backend.url.take(),
+                &format!("backends[{index}].url"),
+                env_vars,
+            )?;
+            backend.command = resolve_option_placeholder(
+                backend.command.take(),
+                &format!("backends[{index}].command"),
+                env_vars,
+            )?;
+            if let Some(args) = backend.args.as_mut() {
+                resolve_vec_placeholders(args, &format!("backends[{index}].args"), env_vars)?;
+            }
+            resolve_vec_placeholders(
+                &mut backend.allowed_tools,
+                &format!("backends[{index}].allowed_tools"),
+                env_vars,
+            )?;
+            backend.auth_token = resolve_option_placeholder(
+                backend.auth_token.take(),
+                &format!("backends[{index}].auth_token"),
+                env_vars,
+            )?;
+            resolve_map_value_placeholders(
+                &mut backend.headers,
+                &format!("backends[{index}].headers"),
+                env_vars,
+            )?;
+            resolve_map_value_placeholders(
+                &mut backend.env,
+                &format!("backends[{index}].env"),
+                env_vars,
+            )?;
+        }
+
+        for (index, group) in self.groups.iter_mut().enumerate() {
+            group.name =
+                resolve_placeholders(&group.name, &format!("groups[{index}].name"), env_vars)?;
+            resolve_vec_placeholders(
+                &mut group.tools,
+                &format!("groups[{index}].tools"),
+                env_vars,
+            )?;
+            resolve_vec_placeholders(
+                &mut group.backends,
+                &format!("groups[{index}].backends"),
+                env_vars,
+            )?;
+            group.description = resolve_option_placeholder(
+                group.description.take(),
+                &format!("groups[{index}].description"),
+                env_vars,
+            )?;
+        }
+
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -227,5 +323,150 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+fn load_env_vars(config_path: &Path) -> Result<HashMap<String, String>, ConfigError> {
+    let mut env_vars: HashMap<String, String> = std::env::vars().collect();
+    let env_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".env");
+
+    if env_path.exists() {
+        let path_display = env_path.display().to_string();
+        let iter =
+            dotenvy::from_path_iter(&env_path).map_err(|source| ConfigError::EnvFileError {
+                path: path_display.clone(),
+                source,
+            })?;
+
+        for entry in iter {
+            let (key, value) = entry.map_err(|source| ConfigError::EnvFileError {
+                path: path_display.clone(),
+                source,
+            })?;
+            env_vars.entry(key).or_insert(value);
+        }
+    }
+
+    Ok(env_vars)
+}
+
+fn resolve_option_placeholder(
+    value: Option<String>,
+    field: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<Option<String>, ConfigError> {
+    value
+        .map(|v| resolve_placeholders(&v, field, env_vars))
+        .transpose()
+}
+
+fn resolve_vec_placeholders(
+    values: &mut [String],
+    field: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (index, value) in values.iter_mut().enumerate() {
+        let resolved = resolve_placeholders(value, &format!("{field}[{index}]"), env_vars)?;
+        value.clone_from(&resolved);
+    }
+    Ok(())
+}
+
+fn resolve_map_value_placeholders(
+    values: &mut HashMap<String, String>,
+    field: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (key, value) in values.iter_mut() {
+        let resolved = resolve_placeholders(value, &format!("{field}.{key}"), env_vars)?;
+        value.clone_from(&resolved);
+    }
+    Ok(())
+}
+
+fn resolve_placeholders(
+    input: &str,
+    field: &str,
+    env_vars: &HashMap<String, String>,
+) -> Result<String, ConfigError> {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(start) = remaining.find("${") {
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 2..];
+
+        let Some(end) = after_start.find('}') else {
+            return Err(ConfigError::InvalidEnvPlaceholder {
+                field: field.to_string(),
+                value: input.to_string(),
+            });
+        };
+
+        let var_name = &after_start[..end];
+        if var_name.is_empty() {
+            return Err(ConfigError::InvalidEnvPlaceholder {
+                field: field.to_string(),
+                value: input.to_string(),
+            });
+        }
+
+        let var_value = env_vars
+            .get(var_name)
+            .ok_or_else(|| ConfigError::MissingEnvVar {
+                var: var_name.to_string(),
+                field: field.to_string(),
+            })?;
+        output.push_str(var_value);
+
+        remaining = &after_start[end + 1..];
+    }
+
+    output.push_str(remaining);
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::resolve_placeholders;
+    use crate::error::ConfigError;
+
+    #[test]
+    fn resolves_single_placeholder() {
+        let env_vars = HashMap::from([(String::from("API_TOKEN"), String::from("abc123"))]);
+        let resolved = resolve_placeholders("${API_TOKEN}", "gateway.auth_token", &env_vars)
+            .expect("placeholder should resolve");
+        assert_eq!(resolved, "abc123");
+    }
+
+    #[test]
+    fn resolves_multiple_placeholders_in_one_value() {
+        let env_vars = HashMap::from([
+            (String::from("HOST"), String::from("localhost")),
+            (String::from("PORT"), String::from("8080")),
+        ]);
+        let resolved = resolve_placeholders("http://${HOST}:${PORT}", "backends[0].url", &env_vars)
+            .expect("placeholders should resolve");
+        assert_eq!(resolved, "http://localhost:8080");
+    }
+
+    #[test]
+    fn errors_when_placeholder_is_missing() {
+        let env_vars = HashMap::new();
+        let error = resolve_placeholders("${MISSING_TOKEN}", "tokens[0].token", &env_vars)
+            .expect_err("missing placeholder should error");
+
+        match error {
+            ConfigError::MissingEnvVar { var, field } => {
+                assert_eq!(var, "MISSING_TOKEN");
+                assert_eq!(field, "tokens[0].token");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }

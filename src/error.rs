@@ -15,6 +15,19 @@ pub enum ConfigError {
     #[error("invalid TOML in config file")]
     ParseError(#[from] toml::de::Error),
 
+    #[error("failed to read .env file at '{path}'")]
+    EnvFileError {
+        path: String,
+        #[source]
+        source: dotenvy::Error,
+    },
+
+    #[error("missing environment variable '{var}' referenced by '{field}'")]
+    MissingEnvVar { var: String, field: String },
+
+    #[error("invalid environment variable placeholder in '{field}': '{value}'")]
+    InvalidEnvPlaceholder { field: String, value: String },
+
     #[error("backend '{name}' uses {transport:?} transport but has no url")]
     MissingUrl {
         name: String,
