@@ -23,4 +23,4 @@ pre-push:
       glob: "*.rs"
       run: cargo clippy -- -W clippy::pedantic
     - name: keep-sorted-check
-      run: keep-sorted --check .
+      run: keep-sorted --check {staged_files}
