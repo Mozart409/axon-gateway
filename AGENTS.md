@@ -22,6 +22,9 @@ cargo clippy
 # Run clippy with pedantic warnings (as configured in lefthook.yml)
 cargo clippy -- -W clippy::pedantic
 
+# Always run pedantic clippy and fix all reported issues
+cargo clippy -- -W clippy::pedantic
+
 # Format code
 cargo fmt
 

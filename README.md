@@ -110,6 +110,41 @@ auth_token = "your-secret-token"
 
 Clients must include `Authorization: Bearer your-secret-token` header.
 
+## Environment Variable References in Config
+
+You can reference environment variables in `config.toml` using `${VAR_NAME}` placeholders.
+
+Example:
+
+```toml
+[gateway]
+bind = "0.0.0.0:8080"
+auth_token = "${AXON_GATEWAY_TOKEN}"
+
+[[tokens]]
+name = "claude-agent"
+token = "${CLAUDE_AGENT_TOKEN}"
+
+[[backends]]
+name = "secure-api"
+url = "https://example.com/mcp"
+transport = "http"
+auth_token = "${SECURE_API_TOKEN}"
+
+[[backends]]
+name = "local-tool"
+command = "/usr/local/bin/mcp-tool"
+transport = "stdio"
+env = { API_KEY = "${OPENAI_API_KEY}" }
+```
+
+Resolution rules:
+
+- Placeholders are resolved at config load time
+- Missing variables are a hard error (startup/reload fails)
+- Process environment variables take precedence over `.env`
+- A `.env` file in the same directory as `config.toml` is loaded automatically
+
 ## Current Status
 
 Phase 1 (MVP) is complete:

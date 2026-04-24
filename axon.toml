@@ -8,6 +8,7 @@ bind = "0.0.0.0:8080"
 
 # Optional: simple shared Bearer token auth
 # auth_token = "your-secret-token-here"
+# auth_token = "${AXON_GATEWAY_TOKEN}"  # from .env or process env
 
 # Optional: global rate limit (requests per minute per token, 0 = unlimited)
 # rate_limit_per_minute = 0
@@ -63,6 +64,7 @@ enabled = true
 # url = "http://localhost:3005/mcp"
 # transport = "http"
 # auth_token = "backend-secret-token"  # forwarded as Bearer token
+# auth_token = "${SECURE_API_TOKEN}"  # from .env or process env
 # enabled = true
 
 # Example: backend with custom environment variables (stdio)
@@ -71,6 +73,7 @@ enabled = true
 # command = "/usr/local/bin/mcp-tool"
 # transport = "stdio"
 # env = { API_KEY = "key123", DEBUG = "true" }
+# env = { API_KEY = "${OPENAI_API_KEY}", DEBUG = "true" }
 # enabled = true
 
 # --- Named API Tokens with Permissions ---
@@ -80,6 +83,7 @@ enabled = true
 # [[tokens]]
 # name = "claude-agent"
 # token = "tok_claude_abc123"
+# token = "${CLAUDE_AGENT_TOKEN}"
 # # allowed_tools = []  # empty = all tools
 # # allowed_backends = []  # empty = all backends
 # # rate_limit_per_minute = 0  # 0 = unlimited
