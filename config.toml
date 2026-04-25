@@ -10,7 +10,7 @@ base_url = "http://localhost:8080"
 
 # Optional: simple shared Bearer token auth
 # auth_token = "your-secret-token-here"
-# auth_token = "${AXON_GATEWAY_TOKEN}"  # from .env or process env
+auth_token = "${AXON_GATEWAY_TOKEN}"  # from .env or process env
 
 # Optional: global rate limit (requests per minute per token, 0 = unlimited)
 # rate_limit_per_minute = 0
