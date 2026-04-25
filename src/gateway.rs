@@ -604,11 +604,11 @@ impl Message<AddBackend> for GatewayActor {
         let name = msg.config.name.clone();
 
         if self.backends.contains_key(&name) {
-            return Err(format!("Backend '{name}' already exists",));
+            return Err(format!("Backend '{name}' already exists"));
         }
 
         if !msg.config.enabled {
-            return Err(format!("Backend '{name}' is disabled",));
+            return Err(format!("Backend '{name}' is disabled"));
         }
 
         // Register in registry
@@ -784,7 +784,7 @@ impl Message<ReloadConfig> for GatewayActor {
         for name in current_names.difference(&new_names) {
             if let Some(actor_ref) = self.backends.remove(name) {
                 if let Err(e) = actor_ref.stop_gracefully().await {
-                    errors.push(format!("Failed to stop '{name}': {e:?}",));
+                    errors.push(format!("Failed to stop '{name}': {e:?}"));
                 }
                 let _ = self
                     .registry

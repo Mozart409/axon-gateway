@@ -596,9 +596,9 @@ mod tests {
                 ),
             );
 
-            let tools = registry.build_tool_list();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].name, "connected_test_tool");
+            let tool_list = registry.build_tool_list();
+            assert_eq!(tool_list.len(), 1);
+            assert_eq!(tool_list[0].name, "connected_test_tool");
         }
     }
 
