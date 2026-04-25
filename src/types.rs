@@ -98,6 +98,9 @@ impl NamespacedResource {
         let namespaced_uri = format!("{backend_name}://{}", resource.uri);
         let mut namespaced_def = resource.clone();
         namespaced_def.uri.clone_from(&namespaced_uri);
+        namespaced_def.name = namespaced_def
+            .name
+            .map(|name| format!("{} {name}", display_backend_name(backend_name)));
 
         Self {
             original_uri: resource.uri,
@@ -106,6 +109,25 @@ impl NamespacedResource {
             definition: namespaced_def,
         }
     }
+}
+
+fn display_backend_name(backend_name: &str) -> String {
+    backend_name
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(capitalize_first)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let first = chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_default();
+    let rest = chars.as_str().to_lowercase();
+    format!("{first}{rest}")
 }
 
 /// A prompt definition as returned by MCP servers
@@ -269,5 +291,47 @@ impl BackendInfo {
             tool_count,
             last_error,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NamespacedResource, ResourceDefinition};
+
+    #[test]
+    fn namespaced_resource_prefixes_display_name_with_backend() {
+        let resource = ResourceDefinition {
+            uri: String::from("http://localhost:20212/openapi.json"),
+            name: Some(String::from("OpenApi Specification")),
+            description: None,
+            mime_type: None,
+        };
+
+        let namespaced = NamespacedResource::new("netalertx", resource);
+
+        assert_eq!(
+            namespaced.definition.name,
+            Some(String::from("Netalertx OpenApi Specification"))
+        );
+        assert_eq!(
+            namespaced.definition.uri,
+            String::from("netalertx://http://localhost:20212/openapi.json")
+        );
+    }
+
+    #[test]
+    fn namespaced_resource_humanizes_backend_name_with_separators() {
+        let resource = ResourceDefinition {
+            uri: String::from("stdout.log"),
+            name: Some(String::from("stdout.log")),
+            description: None,
+            mime_type: None,
+        };
+
+        let namespaced = NamespacedResource::new("home_assistant-api", resource);
+        assert_eq!(
+            namespaced.definition.name,
+            Some(String::from("Home Assistant Api stdout.log"))
+        );
     }
 }
