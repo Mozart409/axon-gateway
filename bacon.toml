@@ -136,6 +136,12 @@ allow_warnings = true
 # a project, for example a shortcut to launch a specific job.
 # Shortcuts to internal functions (scrolling, toggling, etc.)
 # should go in your personal global prefs.toml file instead.
+[jobs.container]
+command = ["podman", "build", "-t", "axon-gateway:latest", "."]
+need_stdout = true
+allow_warnings = true
+watch = ["src", "Cargo.toml", "Cargo.lock", "Dockerfile"]
+
 [keybindings]
 # alt-m = "job:my-job"
 c = "job:clippy-all" # comment this to have 'c' run clippy on only the default target
