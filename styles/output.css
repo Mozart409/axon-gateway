@@ -15,10 +15,14 @@
     --color-red-800: oklch(44.4% 0.177 26.899);
     --color-red-900: oklch(39.6% 0.141 25.723);
     --color-red-950: oklch(25.8% 0.092 26.042);
+    --color-orange-100: oklch(95.4% 0.038 75.164);
     --color-orange-200: oklch(90.1% 0.076 70.697);
     --color-orange-300: oklch(83.7% 0.128 66.29);
+    --color-orange-400: oklch(75% 0.183 55.934);
+    --color-orange-500: oklch(70.5% 0.213 47.604);
     --color-orange-600: oklch(64.6% 0.222 41.116);
     --color-orange-700: oklch(55.3% 0.195 38.402);
+    --color-orange-900: oklch(40.8% 0.123 38.172);
     --color-amber-400: oklch(82.8% 0.189 84.429);
     --color-amber-700: oklch(55.5% 0.163 48.998);
     --color-emerald-50: oklch(97.9% 0.021 166.113);
@@ -544,8 +548,8 @@
   .underline {
     text-decoration-line: underline;
   }
-  .decoration-slate-300 {
-    text-decoration-color: var(--color-slate-300);
+  .decoration-orange-300 {
+    text-decoration-color: var(--color-orange-300);
   }
   .underline-offset-2 {
     text-underline-offset: 2px;
@@ -571,10 +575,24 @@
       }
     }
   }
+  .hover\:text-orange-900 {
+    &:hover {
+      @media (hover: hover) {
+        color: var(--color-orange-900);
+      }
+    }
+  }
   .hover\:text-slate-900 {
     &:hover {
       @media (hover: hover) {
         color: var(--color-slate-900);
+      }
+    }
+  }
+  .hover\:decoration-orange-500 {
+    &:hover {
+      @media (hover: hover) {
+        text-decoration-color: var(--color-orange-500);
       }
     }
   }
@@ -714,9 +732,9 @@
       color: var(--color-slate-900);
     }
   }
-  .dark\:decoration-slate-700 {
+  .dark\:decoration-orange-700 {
     @media (prefers-color-scheme: dark) {
-      text-decoration-color: var(--color-slate-700);
+      text-decoration-color: var(--color-orange-700);
     }
   }
   .dark\:hover\:bg-slate-300 {
@@ -737,11 +755,11 @@
       }
     }
   }
-  .dark\:hover\:text-slate-50 {
+  .dark\:hover\:text-orange-100 {
     @media (prefers-color-scheme: dark) {
       &:hover {
         @media (hover: hover) {
-          color: var(--color-slate-50);
+          color: var(--color-orange-100);
         }
       }
     }
@@ -751,6 +769,15 @@
       &:hover {
         @media (hover: hover) {
           color: var(--color-slate-100);
+        }
+      }
+    }
+  }
+  .dark\:hover\:decoration-orange-400 {
+    @media (prefers-color-scheme: dark) {
+      &:hover {
+        @media (hover: hover) {
+          text-decoration-color: var(--color-orange-400);
         }
       }
     }
