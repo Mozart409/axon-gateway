@@ -4,6 +4,7 @@
 //! ```toml
 //! [gateway]
 //! bind = "0.0.0.0:8080"
+//! base_url = "http://localhost:8080"
 //! auth_token = "your-secret-token"  # optional
 //!
 //! [[backends]]
@@ -63,11 +64,17 @@ pub struct ToolGroupConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
     pub bind: String,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
     /// Simple shared auth token (for backward compat)
     pub auth_token: Option<String>,
     /// Rate limit: max requests per minute per token (0 = unlimited)
     #[serde(default)]
     pub rate_limit_per_minute: u32,
+}
+
+fn default_base_url() -> String {
+    String::from("http://localhost:8080")
 }
 
 /// Per-token configuration with permissions
@@ -213,6 +220,8 @@ impl Config {
 
     fn resolve_env_vars(&mut self, env_vars: &HashMap<String, String>) -> Result<(), ConfigError> {
         self.gateway.bind = resolve_placeholders(&self.gateway.bind, "gateway.bind", env_vars)?;
+        self.gateway.base_url =
+            resolve_placeholders(&self.gateway.base_url, "gateway.base_url", env_vars)?;
         self.gateway.auth_token = resolve_option_placeholder(
             self.gateway.auth_token.take(),
             "gateway.auth_token",

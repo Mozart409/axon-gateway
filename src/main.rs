@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
         .wrap_err_with(|| format!("failed to load config from '{config_path}'"))?;
 
     let bind_addr = config.gateway.bind.clone();
+    let base_url = config.gateway.base_url.clone();
 
     // Initialize Prometheus metrics exporter
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -120,6 +121,7 @@ async fn main() -> Result<()> {
         gateway,
         auth_manager,
         config_path: Some(config_path),
+        base_url,
         ui_events: broadcast::channel(256).0,
         sse_clients: Arc::new(AtomicU64::new(0)),
         started_at: SystemTime::now(),

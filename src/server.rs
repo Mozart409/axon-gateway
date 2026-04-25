@@ -59,6 +59,7 @@ pub struct AppState {
     pub gateway: ActorRef<GatewayActor>,
     pub auth_manager: Arc<AuthManager>,
     pub config_path: Option<String>,
+    pub base_url: String,
     pub ui_events: broadcast::Sender<UiEvent>,
     pub sse_clients: Arc<AtomicU64>,
     pub started_at: SystemTime,
@@ -160,6 +161,8 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Handle GET / - simple landing page
 async fn handle_landing(State(state): State<AppState>) -> Html<String> {
+    let mcp_server_url = build_mcp_server_url(&state.base_url);
+
     let page = html! {
         (DOCTYPE)
         html lang="en" {
@@ -180,6 +183,30 @@ async fn handle_landing(State(state): State<AppState>) -> Html<String> {
                         }
                         p class="mt-3 text-slate-600 dark:text-slate-300" {
                             "Use the dashboard for live backend health, and the MCP endpoint for agent calls."
+                        }
+                        div class="mt-6 rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-950" {
+                            p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
+                                "Axon Gateway MCP Server"
+                            }
+                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" {
+                                "Copy this URL into your MCP client configuration."
+                            }
+                            div class="mt-3 flex flex-col gap-2 sm:flex-row" {
+                                code class="block flex-1 overflow-x-auto rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" id="mcp-server-url" {
+                                    (mcp_server_url.as_str())
+                                }
+                                button
+                                    class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                                    data-url=(mcp_server_url.as_str())
+                                    id="copy-mcp-url"
+                                    type="button"
+                                {
+                                    "Copy MCP URL"
+                                }
+                            }
+                            p class="mt-2 text-xs text-slate-500 dark:text-slate-400" id="copy-mcp-url-feedback" aria-live="polite" {
+                                ""
+                            }
                         }
                         div class="mt-6 flex flex-wrap gap-3" {
                             a
@@ -205,6 +232,34 @@ async fn handle_landing(State(state): State<AppState>) -> Html<String> {
                             (build_fingerprint(&state))
                         }
                     }
+                }
+                script {
+                    (PreEscaped(
+                        r#"
+                        (() => {
+                            const copyButton = document.getElementById("copy-mcp-url");
+                            if (!copyButton) {
+                                return;
+                            }
+
+                            const feedback = document.getElementById("copy-mcp-url-feedback");
+                            copyButton.addEventListener("click", async () => {
+                                const mcpUrl = copyButton.dataset.url ?? "";
+
+                                try {
+                                    await navigator.clipboard.writeText(mcpUrl);
+                                    if (feedback) {
+                                        feedback.textContent = "Copied MCP server URL.";
+                                    }
+                                } catch (_error) {
+                                    if (feedback) {
+                                        feedback.textContent = "Copy failed. Copy the URL manually.";
+                                    }
+                                }
+                            });
+                        })();
+                        "#,
+                    ))
                 }
             }
         }
@@ -603,6 +658,10 @@ fn build_fingerprint(state: &AppState) -> String {
         env!("CARGO_PKG_VERSION"),
         state.process_id
     )
+}
+
+fn build_mcp_server_url(base_url: &str) -> String {
+    format!("{}/mcp", base_url.trim_end_matches('/'))
 }
 
 fn render_flash(flash: &FlashMessage) -> Markup {
@@ -1158,6 +1217,7 @@ mod tests {
         let config = Config {
             gateway: GatewayConfig {
                 bind: String::from("127.0.0.1:0"),
+                base_url: String::from("http://127.0.0.1:8080"),
                 auth_token: None,
                 rate_limit_per_minute: 0,
             },
@@ -1174,12 +1234,14 @@ mod tests {
             auth_manager: Arc::new(AuthManager::new(
                 &GatewayConfig {
                     bind: String::from("127.0.0.1:0"),
+                    base_url: String::from("http://127.0.0.1:8080"),
                     auth_token: None,
                     rate_limit_per_minute: 0,
                 },
                 &[],
             )),
             config_path: None,
+            base_url: String::from("http://127.0.0.1:8080"),
             ui_events: broadcast::channel(64).0,
             sse_clients: Arc::new(AtomicU64::new(0)),
             started_at: SystemTime::now(),
@@ -1229,6 +1291,8 @@ mod tests {
             .expect("body should be readable");
         let html = String::from_utf8(body.to_vec()).expect("html should be utf-8");
         assert!(html.contains("Open Dashboard"));
+        assert!(html.contains("Copy MCP URL"));
+        assert!(html.contains("http://127.0.0.1:8080/mcp"));
         assert!(html.contains("started:"));
     }
 
