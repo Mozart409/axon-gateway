@@ -8,6 +8,7 @@
 //! - GET /build - Build and process metadata
 //! - GET /status - Gateway status
 //! - GET /status/detailed - Detailed backend status
+//! - GET /ui/backends/{name} - Backend detail page
 //! - GET /status/groups - List tool groups
 //! - GET /metrics - Prometheus metrics
 //! - POST /admin/backends/{name}/reconnect - Force reconnect a backend
@@ -50,8 +51,9 @@ use crate::gateway::{
     DetailedGatewayStatus, DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect,
     GatewayActor, GetDetailedStatus, GetStatus, HandleGroupRequest, HandleRequest, ReloadConfig,
 };
-use crate::types::JsonRpcRequest;
-use crate::types::{BackendInfo, BackendState};
+use crate::types::{
+    BackendInfo, BackendState, JsonRpcRequest, PromptDefinition, ResourceDefinition,
+};
 
 /// Shared state for the HTTP server
 #[derive(Clone)]
@@ -103,6 +105,7 @@ pub fn create_router(state: AppState) -> Router {
         .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
         // UI endpoints
         .route("/ui", get(handle_ui))
+        .route("/ui/backends/{name}", get(handle_ui_backend_detail))
         .route("/ui/events", get(handle_ui_events))
         .route("/ui/partials/backends", get(handle_ui_backends_partial))
         .route(
@@ -325,6 +328,33 @@ async fn handle_ui(
     })?;
 
     let page = render_ui_page(&status, &state);
+    Ok(Html(page.into_string()))
+}
+
+/// Handle GET /ui/backends/{name} - backend detail page
+async fn handle_ui_backend_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let _identity = verify_auth(&headers, &state.auth_manager)?;
+    let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
+        tracing::error!(backend = %name, "Failed to get UI backend detail status: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let Some(backend) = status
+        .backends
+        .into_iter()
+        .find(|backend| backend.name == name)
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let prompts = fetch_backend_prompts(&state, &backend.name).await;
+    let resources = fetch_backend_resources(&state, &backend.name).await;
+
+    let page = render_ui_backend_detail_page(&backend, &prompts, &resources, &state);
     Ok(Html(page.into_string()))
 }
 
@@ -648,6 +678,208 @@ fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -> Markup {
     }
 }
 
+fn render_ui_backend_detail_page(
+    backend: &BackendInfo,
+    prompts: &[PromptDefinition],
+    resources: &[ResourceDefinition],
+    state: &AppState,
+) -> Markup {
+    let state_text = backend_state_text(backend.state);
+    let state_class = backend_state_class(backend.state);
+
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Axon Gateway Backend Detail" }
+                link rel="stylesheet" href="/styles/output.css?v=1";
+            }
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+                main class="mx-auto max-w-6xl p-6" {
+                    section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        a
+                            href="/ui"
+                            class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
+                        {
+                            (PreEscaped("&larr;")) " Back to dashboard"
+                        }
+                        h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                            code { (&backend.name) }
+                        }
+                        div class="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-600 dark:text-slate-300" {
+                            span { "State:" }
+                            span class=(state_class) { (state_text) }
+                            span { "Tools: " (backend.tool_count) }
+                            span { "Prompts: " (prompts.len()) }
+                            span { "Resources: " (resources.len()) }
+                        }
+                        @if let Some(error) = &backend.last_error {
+                            p class="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300" {
+                                "Last error: " code { (error) }
+                            }
+                        }
+                    }
+
+                    section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Tools" }
+                        @if backend.tools.is_empty() {
+                            p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No tools exposed by this backend." }
+                        } @else {
+                            ul class="mt-4 space-y-3" {
+                                @for tool in &backend.tools {
+                                    li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
+                                        p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&tool.original_name) }
+                                        @if let Some(description) = &tool.definition.description {
+                                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Prompts" }
+                        @if prompts.is_empty() {
+                            p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No prompts exposed by this backend." }
+                        } @else {
+                            ul class="mt-4 space-y-3" {
+                                @for prompt in prompts {
+                                    li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
+                                        p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&prompt.name) }
+                                        @if let Some(description) = &prompt.description {
+                                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Resources" }
+                        @if resources.is_empty() {
+                            p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No resources exposed by this backend." }
+                        } @else {
+                            ul class="mt-4 space-y-3" {
+                                @for resource in resources {
+                                    li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
+                                        p class="font-mono text-xs break-all text-slate-900 dark:text-slate-100" { (&resource.uri) }
+                                        @if let Some(name) = &resource.name {
+                                            p class="mt-1 text-sm text-slate-700 dark:text-slate-200" { (name) }
+                                        }
+                                        @if let Some(description) = &resource.description {
+                                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
+                        (build_fingerprint(state))
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_backend_prompts(state: &AppState, backend_name: &str) -> Vec<PromptDefinition> {
+    let response = match state
+        .gateway
+        .ask(HandleRequest {
+            request: JsonRpcRequest {
+                jsonrpc: String::from("2.0"),
+                id: json!("ui-backend-prompts"),
+                method: String::from("prompts/list"),
+                params: json!({}),
+            },
+            identity: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(backend = %backend_name, "Failed to fetch prompts for UI detail: {:?}", e);
+            return Vec::new();
+        }
+    };
+
+    let Some(result) = response.result else {
+        return Vec::new();
+    };
+
+    let Some(prompts_value) = result.get("prompts") else {
+        return Vec::new();
+    };
+
+    let Ok(prompts) = serde_json::from_value::<Vec<PromptDefinition>>(prompts_value.clone()) else {
+        return Vec::new();
+    };
+
+    let prefix = format!("{backend_name}_");
+    prompts
+        .into_iter()
+        .filter_map(|mut prompt| {
+            let original_name = prompt.name.strip_prefix(&prefix)?;
+            prompt.name = original_name.to_string();
+            Some(prompt)
+        })
+        .collect()
+}
+
+async fn fetch_backend_resources(state: &AppState, backend_name: &str) -> Vec<ResourceDefinition> {
+    let response = match state
+        .gateway
+        .ask(HandleRequest {
+            request: JsonRpcRequest {
+                jsonrpc: String::from("2.0"),
+                id: json!("ui-backend-resources"),
+                method: String::from("resources/list"),
+                params: json!({}),
+            },
+            identity: None,
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(backend = %backend_name, "Failed to fetch resources for UI detail: {:?}", e);
+            return Vec::new();
+        }
+    };
+
+    let Some(result) = response.result else {
+        return Vec::new();
+    };
+
+    let Some(resources_value) = result.get("resources") else {
+        return Vec::new();
+    };
+
+    let Ok(resources) = serde_json::from_value::<Vec<ResourceDefinition>>(resources_value.clone())
+    else {
+        return Vec::new();
+    };
+
+    resources
+        .into_iter()
+        .filter_map(|mut resource| {
+            let (resource_backend, original_uri) = resource.uri.split_once("://")?;
+            if resource_backend != backend_name {
+                return None;
+            }
+
+            resource.uri = original_uri.to_string();
+            Some(resource)
+        })
+        .collect()
+}
+
 fn build_fingerprint(state: &AppState) -> String {
     let started_utc: DateTime<Utc> = state.started_at.into();
     let started = started_utc.format("%Y-%m-%d %H:%M:%S UTC");
@@ -696,7 +928,7 @@ fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
                     table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800" {
                         thead class="bg-slate-50 dark:bg-slate-800/80" {
                             tr {
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Name" }
+                                th class="px-4 py-3 text-left font-medium text-orange-600 dark:text-orange-300" { "Name" }
                                 th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "State" }
                                 th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Tools" }
                                 th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Actions" }
@@ -716,28 +948,19 @@ fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
 }
 
 fn render_backend_row(backend: &BackendInfo) -> Markup {
-    let state_text = match backend.state {
-        BackendState::Disconnected => "Disconnected",
-        BackendState::Connecting => "Connecting",
-        BackendState::Connected => "Connected",
-        BackendState::Failed => "Failed",
-        BackendState::CircuitOpen => "Circuit Open",
-        BackendState::Reconnecting => "Reconnecting",
-    };
-
-    let state_class = match backend.state {
-        BackendState::Connected => "text-emerald-700 dark:text-emerald-400",
-        BackendState::Connecting | BackendState::Reconnecting => {
-            "text-amber-700 dark:text-amber-400"
-        }
-        BackendState::Failed | BackendState::CircuitOpen | BackendState::Disconnected => {
-            "text-red-700 dark:text-red-400"
-        }
-    };
+    let state_text = backend_state_text(backend.state);
+    let state_class = backend_state_class(backend.state);
 
     html! {
         tr class="align-top" {
-            td class="px-4 py-3" { code { (backend.name) } }
+            td class="px-4 py-3" {
+                a
+                    href=(format!("/ui/backends/{}", backend.name))
+                    class="font-medium text-orange-700 underline decoration-slate-300 underline-offset-2 hover:text-slate-900 dark:text-orange-200 dark:decoration-slate-700 dark:hover:text-slate-50"
+                {
+                    code { (backend.name) }
+                }
+            }
             td class="px-4 py-3" { span class=(state_class) { (state_text) } }
             td class="px-4 py-3 text-slate-700 dark:text-slate-200" { (backend.tool_count) }
             td class="px-4 py-3" {
@@ -775,6 +998,29 @@ fn render_backend_row(backend: &BackendInfo) -> Markup {
                     (PreEscaped("&mdash;"))
                 }
             }
+        }
+    }
+}
+
+fn backend_state_text(state: BackendState) -> &'static str {
+    match state {
+        BackendState::Disconnected => "Disconnected",
+        BackendState::Connecting => "Connecting",
+        BackendState::Connected => "Connected",
+        BackendState::Failed => "Failed",
+        BackendState::CircuitOpen => "Circuit Open",
+        BackendState::Reconnecting => "Reconnecting",
+    }
+}
+
+fn backend_state_class(state: BackendState) -> &'static str {
+    match state {
+        BackendState::Connected => "text-emerald-700 dark:text-emerald-400",
+        BackendState::Connecting | BackendState::Reconnecting => {
+            "text-amber-700 dark:text-amber-400"
+        }
+        BackendState::Failed | BackendState::CircuitOpen | BackendState::Disconnected => {
+            "text-red-700 dark:text-red-400"
         }
     }
 }
@@ -1271,6 +1517,19 @@ mod tests {
         assert!(markup.contains("done"));
     }
 
+    #[test]
+    fn backend_row_links_name_to_detail_page() {
+        let backend = BackendInfo::new(
+            String::from("filesystem"),
+            BackendState::Connected,
+            Vec::new(),
+            None,
+        );
+
+        let markup = render_backend_row(&backend).into_string();
+        assert!(markup.contains("href=\"/ui/backends/filesystem\""));
+    }
+
     #[tokio::test]
     async fn landing_page_renders() {
         let app = create_router(test_state());
@@ -1317,6 +1576,23 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).expect("html should be utf-8");
         assert!(html.contains("Axon Gateway Dashboard"));
         assert!(html.contains("backend-panel"));
+    }
+
+    #[tokio::test]
+    async fn backend_detail_returns_not_found_for_unknown_backend() {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/backends/missing")
+                    .method(http::Method::GET)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
