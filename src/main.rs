@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
 
     // Start HTTP server
     let state = AppState {
-        gateway,
+        gateway: gateway.clone(),
         auth_manager,
         config_path: Some(config_path),
         base_url,
@@ -136,15 +136,18 @@ async fn main() -> Result<()> {
         metrics_handle,
     };
 
-    tokio::select! {
-        result = server::serve(state, &bind_addr) => {
-            result.wrap_err_with(|| format!("failed to start server on '{bind_addr}'"))?;
-        }
-        () = shutdown_signal() => {
-            tracing::info!("Shutdown signal received, exiting");
-        }
+    // Run server with graceful shutdown
+    server::serve(state, &bind_addr, shutdown_signal())
+        .await
+        .wrap_err_with(|| format!("failed to start server on '{bind_addr}'"))?;
+
+    // Gracefully stop the gateway actor
+    tracing::info!("Stopping gateway actor...");
+    if let Err(e) = gateway.stop_gracefully().await {
+        tracing::warn!("Failed to stop gateway gracefully: {:?}", e);
     }
 
+    tracing::info!("Shutdown complete");
     Ok(())
 }
 
