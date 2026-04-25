@@ -5,6 +5,8 @@
 [gateway]
 # Address to bind the gateway server
 bind = "0.0.0.0:8080"
+# Public base URL used to render MCP endpoint links
+base_url = "http://localhost:8080"
 
 # Optional: simple shared Bearer token auth
 # auth_token = "your-secret-token-here"
