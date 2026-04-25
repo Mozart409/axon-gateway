@@ -131,14 +131,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/status/groups", get(list_tool_groups))
         // Metrics endpoint
         .route("/metrics", get(prometheus_metrics))
-        // Admin endpoints
-        .route(
-            "/admin/backends/{name}/reconnect",
-            post(force_backend_reconnect),
-        )
-        .route("/admin/backends/{name}/disable", post(disable_backend))
-        .route("/admin/backends/{name}/enable", post(enable_backend))
-        .route("/admin/reload", post(reload_config))
         // Middleware
         .layer(middleware::from_fn(request_id_middleware))
         .layer(CorsLayer::permissive())
@@ -317,11 +309,7 @@ async fn handle_not_found(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Handle GET /ui - SSR dashboard
-async fn handle_ui(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Html<String>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
+async fn handle_ui(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
     let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
         tracing::error!("Failed to get UI backend status: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -334,10 +322,8 @@ async fn handle_ui(
 /// Handle GET /ui/backends/{name} - backend detail page
 async fn handle_ui_backend_detail(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
     let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
         tracing::error!(backend = %name, "Failed to get UI backend detail status: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -361,9 +347,7 @@ async fn handle_ui_backend_detail(
 /// Handle GET /ui/partials/backends - HTML fragment for backend list
 async fn handle_ui_backends_partial(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
     let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
         tracing::error!("Failed to get backend partial status: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -375,10 +359,7 @@ async fn handle_ui_backends_partial(
 /// Handle GET /ui/events - SSE stream for HTMX updates
 async fn handle_ui_events(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
     let initial_status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
         tracing::error!("Failed to load initial UI status for SSE: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -433,11 +414,8 @@ async fn handle_ui_events(
 
 async fn handle_ui_reconnect_backend(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
     let flash = match state
         .gateway
         .ask(ForceBackendReconnect {
@@ -462,11 +440,8 @@ async fn handle_ui_reconnect_backend(
 
 async fn handle_ui_disable_backend(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
     let flash = match state
         .gateway
         .ask(DisableBackendMsg {
@@ -491,11 +466,8 @@ async fn handle_ui_disable_backend(
 
 async fn handle_ui_enable_backend(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
     let flash = match state
         .gateway
         .ask(EnableBackendMsg {
@@ -520,10 +492,7 @@ async fn handle_ui_enable_backend(
 
 async fn handle_ui_reload_config(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
     let config_path = state.config_path.as_ref().ok_or_else(|| {
         tracing::error!("Config path not set, cannot reload from UI action");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1256,136 +1225,9 @@ async fn get_detailed_status(
     Ok(Json(status))
 }
 
-/// Force reconnect a backend
-async fn force_backend_reconnect(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
-    // Admin endpoints require auth
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
-    // When Reply = Result<T, E>, ask().await returns Result<T, SendError<M, E>>
-    let result = state
-        .gateway
-        .ask(ForceBackendReconnect {
-            backend_name: name.clone(),
-        })
-        .await;
-
-    match result {
-        Ok(()) => Ok(Json(json!({
-            "status": "ok",
-            "message": format!("Backend '{}' reconnect initiated", name)
-        }))),
-        Err(e) => {
-            tracing::warn!("Force reconnect failed for '{}': {:?}", name, e);
-            Ok(Json(json!({
-                "status": "error",
-                "message": format!("{:?}", e)
-            })))
-        }
-    }
-}
-
-/// Reload configuration from file
-async fn reload_config(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    // Admin endpoints require auth
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
-    let config_path = state.config_path.as_ref().ok_or_else(|| {
-        tracing::error!("Config path not set, cannot reload");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Load the new config
-    let new_config = Config::load(config_path).map_err(|e| {
-        tracing::error!("Failed to load config: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Send reload message to gateway
-    match state.gateway.ask(ReloadConfig { config: new_config }).await {
-        Ok(result) => Ok(Json(json!({
-            "status": "ok",
-            "added": result.added,
-            "removed": result.removed,
-            "errors": result.errors
-        }))),
-        Err(e) => {
-            tracing::error!("Config reload failed: {:?}", e);
-            Ok(Json(json!({
-                "status": "error",
-                "message": format!("{:?}", e)
-            })))
-        }
-    }
-}
-
 /// Prometheus metrics endpoint
 async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     state.metrics_handle.render()
-}
-
-/// Disable a backend (stop routing traffic to it)
-async fn disable_backend(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
-    match state
-        .gateway
-        .ask(DisableBackendMsg {
-            backend_name: name.clone(),
-        })
-        .await
-    {
-        Ok(()) => Ok(Json(json!({
-            "status": "ok",
-            "message": format!("Backend '{name}' disabled")
-        }))),
-        Err(e) => {
-            tracing::warn!("Failed to disable backend '{}': {:?}", name, e);
-            Ok(Json(json!({
-                "status": "error",
-                "message": format!("{e:?}")
-            })))
-        }
-    }
-}
-
-/// Enable a previously disabled backend
-async fn enable_backend(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
-
-    match state
-        .gateway
-        .ask(EnableBackendMsg {
-            backend_name: name.clone(),
-        })
-        .await
-    {
-        Ok(()) => Ok(Json(json!({
-            "status": "ok",
-            "message": format!("Backend '{name}' enabled")
-        }))),
-        Err(e) => {
-            tracing::warn!("Failed to enable backend '{}': {:?}", name, e);
-            Ok(Json(json!({
-                "status": "error",
-                "message": format!("{e:?}")
-            })))
-        }
-    }
 }
 
 fn start_ui_event_poller(state: AppState) {
