@@ -1,0 +1,125 @@
+# MCP Gateway Configuration
+#
+# This config defines which MCP servers to aggregate and how to connect to them.
+
+[gateway]
+# Address to bind the gateway server
+bind = "0.0.0.0:8080"
+# Public base URL used to render MCP endpoint links
+base_url = "http://localhost:8080"
+
+# Optional: simple shared Bearer token auth
+# auth_token = "your-secret-token-here"
+# auth_token = "${AXON_GATEWAY_TOKEN}"  # from .env or process env
+
+# Optional: global rate limit (requests per minute per token, 0 = unlimited)
+# rate_limit_per_minute = 0
+
+# --- Backend MCP Servers ---
+# Each backend gets a namespace prefix for its tools.
+# e.g., homeassistant's "turn_on" becomes "homeassistant_turn_on"
+
+[[backends]]
+name = "homeassistant"
+url = "https://homelab-mcp.dropbear-butterfly.ts.net/mcp"
+transport = "http"
+enabled = true
+
+[[backends]]
+name = "jellyfin"
+url = "http://localhost:3002/mcp"
+transport = "http"
+enabled = true
+
+[[backends]]
+name = "proxmox"
+url = "http://localhost:3003/mcp/sse"
+transport = "sse"
+enabled = true
+
+# Example: stdio-based MCP server (local binary)
+# [[backends]]
+# name = "filesystem"
+# command = "/usr/local/bin/mcp-filesystem"
+# args = ["--root", "/data"]
+# transport = "stdio"
+# enabled = true
+
+# Example: disabled backend (kept for reference)
+# [[backends]]
+# name = "experimental"
+# url = "http://localhost:9999/mcp"
+# transport = "http"
+# enabled = false
+
+# Example: backend with tool filtering
+# [[backends]]
+# name = "docker"
+# url = "http://localhost:3004/mcp"
+# transport = "http"
+# allowed_tools = ["list_containers", "get_logs"]  # only expose these
+# enabled = true
+
+# Example: backend with auth token forwarding
+# [[backends]]
+# name = "secure-api"
+# url = "http://localhost:3005/mcp"
+# transport = "http"
+# auth_token = "backend-secret-token"  # forwarded as Bearer token
+# auth_token = "${SECURE_API_TOKEN}"  # from .env or process env
+# enabled = true
+
+# Example: backend with custom environment variables (stdio)
+# [[backends]]
+# name = "local-tool"
+# command = "/usr/local/bin/mcp-tool"
+# transport = "stdio"
+# env = { API_KEY = "key123", DEBUG = "true" }
+# env = { API_KEY = "${OPENAI_API_KEY}", DEBUG = "true" }
+# enabled = true
+
+# --- Named API Tokens with Permissions ---
+# Define multiple tokens with different access levels
+
+# Example: agent with full access
+# [[tokens]]
+# name = "claude-agent"
+# token = "tok_claude_abc123"
+# token = "${CLAUDE_AGENT_TOKEN}"
+# # allowed_tools = []  # empty = all tools
+# # allowed_backends = []  # empty = all backends
+# # rate_limit_per_minute = 0  # 0 = unlimited
+
+# Example: restricted agent
+# [[tokens]]
+# name = "limited-agent"
+# token = "tok_limited_xyz789"
+# allowed_tools = ["homeassistant_*", "jellyfin_search"]
+# allowed_backends = ["homeassistant", "jellyfin"]
+# rate_limit_per_minute = 60
+
+# --- Tool Groups ---
+# Expose subsets of tools via different endpoints.
+# Access via POST /mcp/group/{name}
+# List groups via GET /status/groups
+
+# Example: home automation group
+# [[groups]]
+# name = "home"
+# description = "Home automation tools"
+# backends = ["homeassistant"]
+# # tools = []  # empty = all tools from allowed backends
+
+# Example: media group with specific tools
+# [[groups]]
+# name = "media"
+# description = "Media management tools"
+# tools = ["jellyfin_*"]
+# backends = ["jellyfin"]
+
+# Example: all tools (useful for giving different auth to different groups)
+# [[groups]]
+# name = "all"
+# description = "All available tools"
+# # backends = []  # empty = all backends
+# # tools = []  # empty = all tools

@@ -15,3 +15,9 @@ oci-build: clear
 trivy: clear
     podman build -t axon-gateway:latest .
     trivy image axon-gateway:latest
+
+up: clear
+    podman compose -f example/compose.local.yml up --build --force-recreate
+
+down:
+    podman compose -f example/compose.local.yml down -v
