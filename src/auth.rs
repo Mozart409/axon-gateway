@@ -270,6 +270,7 @@ mod tests {
     fn test_validate_shared_token() {
         let config = GatewayConfig {
             bind: "0.0.0.0:8080".to_string(),
+            base_url: "http://localhost:8080".to_string(),
             auth_token: Some("secret".to_string()),
             rate_limit_per_minute: 0,
         };
@@ -283,6 +284,7 @@ mod tests {
     fn test_validate_named_token() {
         let config = GatewayConfig {
             bind: "0.0.0.0:8080".to_string(),
+            base_url: "http://localhost:8080".to_string(),
             auth_token: None,
             rate_limit_per_minute: 0,
         };
@@ -307,6 +309,7 @@ mod tests {
     fn test_no_auth_configured() {
         let config = GatewayConfig {
             bind: "0.0.0.0:8080".to_string(),
+            base_url: "http://localhost:8080".to_string(),
             auth_token: None,
             rate_limit_per_minute: 0,
         };
@@ -338,6 +341,7 @@ mod tests {
     fn test_rate_limiting() {
         let config = GatewayConfig {
             bind: "0.0.0.0:8080".to_string(),
+            base_url: "http://localhost:8080".to_string(),
             auth_token: Some("secret".to_string()),
             rate_limit_per_minute: 3,
         };
