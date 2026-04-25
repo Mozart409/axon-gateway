@@ -8,13 +8,10 @@
 //! - GET /build - Build and process metadata
 //! - GET /status - Gateway status
 //! - GET /status/detailed - Detailed backend status
+//! - GET /ui - Dashboard
 //! - GET /ui/backends/{name} - Backend detail page
 //! - GET /status/groups - List tool groups
 //! - GET /metrics - Prometheus metrics
-//! - POST /admin/backends/{name}/reconnect - Force reconnect a backend
-//! - POST /admin/backends/{name}/disable - Disable a backend
-//! - POST /admin/backends/{name}/enable - Enable a backend
-//! - POST /admin/reload - Reload configuration
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -41,7 +38,8 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeFile;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use uuid::Uuid;
 
 use crate::auth::{AuthError, AuthManager, TokenIdentity};
@@ -135,20 +133,22 @@ pub fn create_router(state: AppState) -> Router {
         .layer(middleware::from_fn(request_id_middleware))
         .layer(CorsLayer::permissive())
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
-                let request_id = request
-                    .extensions()
-                    .get::<RequestId>()
-                    .map(|id| id.0.clone())
-                    .unwrap_or_default();
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<_>| {
+                    let request_id = request
+                        .extensions()
+                        .get::<RequestId>()
+                        .map(|id| id.0.clone())
+                        .unwrap_or_default();
 
-                tracing::info_span!(
-                    "http_request",
-                    request_id = %request_id,
-                    method = %request.method(),
-                    uri = %request.uri(),
-                )
-            }),
+                    tracing::info_span!(
+                        "http_request",
+                        request_id = %request_id,
+                        method = %request.method(),
+                        uri = %request.uri(),
+                    )
+                })
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
         .fallback(handle_not_found)
         .with_state(state)

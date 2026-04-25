@@ -139,3 +139,4 @@ Pre-push:
 - Config file is TOML format with sections `[gateway]` and `[[backends]]`
 - SSE and HTTP transports both use rmcp's `StreamableHttpClientTransport`
 - Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
+- `auth_token` in `[gateway]` config only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard routes
