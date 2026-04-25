@@ -156,6 +156,7 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 /// Handle GET / - simple landing page
+#[allow(clippy::too_many_lines)]
 async fn handle_landing(State(state): State<AppState>) -> Html<String> {
     let mcp_server_url = build_mcp_server_url(&state.base_url);
 
