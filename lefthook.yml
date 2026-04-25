@@ -4,6 +4,8 @@ pre-commit:
   parallel: true
   jobs:
     # keep-sorted start
+    - name: cargo-deny
+      run: cargo deny check
     - name: clippy
       glob: "*.rs"
       run: cargo clippy --all-targets -- -D warnings
