@@ -1,0 +1,27 @@
+name: OCI Build
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-image:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build OCI image (no push)
+        run: >-
+          docker buildx build
+          --file Dockerfile
+          --tag axon-gateway:ci
+          --load
+          .
