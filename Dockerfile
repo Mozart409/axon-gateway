@@ -18,6 +18,10 @@ FROM cgr.dev/chainguard/wolfi-base:latest
 
 COPY --from=builder /build/target/release/axon-gateway /usr/local/bin/axon-gateway
 COPY LICENSE licenses.html /usr/share/licenses/axon-gateway/
+COPY static /app/static
+COPY styles/output.css /app/styles/output.css
+
+WORKDIR /app
 
 EXPOSE 8080 
 

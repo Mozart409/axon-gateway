@@ -101,6 +101,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/mcp", post(handle_mcp_request))
         .route("/mcp/sse", get(handle_mcp_sse))
         .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
+        .route_service("/favicon.svg", ServeFile::new("static/favicon.svg"))
         // UI endpoints
         .route("/ui", get(handle_ui))
         .route("/ui/backends/{name}", get(handle_ui_backend_detail))
@@ -165,6 +166,7 @@ async fn handle_landing(State(state): State<AppState>) -> Html<String> {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Axon Gateway" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
@@ -272,6 +274,7 @@ async fn handle_not_found(State(state): State<AppState>) -> impl IntoResponse {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Page Not Found" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
@@ -605,6 +608,7 @@ fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Axon Gateway Dashboard" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 script src="https://unpkg.com/htmx.org@2.0.4" defer {};
                 script src="https://unpkg.com/htmx-ext-sse@2.2.2" defer {};
                 link rel="stylesheet" href="/styles/output.css?v=1";
@@ -663,6 +667,7 @@ fn render_ui_backend_detail_page(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Axon Gateway Backend Detail" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
