@@ -10,9 +10,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::error::BoxError;
 use dashmap::DashMap;
 use kameo::actor::{Actor, ActorRef};
-use kameo::error::BoxError;
 use kameo::message::{Context, Message};
 
 use crate::config::ToolGroupConfig;
@@ -138,17 +138,22 @@ impl RegistryActor {
 }
 
 impl Actor for RegistryActor {
-    type Mailbox = kameo::mailbox::unbounded::UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = BoxError;
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(state: Self, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!("Registry actor started");
-        if !self.tool_groups.is_empty() {
+        if !state.tool_groups.is_empty() {
             tracing::info!(
                 "Tool groups configured: {:?}",
-                self.tool_groups.iter().map(|g| &g.name).collect::<Vec<_>>()
+                state
+                    .tool_groups
+                    .iter()
+                    .map(|g| &g.name)
+                    .collect::<Vec<_>>()
             );
         }
-        Ok(())
+        Ok(state)
     }
 }
 
@@ -166,7 +171,7 @@ impl Message<RegisterBackend> for RegistryActor {
     async fn handle(
         &mut self,
         msg: RegisterBackend,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.backends.insert(
             msg.name.clone(),
@@ -190,7 +195,7 @@ impl Message<UpdateBackend> for RegistryActor {
     async fn handle(
         &mut self,
         msg: UpdateBackend,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Remove old tool routes for this backend
         self.tool_routing.retain(|_, backend| backend != &msg.name);
@@ -227,7 +232,7 @@ impl Message<ListTools> for RegistryActor {
     async fn handle(
         &mut self,
         _msg: ListTools,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Return cached tools if available
         if self.tool_cache.is_valid() {
@@ -254,7 +259,7 @@ impl Message<ListToolGroup> for RegistryActor {
     async fn handle(
         &mut self,
         msg: ListToolGroup,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let group = self
             .tool_groups
@@ -291,7 +296,7 @@ impl Message<ListToolGroups> for RegistryActor {
     async fn handle(
         &mut self,
         _msg: ListToolGroups,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let all_tools = if self.tool_cache.is_valid() {
             self.tool_cache.tools.clone()
@@ -332,7 +337,7 @@ impl Message<ResolveToolBackend> for RegistryActor {
     async fn handle(
         &mut self,
         msg: ResolveToolBackend,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Find the backend for this tool
         if let Some(backend_name) = self.tool_routing.get(&msg.namespaced_tool_name)
@@ -360,7 +365,7 @@ impl Message<GetBackendStatus> for RegistryActor {
     async fn handle(
         &mut self,
         _msg: GetBackendStatus,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.backends.iter().map(|r| r.value().clone()).collect()
     }
@@ -378,7 +383,7 @@ impl Message<RemoveBackend> for RegistryActor {
     async fn handle(
         &mut self,
         msg: RemoveBackend,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Remove tool routes for this backend
         self.tool_routing.retain(|_, backend| backend != &msg.name);

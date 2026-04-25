@@ -6,6 +6,9 @@
 use crate::config::TransportType;
 use thiserror::Error;
 
+/// Boxed error type used for actor lifecycle errors
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// Configuration-related errors
 #[derive(Error, Debug)]
 pub enum ConfigError {

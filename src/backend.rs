@@ -10,8 +10,8 @@
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
+use crate::error::BoxError;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
-use kameo::error::BoxError;
 use kameo::message::{Context, Message};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
@@ -786,21 +786,21 @@ impl BackendActor {
 }
 
 impl Actor for BackendActor {
-    type Mailbox = kameo::mailbox::unbounded::UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = BoxError;
 
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        tracing::info!("Backend actor started: {}", self.config.name);
+    async fn on_start(mut state: Self, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        tracing::info!("Backend actor started: {}", state.config.name);
 
-        // Store weak reference for delayed message scheduling
-        self.self_ref = Some(actor_ref.downgrade());
+        state.self_ref = Some(actor_ref.downgrade());
 
-        // Initial connection
-        if let Err(e) = self.connect().await {
-            tracing::error!("Failed to connect to {}: {}", self.config.name, e);
-            self.state = BackendState::Failed;
-            self.registry
+        if let Err(e) = state.connect().await {
+            tracing::error!("Failed to connect to {}: {}", state.config.name, e);
+            state.state = BackendState::Failed;
+            state
+                .registry
                 .tell(UpdateBackend {
-                    name: self.config.name.clone(),
+                    name: state.config.name.clone(),
                     state: BackendState::Failed,
                     tools: vec![],
                     error: Some(e.to_string()),
@@ -808,18 +808,17 @@ impl Actor for BackendActor {
                 .await
                 .map_err(|e| Box::new(e) as BoxError)?;
 
-            // Schedule reconnect with exponential backoff
-            self.schedule_reconnect().await;
+            state.schedule_reconnect().await;
         }
 
-        Ok(())
+        Ok(state)
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: kameo::error::ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("Backend actor stopping: {}", self.config.name);
         self.cancel_token.cancel();
         self.disconnect().await;
@@ -839,7 +838,11 @@ pub struct CallTool {
 impl Message<CallTool> for BackendActor {
     type Reply = Result<serde_json::Value, String>;
 
-    async fn handle(&mut self, msg: CallTool, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        msg: CallTool,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         match self.state {
             BackendState::Connected => self.call_tool(&msg.tool_name, &msg.arguments).await,
             BackendState::CircuitOpen => {
@@ -874,7 +877,7 @@ impl Message<ReadResource> for BackendActor {
     async fn handle(
         &mut self,
         msg: ReadResource,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         match self.state {
             BackendState::Connected => self.read_resource(&msg.uri).await,
@@ -910,7 +913,7 @@ impl Message<GetPrompt> for BackendActor {
     async fn handle(
         &mut self,
         msg: GetPrompt,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         match self.state {
             BackendState::Connected => self.get_prompt(&msg.name, msg.arguments).await,
@@ -942,7 +945,7 @@ impl Message<ListResources> for BackendActor {
     async fn handle(
         &mut self,
         _msg: ListResources,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if self.state != BackendState::Connected {
             return Err(format!("Backend '{}' is not connected", self.config.name));
@@ -963,7 +966,7 @@ impl Message<ListPrompts> for BackendActor {
     async fn handle(
         &mut self,
         _msg: ListPrompts,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if self.state != BackendState::Connected {
             return Err(format!("Backend '{}' is not connected", self.config.name));
@@ -984,7 +987,7 @@ impl Message<Reconnect> for BackendActor {
     async fn handle(
         &mut self,
         _msg: Reconnect,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Only reconnect if not already connected
         if self.state == BackendState::Connected {
@@ -1033,7 +1036,7 @@ impl Message<HealthCheck> for BackendActor {
     async fn handle(
         &mut self,
         _msg: HealthCheck,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.state
     }
@@ -1048,7 +1051,7 @@ impl Message<PerformHealthCheck> for BackendActor {
     async fn handle(
         &mut self,
         _msg: PerformHealthCheck,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if let Err(e) = self.perform_health_check().await {
             // Health check failed, trigger circuit breaker
@@ -1082,7 +1085,7 @@ impl Message<RefreshTools> for BackendActor {
     async fn handle(
         &mut self,
         _msg: RefreshTools,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if self.state != BackendState::Connected {
             return Err(format!("Backend '{}' is not connected", self.config.name));
@@ -1125,7 +1128,7 @@ impl Message<GetBackendInfo> for BackendActor {
     async fn handle(
         &mut self,
         _msg: GetBackendInfo,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         BackendInfoResponse {
             name: self.config.name.clone(),
@@ -1146,7 +1149,7 @@ impl Message<ForceReconnect> for BackendActor {
     async fn handle(
         &mut self,
         _msg: ForceReconnect,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         tracing::info!("Force reconnect requested for '{}'", self.config.name);
 
