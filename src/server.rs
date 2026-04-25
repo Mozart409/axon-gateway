@@ -930,7 +930,7 @@ fn render_backend_row(backend: &BackendInfo) -> Markup {
             td class="px-4 py-3" {
                 a
                     href=(format!("/ui/backends/{}", backend.name))
-                    class="font-medium text-orange-700 underline decoration-slate-300 underline-offset-2 hover:text-slate-900 dark:text-orange-200 dark:decoration-slate-700 dark:hover:text-slate-50"
+                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 hover:decoration-orange-500 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100 dark:hover:decoration-orange-400"
                 {
                     code { (backend.name) }
                 }
