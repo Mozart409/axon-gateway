@@ -42,10 +42,11 @@ async fn main() -> Result<()> {
     // Check if JSON logging is requested
     let json_logging = env::var("AXON_LOG_JSON").is_ok();
 
-    // Initialize logging
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("axon_gateway=debug".parse()?)
-        .add_directive("info".parse()?);
+    // Initialize logging - respect RUST_LOG if set, otherwise use defaults
+    let env_filter = match env::var("RUST_LOG") {
+        Ok(_) => tracing_subscriber::EnvFilter::from_default_env(),
+        Err(_) => tracing_subscriber::EnvFilter::new("axon_gateway=debug,info"),
+    };
 
     if json_logging {
         // JSON logging for production/structured log aggregation
