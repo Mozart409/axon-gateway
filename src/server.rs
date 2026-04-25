@@ -1264,7 +1264,11 @@ fn start_ui_event_poller(state: AppState) {
 }
 
 /// Start the HTTP server
-pub async fn serve(state: AppState, bind: &str) -> Result<(), ServerError> {
+pub async fn serve(
+    state: AppState,
+    bind: &str,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), ServerError> {
     start_ui_event_poller(state.clone());
     let router = create_router(state);
 
@@ -1276,7 +1280,9 @@ pub async fn serve(state: AppState, bind: &str) -> Result<(), ServerError> {
         })?;
     tracing::info!("MCP Gateway listening on {}", bind);
 
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
     Ok(())
 }
