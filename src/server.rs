@@ -947,21 +947,24 @@ fn render_backend_row(backend: &BackendInfo) -> Markup {
                     {
                         "Reconnect"
                     }
-                    button
-                        class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        hx-post=(format!("/ui/actions/backends/{}/disable", backend.name))
-                        hx-target="#flash"
-                        hx-swap="innerHTML"
-                    {
-                        "Disable"
-                    }
-                    button
-                        class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        hx-post=(format!("/ui/actions/backends/{}/enable", backend.name))
-                        hx-target="#flash"
-                        hx-swap="innerHTML"
-                    {
-                        "Enable"
+                    @if backend.state == BackendState::Disconnected {
+                        button
+                            class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                            hx-post=(format!("/ui/actions/backends/{}/enable", backend.name))
+                            hx-target="#flash"
+                            hx-swap="innerHTML"
+                        {
+                            "Enable"
+                        }
+                    } @else {
+                        button
+                            class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                            hx-post=(format!("/ui/actions/backends/{}/disable", backend.name))
+                            hx-target="#flash"
+                            hx-swap="innerHTML"
+                        {
+                            "Disable"
+                        }
                     }
                 }
             }
