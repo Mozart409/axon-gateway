@@ -130,9 +130,26 @@ async fn main() -> Result<()> {
         metrics_handle,
     };
 
-    server::serve(state, &bind_addr)
-        .await
-        .wrap_err_with(|| format!("failed to start server on '{bind_addr}'"))?;
+    tokio::select! {
+        result = server::serve(state, &bind_addr) => {
+            result.wrap_err_with(|| format!("failed to start server on '{bind_addr}'"))?;
+        }
+        () = shutdown_signal() => {
+            tracing::info!("Shutdown signal received, exiting");
+        }
+    }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+        _ = sigint.recv() => tracing::info!("Received SIGINT"),
+    }
 }
