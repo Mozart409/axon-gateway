@@ -125,6 +125,9 @@ impl Message<HandleRequest> for GatewayActor {
                 }),
             ),
 
+            // Liveness check used by MCP clients/inspectors
+            "ping" => JsonRpcResponse::success(request.id, serde_json::json!({})),
+
             // List all tools from all backends
             "tools/list" => match self.registry.ask(ListTools).await {
                 Ok(tools) => JsonRpcResponse::success(
