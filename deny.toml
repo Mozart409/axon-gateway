@@ -8,7 +8,6 @@ feature-depth = 1
 
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained but no replacement available in dependency tree" },
 ]
 
 [licenses]
@@ -52,7 +51,6 @@ skip = [
     "r-efi",
     "rand",
     "rand_core",
-    "redox_syscall",
     "windows-sys",
     "windows-targets",
     "windows_aarch64_gnullvm",
