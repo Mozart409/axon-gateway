@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: oci-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-image:
     name: Build Docker image
