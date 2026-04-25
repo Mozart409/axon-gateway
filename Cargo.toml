@@ -18,7 +18,7 @@ maud = "0.27"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 moka = { version = "0.12", features = ["future"] }
-notify = "7"
+notify = "8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rmcp = { version = "0.17.0", features = [
     "client",
