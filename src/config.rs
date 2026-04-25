@@ -442,40 +442,407 @@ fn resolve_placeholders(
 mod tests {
     use std::collections::HashMap;
 
-    use super::resolve_placeholders;
+    use super::*;
     use crate::error::ConfigError;
 
-    #[test]
-    fn resolves_single_placeholder() {
-        let env_vars = HashMap::from([(String::from("API_TOKEN"), String::from("abc123"))]);
-        let resolved = resolve_placeholders("${API_TOKEN}", "gateway.auth_token", &env_vars)
-            .expect("placeholder should resolve");
-        assert_eq!(resolved, "abc123");
-    }
+    mod resolve_placeholders {
+        use super::*;
 
-    #[test]
-    fn resolves_multiple_placeholders_in_one_value() {
-        let env_vars = HashMap::from([
-            (String::from("HOST"), String::from("localhost")),
-            (String::from("PORT"), String::from("8080")),
-        ]);
-        let resolved = resolve_placeholders("http://${HOST}:${PORT}", "backends[0].url", &env_vars)
-            .expect("placeholders should resolve");
-        assert_eq!(resolved, "http://localhost:8080");
-    }
+        #[test]
+        fn resolves_single_placeholder() {
+            let env_vars = HashMap::from([(String::from("API_TOKEN"), String::from("abc123"))]);
+            let resolved = resolve_placeholders("${API_TOKEN}", "gateway.auth_token", &env_vars)
+                .expect("placeholder should resolve");
+            assert_eq!(resolved, "abc123");
+        }
 
-    #[test]
-    fn errors_when_placeholder_is_missing() {
-        let env_vars = HashMap::new();
-        let error = resolve_placeholders("${MISSING_TOKEN}", "tokens[0].token", &env_vars)
-            .expect_err("missing placeholder should error");
+        #[test]
+        fn resolves_multiple_placeholders_in_one_value() {
+            let env_vars = HashMap::from([
+                (String::from("HOST"), String::from("localhost")),
+                (String::from("PORT"), String::from("8080")),
+            ]);
+            let resolved =
+                resolve_placeholders("http://${HOST}:${PORT}", "backends[0].url", &env_vars)
+                    .expect("placeholders should resolve");
+            assert_eq!(resolved, "http://localhost:8080");
+        }
 
-        match error {
-            ConfigError::MissingEnvVar { var, field } => {
-                assert_eq!(var, "MISSING_TOKEN");
-                assert_eq!(field, "tokens[0].token");
+        #[test]
+        fn errors_when_placeholder_is_missing() {
+            let env_vars = HashMap::new();
+            let error = resolve_placeholders("${MISSING_TOKEN}", "tokens[0].token", &env_vars)
+                .expect_err("missing placeholder should error");
+
+            match error {
+                ConfigError::MissingEnvVar { var, field } => {
+                    assert_eq!(var, "MISSING_TOKEN");
+                    assert_eq!(field, "tokens[0].token");
+                }
+                other => panic!("unexpected error variant: {other:?}"),
             }
-            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        #[test]
+        fn returns_input_unchanged_without_placeholders() {
+            let env_vars = HashMap::new();
+            let result = resolve_placeholders("plain text", "field", &env_vars).unwrap();
+            assert_eq!(result, "plain text");
+        }
+
+        #[test]
+        fn errors_on_unclosed_placeholder() {
+            let env_vars = HashMap::new();
+            let error = resolve_placeholders("${UNCLOSED", "field", &env_vars)
+                .expect_err("unclosed placeholder should error");
+
+            match error {
+                ConfigError::InvalidEnvPlaceholder { field, value } => {
+                    assert_eq!(field, "field");
+                    assert_eq!(value, "${UNCLOSED");
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn errors_on_empty_placeholder() {
+            let env_vars = HashMap::new();
+            let error = resolve_placeholders("${}", "field", &env_vars)
+                .expect_err("empty placeholder should error");
+
+            match error {
+                ConfigError::InvalidEnvPlaceholder { .. } => {}
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn preserves_text_around_placeholder() {
+            let env_vars = HashMap::from([("VAR".to_string(), "value".to_string())]);
+            let result = resolve_placeholders("prefix_${VAR}_suffix", "field", &env_vars).unwrap();
+            assert_eq!(result, "prefix_value_suffix");
+        }
+    }
+
+    mod config_validation {
+        use super::*;
+
+        #[test]
+        fn sse_transport_requires_url() {
+            let config = Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: vec![BackendConfig {
+                    name: "test".to_string(),
+                    transport: TransportType::Sse,
+                    url: None,
+                    ..Default::default()
+                }],
+                tokens: vec![],
+                groups: vec![],
+            };
+
+            let error = config.validate().expect_err("should require URL");
+            match error {
+                ConfigError::MissingUrl { name, transport } => {
+                    assert_eq!(name, "test");
+                    assert_eq!(transport, TransportType::Sse);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn http_transport_requires_url() {
+            let config = Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: vec![BackendConfig {
+                    name: "http_backend".to_string(),
+                    transport: TransportType::Http,
+                    url: None,
+                    ..Default::default()
+                }],
+                tokens: vec![],
+                groups: vec![],
+            };
+
+            let error = config.validate().expect_err("should require URL");
+            match error {
+                ConfigError::MissingUrl { name, .. } => assert_eq!(name, "http_backend"),
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn stdio_transport_requires_command() {
+            let config = Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: vec![BackendConfig {
+                    name: "stdio_backend".to_string(),
+                    transport: TransportType::Stdio,
+                    command: None,
+                    ..Default::default()
+                }],
+                tokens: vec![],
+                groups: vec![],
+            };
+
+            let error = config.validate().expect_err("should require command");
+            match error {
+                ConfigError::MissingCommand { name } => assert_eq!(name, "stdio_backend"),
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn valid_sse_config_passes() {
+            let config = Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: vec![BackendConfig {
+                    name: "valid".to_string(),
+                    transport: TransportType::Sse,
+                    url: Some("http://localhost:3000".to_string()),
+                    ..Default::default()
+                }],
+                tokens: vec![],
+                groups: vec![],
+            };
+
+            config.validate().expect("valid config should pass");
+        }
+
+        #[test]
+        fn valid_stdio_config_passes() {
+            let config = Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: vec![BackendConfig {
+                    name: "stdio".to_string(),
+                    transport: TransportType::Stdio,
+                    command: Some("/usr/bin/mcp-server".to_string()),
+                    args: Some(vec!["--config".to_string(), "file.toml".to_string()]),
+                    ..Default::default()
+                }],
+                tokens: vec![],
+                groups: vec![],
+            };
+
+            config.validate().expect("valid config should pass");
+        }
+    }
+
+    mod config_parsing {
+        use super::*;
+
+        #[test]
+        fn parses_minimal_config() {
+            let toml = r#"
+                [gateway]
+                bind = "0.0.0.0:8080"
+
+                [[backends]]
+                name = "test"
+                url = "http://localhost:3000"
+                transport = "sse"
+            "#;
+
+            let config: Config = toml::from_str(toml).expect("should parse");
+            assert_eq!(config.gateway.bind, "0.0.0.0:8080");
+            assert_eq!(config.backends.len(), 1);
+            assert_eq!(config.backends[0].name, "test");
+            assert_eq!(config.backends[0].transport, TransportType::Sse);
+        }
+
+        #[test]
+        fn parses_full_backend_config() {
+            let toml = r#"
+                [gateway]
+                bind = "0.0.0.0:8080"
+                auth_token = "secret"
+                rate_limit_per_minute = 100
+
+                [[backends]]
+                name = "full"
+                url = "http://localhost:3000"
+                transport = "http"
+                enabled = false
+                timeout_secs = 60
+                health_check_interval_secs = 120
+                max_consecutive_failures = 5
+                circuit_breaker_cooldown_secs = 300
+                auth_token = "backend_token"
+                allowed_tools = ["tool1", "tool2"]
+
+                [backends.headers]
+                X-Custom = "value"
+
+                [backends.env]
+                MY_VAR = "my_value"
+            "#;
+
+            let config: Config = toml::from_str(toml).expect("should parse");
+            let backend = &config.backends[0];
+
+            assert_eq!(backend.name, "full");
+            assert!(!backend.enabled);
+            assert_eq!(backend.timeout_secs, 60);
+            assert_eq!(backend.health_check_interval_secs, 120);
+            assert_eq!(backend.max_consecutive_failures, 5);
+            assert_eq!(backend.circuit_breaker_cooldown_secs, 300);
+            assert_eq!(backend.auth_token, Some("backend_token".to_string()));
+            assert_eq!(backend.allowed_tools, vec!["tool1", "tool2"]);
+            assert_eq!(backend.headers.get("X-Custom"), Some(&"value".to_string()));
+            assert_eq!(backend.env.get("MY_VAR"), Some(&"my_value".to_string()));
+        }
+
+        #[test]
+        fn parses_stdio_backend() {
+            let toml = r#"
+                [gateway]
+                bind = "0.0.0.0:8080"
+
+                [[backends]]
+                name = "stdio_server"
+                command = "/usr/local/bin/mcp-server"
+                args = ["--verbose", "--config", "/etc/mcp.toml"]
+                transport = "stdio"
+
+                [backends.env]
+                DEBUG = "1"
+            "#;
+
+            let config: Config = toml::from_str(toml).expect("should parse");
+            let backend = &config.backends[0];
+
+            assert_eq!(backend.transport, TransportType::Stdio);
+            assert_eq!(
+                backend.command,
+                Some("/usr/local/bin/mcp-server".to_string())
+            );
+            assert_eq!(
+                backend.args,
+                Some(vec![
+                    "--verbose".to_string(),
+                    "--config".to_string(),
+                    "/etc/mcp.toml".to_string()
+                ])
+            );
+            assert_eq!(backend.env.get("DEBUG"), Some(&"1".to_string()));
+        }
+
+        #[test]
+        fn parses_tokens() {
+            let toml = r#"
+[gateway]
+bind = "0.0.0.0:8080"
+
+[[backends]]
+name = "dummy"
+url = "http://localhost"
+transport = "http"
+
+[[tokens]]
+name = "admin"
+token = "admin_secret"
+allowed_tools = ["*"]
+allowed_backends = ["backend1", "backend2"]
+rate_limit_per_minute = 1000
+
+[[tokens]]
+name = "readonly"
+token = "ro_token"
+allowed_tools = ["*_read", "*_list"]
+            "#;
+
+            let config: Config = toml::from_str(toml).expect("should parse");
+            assert_eq!(config.tokens.len(), 2);
+
+            assert_eq!(config.tokens[0].name, "admin");
+            assert_eq!(
+                config.tokens[0].allowed_backends,
+                vec!["backend1", "backend2"]
+            );
+
+            assert_eq!(config.tokens[1].name, "readonly");
+            assert_eq!(config.tokens[1].allowed_tools, vec!["*_read", "*_list"]);
+        }
+
+        #[test]
+        fn parses_tool_groups() {
+            let toml = r#"
+[gateway]
+bind = "0.0.0.0:8080"
+
+[[backends]]
+name = "dummy"
+url = "http://localhost"
+transport = "http"
+
+[[groups]]
+name = "coding"
+tools = ["*_read", "*_write"]
+backends = ["vscode", "git"]
+description = "Coding tools only"
+
+[[groups]]
+name = "readonly"
+tools = ["*_read", "*_list", "*_get"]
+            "#;
+
+            let config: Config = toml::from_str(toml).expect("should parse");
+            assert_eq!(config.groups.len(), 2);
+
+            assert_eq!(config.groups[0].name, "coding");
+            assert_eq!(config.groups[0].backends, vec!["vscode", "git"]);
+            assert_eq!(
+                config.groups[0].description,
+                Some("Coding tools only".to_string())
+            );
+
+            assert_eq!(config.groups[1].name, "readonly");
+            assert!(config.groups[1].backends.is_empty());
+        }
+    }
+
+    mod backend_config_defaults {
+        use super::*;
+
+        #[test]
+        fn default_values_are_set() {
+            let config = BackendConfig::default();
+
+            assert!(config.enabled);
+            assert_eq!(config.timeout_secs, 30);
+            assert_eq!(config.health_check_interval_secs, 30);
+            assert_eq!(config.max_consecutive_failures, 3);
+            assert_eq!(config.circuit_breaker_cooldown_secs, 60);
+            assert!(config.allowed_tools.is_empty());
+            assert!(config.headers.is_empty());
+            assert!(config.env.is_empty());
         }
     }
 }

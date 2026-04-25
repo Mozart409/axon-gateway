@@ -7,7 +7,6 @@
 //! - Performs periodic health checks
 //! - Implements circuit breaker pattern for failing backends
 
-use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use crate::error::BoxError;
@@ -449,16 +448,12 @@ impl BackendActor {
         let arguments_obj = arguments.as_object().cloned();
 
         let call_timeout = Duration::from_secs(self.config.timeout_secs);
-        let result = timeout(
-            call_timeout,
-            client.peer().call_tool(CallToolRequestParams {
-                meta: None,
-                name: Cow::Owned(tool_name.to_string()),
-                arguments: arguments_obj,
-                task: None,
-            }),
-        )
-        .await;
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        if let Some(args) = arguments_obj {
+            params = params.with_arguments(args);
+        }
+
+        let result = timeout(call_timeout, client.peer().call_tool(params)).await;
 
         match result {
             Ok(Ok(call_result)) => {
@@ -505,10 +500,9 @@ impl BackendActor {
         let call_timeout = Duration::from_secs(self.config.timeout_secs);
         let result = timeout(
             call_timeout,
-            client.peer().read_resource(ReadResourceRequestParams {
-                uri: uri.to_string(),
-                meta: None,
-            }),
+            client
+                .peer()
+                .read_resource(ReadResourceRequestParams::new(uri)),
         )
         .await;
 
@@ -566,16 +560,13 @@ impl BackendActor {
                 .collect()
         });
 
+        let mut params = GetPromptRequestParams::new(name);
+        if let Some(args) = args_map {
+            params = params.with_arguments(args);
+        }
+
         let call_timeout = Duration::from_secs(self.config.timeout_secs);
-        let result = timeout(
-            call_timeout,
-            client.peer().get_prompt(GetPromptRequestParams {
-                name: name.to_string(),
-                arguments: args_map,
-                meta: None,
-            }),
-        )
-        .await;
+        let result = timeout(call_timeout, client.peer().get_prompt(params)).await;
 
         match result {
             Ok(Ok(prompt_result)) => {
@@ -1162,5 +1153,180 @@ impl Message<ForceReconnect> for BackendActor {
         self.connect()
             .await
             .map_err(|e| format!("Force reconnect failed: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendConfig;
+
+    mod circuit_breaker {
+        use super::*;
+
+        #[test]
+        fn new_circuit_breaker_is_closed() {
+            let cb = CircuitBreaker::new(3, 60);
+            assert!(!cb.is_open());
+            assert_eq!(cb.consecutive_failures, 0);
+        }
+
+        #[test]
+        fn record_success_resets_failures() {
+            let mut cb = CircuitBreaker::new(3, 60);
+            cb.consecutive_failures = 2;
+            cb.record_success();
+            assert_eq!(cb.consecutive_failures, 0);
+            assert!(!cb.is_open());
+        }
+
+        #[test]
+        fn record_failure_increments_count() {
+            let mut cb = CircuitBreaker::new(3, 60);
+            let opened = cb.record_failure();
+            assert!(!opened);
+            assert_eq!(cb.consecutive_failures, 1);
+            assert!(!cb.is_open());
+        }
+
+        #[test]
+        fn circuit_opens_after_max_failures() {
+            let mut cb = CircuitBreaker::new(3, 60);
+            assert!(!cb.record_failure()); // 1
+            assert!(!cb.record_failure()); // 2
+            assert!(cb.record_failure()); // 3 - opens
+            assert!(cb.is_open());
+        }
+
+        #[test]
+        fn circuit_stays_open_on_additional_failures() {
+            let mut cb = CircuitBreaker::new(2, 60);
+            cb.record_failure();
+            assert!(cb.record_failure()); // opens
+            assert!(!cb.record_failure()); // already open, returns false
+            assert!(cb.is_open());
+        }
+
+        #[test]
+        fn should_attempt_close_returns_false_when_closed() {
+            let cb = CircuitBreaker::new(3, 60);
+            assert!(!cb.should_attempt_close());
+        }
+
+        #[test]
+        fn should_attempt_close_returns_false_before_cooldown() {
+            let mut cb = CircuitBreaker::new(1, 60);
+            cb.record_failure();
+            assert!(cb.is_open());
+            assert!(!cb.should_attempt_close());
+        }
+
+        #[test]
+        fn should_attempt_close_returns_true_after_cooldown() {
+            let mut cb = CircuitBreaker::new(1, 0); // 0 second cooldown
+            cb.record_failure();
+            assert!(cb.is_open());
+            // With 0 cooldown, should immediately be ready
+            assert!(cb.should_attempt_close());
+        }
+
+        #[test]
+        fn reset_clears_all_state() {
+            let mut cb = CircuitBreaker::new(1, 60);
+            cb.record_failure();
+            assert!(cb.is_open());
+            cb.reset();
+            assert!(!cb.is_open());
+            assert_eq!(cb.consecutive_failures, 0);
+        }
+    }
+
+    mod calculate_backoff {
+        use super::*;
+
+        fn backoff_for_attempts(attempts: u32) -> Duration {
+            let backoff_secs = BASE_BACKOFF_SECS.saturating_mul(2u64.saturating_pow(attempts));
+            Duration::from_secs(backoff_secs.min(MAX_BACKOFF_SECS))
+        }
+
+        #[test]
+        fn first_attempt_uses_base_backoff() {
+            let backoff = backoff_for_attempts(0);
+            assert_eq!(backoff, Duration::from_secs(BASE_BACKOFF_SECS));
+        }
+
+        #[test]
+        fn backoff_doubles_each_attempt() {
+            assert_eq!(backoff_for_attempts(0), Duration::from_secs(1));
+            assert_eq!(backoff_for_attempts(1), Duration::from_secs(2));
+            assert_eq!(backoff_for_attempts(2), Duration::from_secs(4));
+            assert_eq!(backoff_for_attempts(3), Duration::from_secs(8));
+        }
+
+        #[test]
+        fn backoff_caps_at_max() {
+            let backoff = backoff_for_attempts(20);
+            assert_eq!(backoff, Duration::from_secs(MAX_BACKOFF_SECS));
+        }
+    }
+
+    mod filter_tools {
+        use super::*;
+
+        fn make_tool(name: &str) -> ToolDefinition {
+            ToolDefinition {
+                name: name.to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            }
+        }
+
+        #[test]
+        fn no_filter_returns_all_tools() {
+            let config = BackendConfig {
+                name: "test".to_string(),
+                allowed_tools: vec![],
+                ..Default::default()
+            };
+            let tools = [make_tool("a"), make_tool("b"), make_tool("c")];
+
+            // Empty allowed_tools means no filtering - all tools returned
+            assert!(config.allowed_tools.is_empty());
+            assert_eq!(tools.len(), 3);
+        }
+
+        #[test]
+        fn filter_keeps_only_allowed_tools() {
+            let allowed_set: std::collections::HashSet<&str> =
+                ["tool_a", "tool_c"].into_iter().collect();
+
+            let tools = vec![
+                make_tool("tool_a"),
+                make_tool("tool_b"),
+                make_tool("tool_c"),
+            ];
+            let filtered: Vec<_> = tools
+                .into_iter()
+                .filter(|t| allowed_set.contains(t.name.as_str()))
+                .collect();
+
+            assert_eq!(filtered.len(), 2);
+            assert_eq!(filtered[0].name, "tool_a");
+            assert_eq!(filtered[1].name, "tool_c");
+        }
+
+        #[test]
+        fn filter_with_no_matches_returns_empty() {
+            let allowed_set: std::collections::HashSet<&str> =
+                ["nonexistent"].into_iter().collect();
+
+            let tools = vec![make_tool("tool_a"), make_tool("tool_b")];
+            let filtered: Vec<_> = tools
+                .into_iter()
+                .filter(|t| allowed_set.contains(t.name.as_str()))
+                .collect();
+
+            assert!(filtered.is_empty());
+        }
     }
 }
