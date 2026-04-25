@@ -15,7 +15,7 @@ pre-commit:
       stage_fixed: true
     - name: clippy
       glob: "*.rs"
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo clippy --all-targets -- -D warnings -D clippy::pedantic
       stage_fixed: true
     - name: format
       glob: "*.rs"
