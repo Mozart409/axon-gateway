@@ -296,42 +296,296 @@ impl BackendInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{NamespacedResource, ResourceDefinition};
+    use super::*;
+    use std::sync::Arc;
 
-    #[test]
-    fn namespaced_resource_prefixes_display_name_with_backend() {
-        let resource = ResourceDefinition {
-            uri: String::from("http://localhost:20212/openapi.json"),
-            name: Some(String::from("OpenApi Specification")),
-            description: None,
-            mime_type: None,
-        };
+    mod namespaced_resource {
+        use super::*;
 
-        let namespaced = NamespacedResource::new("netalertx", resource);
+        #[test]
+        fn prefixes_display_name_with_backend() {
+            let resource = ResourceDefinition {
+                uri: String::from("http://localhost:20212/openapi.json"),
+                name: Some(String::from("OpenApi Specification")),
+                description: None,
+                mime_type: None,
+            };
 
-        assert_eq!(
-            namespaced.definition.name,
-            Some(String::from("Netalertx OpenApi Specification"))
-        );
-        assert_eq!(
-            namespaced.definition.uri,
-            String::from("netalertx://http://localhost:20212/openapi.json")
-        );
+            let namespaced = NamespacedResource::new("netalertx", resource);
+
+            assert_eq!(
+                namespaced.definition.name,
+                Some(String::from("Netalertx OpenApi Specification"))
+            );
+            assert_eq!(
+                namespaced.definition.uri,
+                String::from("netalertx://http://localhost:20212/openapi.json")
+            );
+        }
+
+        #[test]
+        fn humanizes_backend_name_with_separators() {
+            let resource = ResourceDefinition {
+                uri: String::from("stdout.log"),
+                name: Some(String::from("stdout.log")),
+                description: None,
+                mime_type: None,
+            };
+
+            let namespaced = NamespacedResource::new("home_assistant-api", resource);
+            assert_eq!(
+                namespaced.definition.name,
+                Some(String::from("Home Assistant Api stdout.log"))
+            );
+        }
     }
 
-    #[test]
-    fn namespaced_resource_humanizes_backend_name_with_separators() {
-        let resource = ResourceDefinition {
-            uri: String::from("stdout.log"),
-            name: Some(String::from("stdout.log")),
-            description: None,
-            mime_type: None,
-        };
+    mod tool_definition_from {
+        use super::*;
 
-        let namespaced = NamespacedResource::new("home_assistant-api", resource);
-        assert_eq!(
-            namespaced.definition.name,
-            Some(String::from("Home Assistant Api stdout.log"))
-        );
+        #[test]
+        fn converts_tool_with_all_fields() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "arg1": {"type": "string"}
+                }
+            });
+            let tool = Tool::new(
+                "test_tool",
+                "A test tool",
+                Arc::new(schema.as_object().unwrap().clone()),
+            );
+
+            let def = ToolDefinition::from(tool);
+            assert_eq!(def.name, "test_tool");
+            assert_eq!(def.description, Some("A test tool".to_string()));
+            assert!(def.input_schema.get("type").is_some());
+        }
+
+        #[test]
+        fn converts_tool_without_description() {
+            let tool = Tool::new_with_raw("minimal_tool", None, Arc::new(serde_json::Map::new()));
+
+            let def = ToolDefinition::from(tool);
+            assert_eq!(def.name, "minimal_tool");
+            assert!(def.description.is_none());
+        }
+
+        #[test]
+        fn owned_string_is_converted() {
+            let tool = Tool::new(
+                "owned_name".to_string(),
+                "owned desc".to_string(),
+                Arc::new(serde_json::Map::new()),
+            );
+
+            let def = ToolDefinition::from(tool);
+            assert_eq!(def.name, "owned_name");
+            assert_eq!(def.description, Some("owned desc".to_string()));
+        }
+    }
+
+    mod prompt_definition_from {
+        use super::*;
+        use rmcp::model::PromptArgument as McpPromptArgument;
+
+        #[test]
+        fn converts_prompt_with_arguments() {
+            let prompt = Prompt::new(
+                "code_review",
+                Some("Reviews code"),
+                Some(vec![
+                    McpPromptArgument::new("file")
+                        .with_description("File to review")
+                        .with_required(true),
+                    McpPromptArgument::new("style").with_required(false),
+                ]),
+            );
+
+            let def = PromptDefinition::from(prompt);
+            assert_eq!(def.name, "code_review");
+            assert_eq!(def.description, Some("Reviews code".to_string()));
+
+            let args = def.arguments.unwrap();
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0].name, "file");
+            assert_eq!(args[0].description, Some("File to review".to_string()));
+            assert_eq!(args[0].required, Some(true));
+            assert_eq!(args[1].name, "style");
+            assert!(args[1].description.is_none());
+        }
+
+        #[test]
+        fn converts_prompt_without_arguments() {
+            let prompt = Prompt::new::<_, String>("simple", None, None);
+
+            let def = PromptDefinition::from(prompt);
+            assert_eq!(def.name, "simple");
+            assert!(def.description.is_none());
+            assert!(def.arguments.is_none());
+        }
+    }
+
+    mod namespaced_tool {
+        use super::*;
+
+        fn make_tool(name: &str) -> ToolDefinition {
+            ToolDefinition {
+                name: name.to_string(),
+                description: Some(format!("{name} description")),
+                input_schema: serde_json::json!({}),
+            }
+        }
+
+        #[test]
+        fn creates_namespaced_name_from_backend_and_tool() {
+            let tool = make_tool("get_status");
+            let ns = NamespacedTool::new("homeassistant", tool);
+
+            assert_eq!(ns.original_name, "get_status");
+            assert_eq!(ns.namespaced_name, "homeassistant_get_status");
+            assert_eq!(ns.backend_name, "homeassistant");
+        }
+
+        #[test]
+        fn definition_uses_namespaced_name() {
+            let tool = make_tool("my_tool");
+            let ns = NamespacedTool::new("backend", tool);
+
+            assert_eq!(ns.definition.name, "backend_my_tool");
+            assert_eq!(
+                ns.definition.description,
+                Some("my_tool description".to_string())
+            );
+        }
+
+        #[test]
+        fn preserves_input_schema() {
+            let tool = ToolDefinition {
+                name: "tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["input"]
+                }),
+            };
+            let ns = NamespacedTool::new("be", tool);
+
+            assert_eq!(
+                ns.definition.input_schema,
+                serde_json::json!({"type": "object", "required": ["input"]})
+            );
+        }
+    }
+
+    mod namespaced_prompt {
+        use super::*;
+
+        #[test]
+        fn creates_namespaced_prompt_name() {
+            let prompt = PromptDefinition {
+                name: "summarize".to_string(),
+                description: Some("Summarizes text".to_string()),
+                arguments: None,
+            };
+            let ns = NamespacedPrompt::new("llm", prompt);
+
+            assert_eq!(ns.original_name, "summarize");
+            assert_eq!(ns.namespaced_name, "llm_summarize");
+            assert_eq!(ns.backend_name, "llm");
+            assert_eq!(ns.definition.name, "llm_summarize");
+        }
+
+        #[test]
+        fn preserves_arguments() {
+            let prompt = PromptDefinition {
+                name: "test".to_string(),
+                description: None,
+                arguments: Some(vec![PromptArgument {
+                    name: "arg1".to_string(),
+                    description: None,
+                    required: Some(true),
+                }]),
+            };
+            let ns = NamespacedPrompt::new("be", prompt);
+
+            let args = ns.definition.arguments.unwrap();
+            assert_eq!(args.len(), 1);
+            assert_eq!(args[0].name, "arg1");
+        }
+    }
+
+    mod json_rpc_response {
+        use super::*;
+
+        #[test]
+        fn success_response_has_result() {
+            let resp =
+                JsonRpcResponse::success(serde_json::json!(1), serde_json::json!({"data": "test"}));
+
+            assert_eq!(resp.jsonrpc, "2.0");
+            assert_eq!(resp.id, serde_json::json!(1));
+            assert!(resp.result.is_some());
+            assert!(resp.error.is_none());
+        }
+
+        #[test]
+        fn error_response_has_error() {
+            let resp =
+                JsonRpcResponse::error(serde_json::json!("req-1"), -32600, "Invalid request");
+
+            assert_eq!(resp.jsonrpc, "2.0");
+            assert_eq!(resp.id, serde_json::json!("req-1"));
+            assert!(resp.result.is_none());
+
+            let err = resp.error.unwrap();
+            assert_eq!(err.code, -32600);
+            assert_eq!(err.message, "Invalid request");
+        }
+    }
+
+    mod backend_info {
+        use super::*;
+
+        #[test]
+        fn new_computes_tool_count() {
+            let tools = vec![
+                NamespacedTool::new(
+                    "be",
+                    ToolDefinition {
+                        name: "t1".to_string(),
+                        description: None,
+                        input_schema: serde_json::json!({}),
+                    },
+                ),
+                NamespacedTool::new(
+                    "be",
+                    ToolDefinition {
+                        name: "t2".to_string(),
+                        description: None,
+                        input_schema: serde_json::json!({}),
+                    },
+                ),
+            ];
+
+            let info = BackendInfo::new("test".to_string(), BackendState::Connected, tools, None);
+
+            assert_eq!(info.tool_count, 2);
+            assert_eq!(info.tools.len(), 2);
+        }
+
+        #[test]
+        fn empty_tools_has_zero_count() {
+            let info = BackendInfo::new(
+                "empty".to_string(),
+                BackendState::Disconnected,
+                vec![],
+                Some("error".to_string()),
+            );
+
+            assert_eq!(info.tool_count, 0);
+            assert_eq!(info.last_error, Some("error".to_string()));
+        }
     }
 }
