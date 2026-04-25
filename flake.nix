@@ -43,6 +43,7 @@
           podman-compose
           rust
           tailwindcss_4
+          trivy
           # keep-sorted end
         ];
         shellHook = ''
