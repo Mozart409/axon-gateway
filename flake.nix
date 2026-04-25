@@ -32,26 +32,20 @@
           cargo-deny
           cargo-workspaces
           cocogitto
-          dbeaver-bin
-          docker
-          docker-buildx
-          docker-compose
           just
           keep-sorted
           lazydocker
           lefthook
           opencode
-          opentofu
-          postgresql_16
+          podman
+          podman-compose
           rust
-          sqlx-cli
           tailwindcss_4
           # keep-sorted end
         ];
         shellHook = ''
           lefthook install
           cog install-hook
-          export COMPOSE_BAKE=true
         '';
       };
     });
