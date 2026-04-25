@@ -1,6 +1,6 @@
 [package]
 name = "axon-gateway"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 
@@ -20,8 +20,9 @@ metrics-exporter-prometheus = "0.18"
 moka = { version = "0.12", features = ["future"] }
 notify = "8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-rmcp = { version = "0.17.0", features = [
+rmcp = { version = "1.5", features = [
     "client",
+    "macros",
     "schemars",
     "server",
     "transport-child-process",

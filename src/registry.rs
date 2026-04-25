@@ -394,3 +394,231 @@ impl Message<RemoveBackend> for RegistryActor {
         tracing::info!("Removed backend '{}' from registry", msg.name);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: Some(format!("{name} description")),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    mod tool_cache {
+        use super::*;
+
+        #[test]
+        fn new_cache_is_invalid() {
+            let cache = ToolCache::new(300);
+            assert!(!cache.is_valid());
+        }
+
+        #[test]
+        fn cache_becomes_valid_after_update() {
+            let mut cache = ToolCache::new(300);
+            cache.update(vec![make_tool("test")]);
+            assert!(cache.is_valid());
+        }
+
+        #[test]
+        fn invalidate_clears_cache() {
+            let mut cache = ToolCache::new(300);
+            cache.update(vec![make_tool("test")]);
+            assert!(cache.is_valid());
+            cache.invalidate();
+            assert!(!cache.is_valid());
+        }
+
+        #[test]
+        fn empty_cache_is_invalid_even_after_update() {
+            let mut cache = ToolCache::new(300);
+            cache.update(vec![]);
+            assert!(!cache.is_valid());
+        }
+
+        #[test]
+        fn cache_expires_after_ttl() {
+            let mut cache = ToolCache::new(0); // 0 second TTL
+            cache.update(vec![make_tool("test")]);
+            // With 0 TTL, cache should be invalid immediately
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            assert!(!cache.is_valid());
+        }
+    }
+
+    mod filter_tools_for_group {
+        use super::*;
+
+        #[test]
+        fn empty_filters_returns_all_tools() {
+            let tools = vec![make_tool("backend1_tool_a"), make_tool("backend2_tool_b")];
+            let group = ToolGroupConfig {
+                name: "all".to_string(),
+                tools: vec![],
+                backends: vec![],
+                description: None,
+            };
+
+            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            assert_eq!(filtered.len(), 2);
+        }
+
+        #[test]
+        fn backend_filter_keeps_matching_tools() {
+            let tools = vec![
+                make_tool("backend1_tool_a"),
+                make_tool("backend1_tool_b"),
+                make_tool("backend2_tool_c"),
+            ];
+            let group = ToolGroupConfig {
+                name: "group1".to_string(),
+                tools: vec![],
+                backends: vec!["backend1".to_string()],
+                description: None,
+            };
+
+            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            assert_eq!(filtered.len(), 2);
+            assert!(filtered.iter().all(|t| t.name.starts_with("backend1_")));
+        }
+
+        #[test]
+        fn tool_pattern_filter_with_prefix_glob() {
+            let tools = vec![
+                make_tool("backend1_read"),
+                make_tool("backend1_write"),
+                make_tool("backend2_delete"),
+            ];
+            let group = ToolGroupConfig {
+                name: "backend1_tools".to_string(),
+                tools: vec!["backend1_*".to_string()],
+                backends: vec![],
+                description: None,
+            };
+
+            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            assert_eq!(filtered.len(), 2);
+            assert!(filtered.iter().all(|t| t.name.starts_with("backend1_")));
+        }
+
+        #[test]
+        fn tool_pattern_filter_with_exact_match() {
+            let tools = vec![
+                make_tool("backend1_read"),
+                make_tool("backend1_write"),
+                make_tool("backend1_delete"),
+            ];
+            let group = ToolGroupConfig {
+                name: "readonly".to_string(),
+                tools: vec!["backend1_read".to_string()],
+                backends: vec![],
+                description: None,
+            };
+
+            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].name, "backend1_read");
+        }
+
+        #[test]
+        fn combined_backend_and_tool_filter() {
+            let tools = vec![
+                make_tool("backend1_read"),
+                make_tool("backend1_write"),
+                make_tool("backend2_read"),
+            ];
+            let group = ToolGroupConfig {
+                name: "b1_read".to_string(),
+                tools: vec!["backend1_read".to_string()],
+                backends: vec!["backend1".to_string()],
+                description: None,
+            };
+
+            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].name, "backend1_read");
+        }
+    }
+
+    mod registry_actor {
+        use super::*;
+
+        #[test]
+        fn new_creates_empty_registry() {
+            let registry = RegistryActor::new();
+            assert!(registry.backends.is_empty());
+            assert!(registry.tool_routing.is_empty());
+        }
+
+        #[test]
+        fn with_groups_stores_groups() {
+            let groups = vec![ToolGroupConfig {
+                name: "group1".to_string(),
+                tools: vec![],
+                backends: vec![],
+                description: Some("Test group".to_string()),
+            }];
+            let registry = RegistryActor::with_groups(groups.clone());
+            assert_eq!(registry.tool_groups.len(), 1);
+            assert_eq!(registry.tool_groups[0].name, "group1");
+        }
+
+        #[test]
+        fn build_tool_list_only_includes_connected_backends() {
+            let registry = RegistryActor::new();
+
+            // Add a connected backend
+            let tool = make_tool("test_tool");
+            let ns_tool = NamespacedTool::new("connected", tool);
+            registry.backends.insert(
+                "connected".to_string(),
+                BackendInfo::new(
+                    "connected".to_string(),
+                    BackendState::Connected,
+                    vec![ns_tool],
+                    None,
+                ),
+            );
+
+            // Add a disconnected backend
+            let tool2 = make_tool("other_tool");
+            let ns_tool2 = NamespacedTool::new("disconnected", tool2);
+            registry.backends.insert(
+                "disconnected".to_string(),
+                BackendInfo::new(
+                    "disconnected".to_string(),
+                    BackendState::Disconnected,
+                    vec![ns_tool2],
+                    None,
+                ),
+            );
+
+            let tool_list = registry.build_tool_list();
+            assert_eq!(tool_list.len(), 1);
+            assert_eq!(tool_list[0].name, "connected_test_tool");
+        }
+    }
+
+    mod namespaced_tool {
+        use super::*;
+
+        #[test]
+        fn creates_namespaced_name() {
+            let tool = make_tool("my_tool");
+            let ns = NamespacedTool::new("backend", tool);
+            assert_eq!(ns.namespaced_name, "backend_my_tool");
+            assert_eq!(ns.original_name, "my_tool");
+            assert_eq!(ns.backend_name, "backend");
+        }
+
+        #[test]
+        fn definition_has_namespaced_name() {
+            let tool = make_tool("tool");
+            let ns = NamespacedTool::new("prefix", tool);
+            assert_eq!(ns.definition.name, "prefix_tool");
+        }
+    }
+}

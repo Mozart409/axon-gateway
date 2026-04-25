@@ -21,3 +21,6 @@ up: clear
 
 down:
     podman compose -f example/compose.local.yml down -v
+
+clippy: clear
+    cargo clippy -- -D clippy::pedantic

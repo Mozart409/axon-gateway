@@ -156,6 +156,7 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 /// Handle GET / - simple landing page
+#[allow(clippy::too_many_lines)]
 async fn handle_landing(State(state): State<AppState>) -> Html<String> {
     let mcp_server_url = build_mcp_server_url(&state.base_url);
 
@@ -1264,7 +1265,11 @@ fn start_ui_event_poller(state: AppState) {
 }
 
 /// Start the HTTP server
-pub async fn serve(state: AppState, bind: &str) -> Result<(), ServerError> {
+pub async fn serve(
+    state: AppState,
+    bind: &str,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), ServerError> {
     start_ui_event_poller(state.clone());
     let router = create_router(state);
 
@@ -1276,7 +1281,9 @@ pub async fn serve(state: AppState, bind: &str) -> Result<(), ServerError> {
         })?;
     tracing::info!("MCP Gateway listening on {}", bind);
 
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
     Ok(())
 }

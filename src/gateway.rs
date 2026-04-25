@@ -604,11 +604,11 @@ impl Message<AddBackend> for GatewayActor {
         let name = msg.config.name.clone();
 
         if self.backends.contains_key(&name) {
-            return Err(format!("Backend '{name}' already exists",));
+            return Err(format!("Backend '{name}' already exists"));
         }
 
         if !msg.config.enabled {
-            return Err(format!("Backend '{name}' is disabled",));
+            return Err(format!("Backend '{name}' is disabled"));
         }
 
         // Register in registry
@@ -784,7 +784,7 @@ impl Message<ReloadConfig> for GatewayActor {
         for name in current_names.difference(&new_names) {
             if let Some(actor_ref) = self.backends.remove(name) {
                 if let Err(e) = actor_ref.stop_gracefully().await {
-                    errors.push(format!("Failed to stop '{name}': {e:?}",));
+                    errors.push(format!("Failed to stop '{name}': {e:?}"));
                 }
                 let _ = self
                     .registry
@@ -848,4 +848,217 @@ pub struct ReloadResult {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub errors: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod resource_uri_parsing {
+        #[test]
+        fn parses_namespaced_uri() {
+            let uri = "backend://http://localhost:8080/api";
+            let (backend, original) = uri.split_once("://").unwrap();
+
+            assert_eq!(backend, "backend");
+            assert_eq!(original, "http://localhost:8080/api");
+        }
+
+        #[test]
+        fn handles_simple_uri() {
+            let uri = "mybackend://file.txt";
+            let (backend, original) = uri.split_once("://").unwrap();
+
+            assert_eq!(backend, "mybackend");
+            assert_eq!(original, "file.txt");
+        }
+
+        #[test]
+        fn invalid_uri_returns_none() {
+            let uri = "no-separator-here";
+            let result = uri.split_once("://");
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn empty_backend_parses() {
+            let uri = "://path";
+            let (backend, original) = uri.split_once("://").unwrap();
+
+            assert_eq!(backend, "");
+            assert_eq!(original, "path");
+        }
+    }
+
+    mod prompt_name_parsing {
+        #[test]
+        fn parses_namespaced_prompt() {
+            let name = "backend_prompt_name";
+            let (backend, original) = name.split_once('_').unwrap();
+
+            assert_eq!(backend, "backend");
+            assert_eq!(original, "prompt_name");
+        }
+
+        #[test]
+        fn handles_multiple_underscores() {
+            let name = "be_prompt_with_underscores";
+            let (backend, original) = name.split_once('_').unwrap();
+
+            assert_eq!(backend, "be");
+            assert_eq!(original, "prompt_with_underscores");
+        }
+
+        #[test]
+        fn no_underscore_returns_none() {
+            let name = "nounderscore";
+            let result = name.split_once('_');
+            assert!(result.is_none());
+        }
+    }
+
+    mod json_rpc_request {
+        use super::*;
+
+        #[test]
+        fn deserializes_tools_list() {
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }"#;
+
+            let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(req.method, "tools/list");
+            assert_eq!(req.id, serde_json::json!(1));
+        }
+
+        #[test]
+        fn deserializes_tool_call() {
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "id": "req-123",
+                "method": "tools/call",
+                "params": {
+                    "name": "backend_my_tool",
+                    "arguments": {"key": "value"}
+                }
+            }"#;
+
+            let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(req.method, "tools/call");
+            assert_eq!(
+                req.params.get("name").and_then(|v| v.as_str()),
+                Some("backend_my_tool")
+            );
+            assert_eq!(
+                req.params.get("arguments").and_then(|v| v.get("key")),
+                Some(&serde_json::json!("value"))
+            );
+        }
+
+        #[test]
+        fn deserializes_resource_read() {
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {
+                    "uri": "mybackend://path/to/resource"
+                }
+            }"#;
+
+            let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(req.method, "resources/read");
+            assert_eq!(
+                req.params.get("uri").and_then(|v| v.as_str()),
+                Some("mybackend://path/to/resource")
+            );
+        }
+
+        #[test]
+        fn handles_missing_params() {
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "ping"
+            }"#;
+
+            let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(req.method, "ping");
+            assert_eq!(req.params, serde_json::Value::Null);
+        }
+    }
+
+    mod gateway_status {
+        use super::*;
+
+        #[test]
+        fn serializes_correctly() {
+            let status = GatewayStatus {
+                backend_count: 3,
+                backends: vec![
+                    "backend1".to_string(),
+                    "backend2".to_string(),
+                    "backend3".to_string(),
+                ],
+            };
+
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(json["backend_count"], 3);
+            assert_eq!(json["backends"].as_array().unwrap().len(), 3);
+        }
+    }
+
+    mod reload_result {
+        use super::*;
+
+        #[test]
+        fn serializes_correctly() {
+            let result = ReloadResult {
+                added: vec!["new1".to_string(), "new2".to_string()],
+                removed: vec!["old1".to_string()],
+                errors: vec![],
+            };
+
+            let json = serde_json::to_value(&result).unwrap();
+            assert_eq!(json["added"].as_array().unwrap().len(), 2);
+            assert_eq!(json["removed"].as_array().unwrap().len(), 1);
+            assert!(json["errors"].as_array().unwrap().is_empty());
+        }
+
+        #[test]
+        fn handles_errors() {
+            let result = ReloadResult {
+                added: vec![],
+                removed: vec![],
+                errors: vec!["Failed to connect".to_string()],
+            };
+
+            let json = serde_json::to_value(&result).unwrap();
+            assert_eq!(json["errors"][0], "Failed to connect");
+        }
+    }
+
+    mod tool_routing_logic {
+        #[test]
+        fn extracts_backend_from_namespaced_tool() {
+            let tool_name = "homeassistant_get_state";
+            let parts: Vec<&str> = tool_name.splitn(2, '_').collect();
+
+            assert_eq!(parts.len(), 2);
+            assert_eq!(parts[0], "homeassistant");
+            assert_eq!(parts[1], "get_state");
+        }
+
+        #[test]
+        fn tool_with_underscores_preserves_original_name() {
+            let tool_name = "backend_tool_with_many_underscores";
+            let parts: Vec<&str> = tool_name.splitn(2, '_').collect();
+
+            assert_eq!(parts[0], "backend");
+            assert_eq!(parts[1], "tool_with_many_underscores");
+        }
+    }
 }
