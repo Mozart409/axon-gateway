@@ -28,7 +28,7 @@ pre-push:
     # keep-sorted start
     - name: clippy-pedantic
       glob: "*.rs"
-      run: cargo clippy -- -W clippy::pedantic
+      run: cargo clippy -- -D clippy::pedantic
     - name: test
       run: cargo test
 
