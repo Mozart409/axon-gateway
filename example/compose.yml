@@ -1,0 +1,18 @@
+services:
+  axon-gateway:
+    image: ghcr.io/mozart409/axon-gateway:latest
+    ports:
+      - "8080:8080"
+    environment:
+      RUST_LOG: info
+      # AXON_LOG_JSON: 1
+      # AXON_GATEWAY_TOKEN: your-secret-token-here
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+    command: ["/app/config.toml"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
