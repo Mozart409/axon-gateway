@@ -20,6 +20,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use tokio::process::Command;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{BackendConfig, TransportType};
 use crate::registry::{RegistryActor, UpdateBackend};
@@ -133,6 +134,8 @@ pub struct BackendActor {
     circuit_breaker: CircuitBreaker,
     /// Weak reference to self for scheduling delayed messages
     self_ref: Option<WeakActorRef<Self>>,
+    /// Cancellation token for spawned background tasks
+    cancel_token: CancellationToken,
 }
 
 impl BackendActor {
@@ -149,6 +152,7 @@ impl BackendActor {
             reconnect_attempts: 0,
             circuit_breaker,
             self_ref: None,
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -671,10 +675,17 @@ impl BackendActor {
                 .await;
 
             let name = self.config.name.clone();
+            let token = self.cancel_token.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(backoff).await;
-                if let Err(e) = actor_ref.tell(Reconnect).await {
-                    tracing::error!("Failed to send reconnect message to '{}': {}", name, e);
+                tokio::select! {
+                    () = token.cancelled() => {
+                        tracing::debug!("Reconnect task cancelled for '{}'", name);
+                    }
+                    () = tokio::time::sleep(backoff) => {
+                        if let Err(e) = actor_ref.tell(Reconnect).await {
+                            tracing::debug!("Failed to send reconnect message to '{}': {}", name, e);
+                        }
+                    }
                 }
             });
         }
@@ -694,10 +705,17 @@ impl BackendActor {
             );
 
             let name = self.config.name.clone();
+            let token = self.cancel_token.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(cooldown).await;
-                if let Err(e) = actor_ref.tell(Reconnect).await {
-                    tracing::error!("Failed to send reconnect message to '{}': {}", name, e);
+                tokio::select! {
+                    () = token.cancelled() => {
+                        tracing::debug!("Circuit breaker reconnect task cancelled for '{}'", name);
+                    }
+                    () = tokio::time::sleep(cooldown) => {
+                        if let Err(e) = actor_ref.tell(Reconnect).await {
+                            tracing::debug!("Failed to send reconnect message to '{}': {}", name, e);
+                        }
+                    }
                 }
             });
         }
@@ -714,11 +732,18 @@ impl BackendActor {
         {
             let interval = Duration::from_secs(self.config.health_check_interval_secs);
             let name = self.config.name.clone();
+            let token = self.cancel_token.clone();
 
             tokio::spawn(async move {
-                tokio::time::sleep(interval).await;
-                if let Err(e) = actor_ref.tell(PerformHealthCheck).await {
-                    tracing::debug!("Failed to send health check message to '{}': {}", name, e);
+                tokio::select! {
+                    () = token.cancelled() => {
+                        tracing::debug!("Health check task cancelled for '{}'", name);
+                    }
+                    () = tokio::time::sleep(interval) => {
+                        if let Err(e) = actor_ref.tell(PerformHealthCheck).await {
+                            tracing::debug!("Failed to send health check message to '{}': {}", name, e);
+                        }
+                    }
                 }
             });
         }
@@ -796,6 +821,7 @@ impl Actor for BackendActor {
         _reason: kameo::error::ActorStopReason,
     ) -> Result<(), BoxError> {
         tracing::info!("Backend actor stopping: {}", self.config.name);
+        self.cancel_token.cancel();
         self.disconnect().await;
         Ok(())
     }
