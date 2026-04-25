@@ -1288,7 +1288,8 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use http::Request;
-    use kameo::spawn;
+    use kameo::actor::Spawn;
+    use kameo::mailbox;
     use tower::ServiceExt;
 
     use super::*;
@@ -1322,8 +1323,12 @@ mod tests {
             groups: Vec::new(),
         };
 
-        let registry = spawn(RegistryActor::new());
-        let gateway = spawn(GatewayActor::new(config, registry));
+        let registry =
+            RegistryActor::spawn_with_mailbox(RegistryActor::new(), mailbox::unbounded());
+        let gateway = GatewayActor::spawn_with_mailbox(
+            GatewayActor::new(config, registry),
+            mailbox::unbounded(),
+        );
 
         AppState {
             gateway,

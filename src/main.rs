@@ -28,6 +28,9 @@ use color_eyre::eyre::{Result, WrapErr};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use kameo::actor::Spawn;
+use kameo::mailbox;
+
 use crate::auth::AuthManager;
 use crate::config::Config;
 use crate::gateway::GatewayActor;
@@ -94,17 +97,20 @@ async fn main() -> Result<()> {
 
     // Spawn registry actor (with tool groups if configured)
     let registry = if config.groups.is_empty() {
-        kameo::spawn(RegistryActor::new())
+        RegistryActor::spawn_with_mailbox(RegistryActor::new(), mailbox::unbounded())
     } else {
         tracing::info!(
             "Tool groups configured: {:?}",
             config.groups.iter().map(|g| &g.name).collect::<Vec<_>>()
         );
-        kameo::spawn(RegistryActor::with_groups(config.groups.clone()))
+        RegistryActor::spawn_with_mailbox(
+            RegistryActor::with_groups(config.groups.clone()),
+            mailbox::unbounded(),
+        )
     };
 
-    // Spawn gateway actor
-    let gateway = kameo::spawn(GatewayActor::new(config, registry));
+    let gateway =
+        GatewayActor::spawn_with_mailbox(GatewayActor::new(config, registry), mailbox::unbounded());
 
     // Give actors time to initialize
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

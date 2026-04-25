@@ -9,8 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kameo::actor::{Actor, ActorRef};
-use kameo::error::BoxError;
+use crate::error::BoxError;
+use kameo::actor::{Actor, ActorRef, Spawn};
+use kameo::mailbox;
 use kameo::message::{Context, Message};
 
 use crate::auth::{AuthManager, TokenIdentity};
@@ -62,7 +63,7 @@ impl GatewayActor {
 
             // Spawn backend actor
             let backend_actor = BackendActor::new(backend_config.clone(), self.registry.clone());
-            let actor_ref = kameo::spawn(backend_actor);
+            let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
 
             self.backends.insert(backend_config.name.clone(), actor_ref);
 
@@ -74,13 +75,14 @@ impl GatewayActor {
 }
 
 impl Actor for GatewayActor {
-    type Mailbox = kameo::mailbox::unbounded::UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = BoxError;
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(mut state: Self, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!("Gateway actor starting...");
-        self.init_backends().await?;
-        tracing::info!("Gateway ready with {} backends", self.backends.len());
-        Ok(())
+        state.init_backends().await?;
+        tracing::info!("Gateway ready with {} backends", state.backends.len());
+        Ok(state)
     }
 }
 
@@ -101,7 +103,7 @@ impl Message<HandleRequest> for GatewayActor {
     async fn handle(
         &mut self,
         msg: HandleRequest,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let request = msg.request;
 
@@ -427,7 +429,7 @@ impl Message<GetStatus> for GatewayActor {
     async fn handle(
         &mut self,
         _msg: GetStatus,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         GatewayStatus {
             backend_count: self.backends.len(),
@@ -453,7 +455,7 @@ impl Message<HandleGroupRequest> for GatewayActor {
     async fn handle(
         &mut self,
         msg: HandleGroupRequest,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let request = msg.request.clone();
 
@@ -498,7 +500,7 @@ impl Message<GetToolGroups> for GatewayActor {
     async fn handle(
         &mut self,
         _msg: GetToolGroups,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.registry.ask(ListToolGroups).await.unwrap_or_default()
     }
@@ -519,7 +521,7 @@ impl Message<GetDetailedStatus> for GatewayActor {
     async fn handle(
         &mut self,
         _msg: GetDetailedStatus,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let backends: Vec<BackendInfo> = self
             .registry
@@ -545,7 +547,7 @@ impl Message<ForceBackendReconnect> for GatewayActor {
     async fn handle(
         &mut self,
         msg: ForceBackendReconnect,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let backend = self
             .backends
@@ -572,7 +574,7 @@ impl Message<GetBackendInfoMsg> for GatewayActor {
     async fn handle(
         &mut self,
         msg: GetBackendInfoMsg,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let backend = self
             .backends
@@ -597,7 +599,7 @@ impl Message<AddBackend> for GatewayActor {
     async fn handle(
         &mut self,
         msg: AddBackend,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let name = msg.config.name.clone();
 
@@ -617,7 +619,7 @@ impl Message<AddBackend> for GatewayActor {
 
         // Spawn backend actor
         let backend_actor = BackendActor::new(msg.config, self.registry.clone());
-        let actor_ref = kameo::spawn(backend_actor);
+        let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
 
         self.backends.insert(name.clone(), actor_ref);
         tracing::info!("Added backend: {name}",);
@@ -637,7 +639,7 @@ impl Message<RemoveBackendMsg> for GatewayActor {
     async fn handle(
         &mut self,
         msg: RemoveBackendMsg,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_ref = self
             .backends
@@ -673,7 +675,7 @@ impl Message<DisableBackendMsg> for GatewayActor {
     async fn handle(
         &mut self,
         msg: DisableBackendMsg,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_ref = self
             .backends
@@ -717,7 +719,7 @@ impl Message<EnableBackendMsg> for GatewayActor {
     async fn handle(
         &mut self,
         msg: EnableBackendMsg,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // Check if already running
         if self.backends.contains_key(&msg.backend_name) {
@@ -743,7 +745,7 @@ impl Message<EnableBackendMsg> for GatewayActor {
 
         // Spawn backend actor
         let backend_actor = BackendActor::new(backend_config, self.registry.clone());
-        let actor_ref = kameo::spawn(backend_actor);
+        let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
         self.backends.insert(msg.backend_name.clone(), actor_ref);
 
         tracing::info!("Enabled backend: {}", msg.backend_name);
@@ -762,7 +764,7 @@ impl Message<ReloadConfig> for GatewayActor {
     async fn handle(
         &mut self,
         msg: ReloadConfig,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let new_config = msg.config;
         let mut added = Vec::new();
@@ -816,7 +818,8 @@ impl Message<ReloadConfig> for GatewayActor {
                 // Spawn backend actor
                 let backend_actor =
                     BackendActor::new(backend_config.clone(), self.registry.clone());
-                let actor_ref = kameo::spawn(backend_actor);
+                let actor_ref =
+                    BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
                 self.backends.insert(backend_config.name.clone(), actor_ref);
                 added.push(backend_config.name.clone());
             }
