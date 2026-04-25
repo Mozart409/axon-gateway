@@ -87,6 +87,13 @@ bacon pedantic
 - **types.rs**: Core domain types (ToolDefinition, JsonRpc, etc.)
 - **error.rs**: Error types using thiserror
 
+### UI Stack (Dashboard)
+- **Rendering**: Server-side HTML rendering with **maud** in `server.rs`
+- **Styling**: **Tailwind CSS** via `styles/input.css` compiled to `styles/output.css`
+- **Interactions**: **HTMX** for action endpoints and partial swaps (no SPA framework)
+- **Realtime updates**: **Server-Sent Events (SSE)** from `/ui/events` consumed by HTMX SSE extension
+- **Pattern**: SSR-first pages + HTMX/SSE progressive enhancement for live backend state updates
+
 ### Code Patterns
 - Use `#[serde(rename_all = "lowercase")]` for enums in configs
 - Use `#[serde(default)]` for optional config fields with defaults
@@ -119,6 +126,7 @@ Pre-push:
   - `transport-child-process` - Stdio transport via child process
   - `transport-streamable-http-client-reqwest` - HTTP/SSE client transport
 - **Web**: axum (0.8), tower-http (0.6)
+- **UI**: maud, tailwindcss, htmx (+ htmx-ext-sse)
 - **Serialization**: serde, serde_json, toml
 - **Errors**: thiserror, color-eyre
 - **Logging**: tracing, tracing-subscriber
