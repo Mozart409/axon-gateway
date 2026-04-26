@@ -3,6 +3,12 @@ name = "axon-gateway"
 version = "0.1.5"
 edition = "2024"
 license = "MIT"
+description = "A high-performance MCP gateway that aggregates multiple Model Context Protocol servers behind a single endpoint"
+repository = "https://github.com/Mozart409/axon-gateway"
+homepage = "https://github.com/Mozart409/axon-gateway"
+authors = ["Mozart409"]
+keywords = ["mcp", "gateway", "model-context-protocol", "proxy", "aggregator"]
+categories = ["network-programming", "web-programming"]
 
 [dependencies]
 # keep-sorted start
