@@ -16,6 +16,20 @@ RUN cargo build --release --locked
 # Stage 2: Runtime (minimal Wolfi image)
 FROM cgr.dev/chainguard/wolfi-base:latest
 
+ARG VERSION
+ARG REVISION
+ARG CREATED
+
+LABEL org.opencontainers.image.title="axon-gateway" \
+      org.opencontainers.image.description="A high-performance MCP gateway that aggregates multiple Model Context Protocol servers behind a single endpoint" \
+      org.opencontainers.image.url="https://github.com/Mozart409/axon-gateway" \
+      org.opencontainers.image.source="https://github.com/Mozart409/axon-gateway" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.vendor="Mozart409" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.created="${CREATED}"
+
 COPY --from=builder /build/target/release/axon-gateway /usr/local/bin/axon-gateway
 COPY LICENSE licenses.html /usr/share/licenses/axon-gateway/
 COPY static /app/static

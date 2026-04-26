@@ -52,6 +52,8 @@ jobs:
   build-container:
     needs: prepare-release
     timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ needs.prepare-release.outputs.release-tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +79,10 @@ jobs:
           outputs: type=docker,dest=container-${{ matrix.arch }}.tar
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ env.RELEASE_TAG }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ github.event.repository.pushed_at }}
 
       - name: Upload container image
         uses: actions/upload-artifact@v5
