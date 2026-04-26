@@ -7,29 +7,35 @@ A lightweight, self-hosted MCP (Model Context Protocol) gateway that aggregates 
 - **Aggregation**: Combine tools from multiple MCP servers into one endpoint
 - **Namespacing**: Tools are automatically prefixed with backend name (e.g., `homeassistant_turn_on`)
 - **Multiple transports**: SSE, HTTP, and stdio backends supported
-- **Auth**: Optional Bearer token authentication
+- **Multi-token auth**: Named API tokens with fine-grained permissions (allowed tools/backends)
+- **Tool groups**: Expose subsets of tools via different path prefixes
+- **Hot reload**: Config file watching with automatic backend updates
+- **Prometheus metrics**: Built-in metrics endpoint for monitoring
+- **Resource/Prompt proxying**: Forward MCP resources and prompts from backends
+- **Auto-reconnect**: Exponential backoff reconnection with circuit breaker
+- **Health checks**: Periodic backend health monitoring
 - **Actor-based**: Built on kameo for robust concurrency
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   MCP Gateway                        │
-│                                                      │
+│                   MCP Gateway                       │
+│                                                     │
 │  ┌──────────────┐  ┌─────────────┐  ┌────────────┐  │
 │  │ HTTP Server  │  │   Gateway   │  │  Registry  │  │
 │  │ (axum)       │──│   Actor     │──│   Actor    │  │
 │  │ /mcp         │  │             │  │            │  │
 │  └──────────────┘  └─────────────┘  └────────────┘  │
-│                           │                          │
+│                           │                         │
 │         ┌─────────────────┼─────────────────┐       │
 │         │                 │                 │       │
-│  ┌──────▼─────┐  ┌───────▼──────┐  ┌───────▼─────┐ │
-│  │ Backend    │  │ Backend      │  │ Backend     │ │
-│  │ Actor      │  │ Actor        │  │ Actor       │ │
-│  │ (HA)       │  │ (Jellyfin)   │  │ (Proxmox)   │ │
-│  └──────┬─────┘  └───────┬──────┘  └───────┬─────┘ │
-└─────────┼────────────────┼─────────────────┼───────┘
+│  ┌──────▼─────┐  ┌────────▼─────┐  ┌────────▼────┐  │
+│  │ Backend    │  │ Backend      │  │ Backend     │  │
+│  │ Actor      │  │ Actor        │  │ Actor       │  │
+│  │ (HA)       │  │ (Jellyfin)   │  │ (Proxmox)   │  │
+│  └──────┬─────┘  └───────┬──────┘  └───────┬─────┘  │
+└─────────┼────────────────┼─────────────────┼────────┘
           │                │                 │
           ▼                ▼                 ▼
     MCP Server 1     MCP Server 2      MCP Server 3
@@ -79,21 +85,26 @@ MCP_GATEWAY_CONFIG=config.toml cargo run
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/mcp` | POST | JSON-RPC endpoint (Streamable HTTP transport) |
-| `/mcp/sse` | GET | SSE endpoint for streaming transport |
-| `/` | GET | Landing page |
-| `/ui` | GET | SSR dashboard page |
-| `/ui/events` | GET | Dashboard SSE stream (`text/event-stream`) |
-| `/ui/partials/backends` | GET | SSR backend panel fragment |
-| `/ui/actions/backends/{name}/reconnect` | POST | HTMX action: reconnect backend |
-| `/ui/actions/backends/{name}/disable` | POST | HTMX action: disable backend |
-| `/ui/actions/backends/{name}/enable` | POST | HTMX action: enable backend |
-| `/ui/actions/reload` | POST | HTMX action: reload config |
-| `/build` | GET | Build/runtime metadata (version, pid, startup time) |
-| `/health` | GET | Health check |
-| `/status` | GET | Gateway status (backend list, counts) |
+| Endpoint                                | Method | Description                                         |
+| --------------------------------------- | ------ | --------------------------------------------------- |
+| `/mcp`                                  | POST   | JSON-RPC endpoint (Streamable HTTP transport)       |
+| `/mcp/sse`                              | GET    | SSE endpoint for streaming transport                |
+| `/mcp/group/{group_name}`               | POST   | JSON-RPC endpoint filtered by tool group            |
+| `/`                                     | GET    | Landing page                                        |
+| `/ui`                                   | GET    | SSR dashboard page                                  |
+| `/ui/backends/{name}`                   | GET    | Backend detail page                                 |
+| `/ui/events`                            | GET    | Dashboard SSE stream (`text/event-stream`)          |
+| `/ui/partials/backends`                 | GET    | SSR backend panel fragment                          |
+| `/ui/actions/backends/{name}/reconnect` | POST   | HTMX action: reconnect backend                      |
+| `/ui/actions/backends/{name}/disable`   | POST   | HTMX action: disable backend                        |
+| `/ui/actions/backends/{name}/enable`    | POST   | HTMX action: enable backend                         |
+| `/ui/actions/reload`                    | POST   | HTMX action: reload config                          |
+| `/build`                                | GET    | Build/runtime metadata (version, pid, startup time) |
+| `/health`                               | GET    | Health check                                        |
+| `/status`                               | GET    | Gateway status (backend list, counts)               |
+| `/status/detailed`                      | GET    | Detailed status with tool/resource/prompt lists     |
+| `/status/groups`                        | GET    | List configured tool groups                         |
+| `/metrics`                              | GET    | Prometheus metrics endpoint                         |
 
 ## Frontend Architecture
 
@@ -151,16 +162,20 @@ curl -I http://127.0.0.1:8080/styles/output.css
 ## How Tool Namespacing Works
 
 When backend `homeassistant` provides tools `turn_on` and `turn_off`, the gateway exposes them as:
+
 - `homeassistant_turn_on`
 - `homeassistant_turn_off`
 
 When your agent calls `homeassistant_turn_on`, the gateway:
+
 1. Looks up which backend owns the tool
 2. Strips the prefix to get `turn_on`
 3. Forwards the call to the Home Assistant MCP server
 4. Returns the result
 
 ## Authentication
+
+### Simple Token Auth
 
 Enable auth by setting `auth_token` in config:
 
@@ -171,6 +186,61 @@ auth_token = "your-secret-token"
 ```
 
 Clients must include `Authorization: Bearer your-secret-token` header.
+
+### Multi-Token Auth with Permissions
+
+For fine-grained access control, configure named tokens:
+
+```toml
+[gateway]
+bind = "0.0.0.0:8080"
+
+[[tokens]]
+name = "admin"
+token = "${ADMIN_TOKEN}"
+allowed_backends = ["*"]  # All backends
+
+[[tokens]]
+name = "readonly"
+token = "${READONLY_TOKEN}"
+allowed_tools = ["*_read", "*_list"]  # Only read/list tools
+```
+
+Token permissions:
+
+- `allowed_backends`: List of backend names (supports `*` wildcard)
+- `allowed_tools`: List of tool name patterns (supports `*` wildcard)
+
+## Tool Groups
+
+Expose subsets of tools via different path prefixes:
+
+```toml
+[[groups]]
+name = "coding"
+backends = ["vscode", "git"]
+description = "Development tools only"
+
+[[groups]]
+name = "readonly"
+tools = ["*_read", "*_list", "*_get"]
+description = "Read-only operations"
+```
+
+Access grouped tools at `/mcp/group/{group_name}` instead of `/mcp`.
+
+## Metrics
+
+Prometheus metrics are exposed at `/metrics`:
+
+- `axon_tool_calls_total` - Tool call counter by backend/tool
+- `axon_tool_call_duration_seconds` - Tool call latency histogram
+- `axon_tool_call_errors_total` - Tool call error counter
+- `axon_backend_state` - Backend connection state gauge
+- `axon_http_requests_total` - HTTP request counter
+- `axon_health_checks_total` - Health check counter
+- `axon_resource_reads_total` - Resource read counter
+- `axon_prompt_gets_total` - Prompt get counter
 
 ## Environment Variable References in Config
 
@@ -218,14 +288,18 @@ Phase 1 (MVP) is complete:
 
 ## TODO / Next Steps
 
+Completed:
+
+- [x] **Reconnection logic**: Automatic reconnect with exponential backoff (1s base, 5min max)
+- [x] **Health checks**: Periodic pings to detect dead backends
+- [x] **Hot reload**: Watch config file and update backends without restart
+- [x] **Metrics**: Prometheus metrics for tool calls, latency, errors
+- [x] **Tool filtering**: Support `allowed_tools` config per token/group
+- [x] **Resource/Prompt proxying**: Forward MCP resources and prompts
+- [x] **Multi-token auth**: Named tokens with fine-grained permissions
+
 To make it production-ready:
 
-- [ ] **Reconnection logic**: Automatic reconnect with exponential backoff
-- [ ] **Health checks**: Periodic pings to detect dead backends
-- [ ] **Hot reload**: Watch config file and update backends without restart
-- [ ] **Metrics**: Prometheus metrics for tool calls, latency, errors
-- [ ] **Tool filtering**: Support `allowed_tools` config per backend
-- [ ] **Resource/Prompt proxying**: Forward MCP resources and prompts too
 - [ ] **SSE streaming**: Full bidirectional SSE session support
 - [ ] **OpenID/OAuth**: More auth options beyond simple tokens
 
@@ -245,4 +319,4 @@ src/
 
 ## License
 
-MIT / Apache-2.0
+MIT
