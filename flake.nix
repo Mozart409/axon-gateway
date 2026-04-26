@@ -28,6 +28,7 @@
       devShells.default = pkgs.mkShell {
         buildInputs = with pkgs; [
           # keep-sorted start
+          act
           bacon
           cargo-deny
           cargo-workspaces
