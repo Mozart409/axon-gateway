@@ -25,7 +25,7 @@ done
 
 # Run tests
 echo "Running cargo test..."
-cargo test --locked
+cargo test
 
 # Stage and commit
 echo "Committing release..."
