@@ -1,6 +1,6 @@
 [package]
 name = "axon-gateway"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license = "MIT"
 description = "A high-performance MCP gateway that aggregates multiple Model Context Protocol servers behind a single endpoint"
