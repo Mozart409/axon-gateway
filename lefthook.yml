@@ -4,9 +4,6 @@ pre-commit:
   parallel: true
   jobs:
     # keep-sorted start
-    - name: cargo-about
-      run: cargo about generate about.hbs > licenses.html
-      stage_fixed: true
     - name: cargo-deny
       run: cargo deny check
     - name: cargo-fix

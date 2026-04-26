@@ -29,7 +29,6 @@
         buildInputs = with pkgs; [
           # keep-sorted start
           bacon
-          cargo-about
           cargo-deny
           cargo-workspaces
           claude-code

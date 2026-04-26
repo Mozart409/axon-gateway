@@ -86,6 +86,9 @@ bacon pedantic
 - **config.rs**: Config types and TOML parsing
 - **types.rs**: Core domain types (ToolDefinition, JsonRpc, etc.)
 - **error.rs**: Error types using thiserror
+- **auth.rs**: Authentication middleware and token validation
+- **metrics.rs**: Prometheus metrics recording functions
+- **watcher.rs**: Config file watcher for hot reload
 
 ### UI Stack (Dashboard)
 - **Rendering**: Server-side HTML rendering with **maud** in `server.rs`
@@ -120,17 +123,22 @@ Pre-push:
 
 ### Dependencies
 - **Async**: tokio (full features)
-- **Actors**: kameo (0.13)
-- **MCP Protocol**: rmcp (0.17.0) with features:
+- **Actors**: kameo (0.20)
+- **MCP Protocol**: rmcp (1.5) with features:
   - `client` - Client service types
+  - `server` - Server service types
   - `transport-child-process` - Stdio transport via child process
   - `transport-streamable-http-client-reqwest` - HTTP/SSE client transport
+  - `transport-streamable-http-server` - HTTP server transport
 - **Web**: axum (0.8), tower-http (0.6)
 - **UI**: maud, tailwindcss, htmx (+ htmx-ext-sse)
+- **Metrics**: metrics, metrics-exporter-prometheus
+- **Config watching**: notify (8)
+- **Caching**: moka
 - **Serialization**: serde, serde_json, toml
 - **Errors**: thiserror, color-eyre
 - **Logging**: tracing, tracing-subscriber
-- **Utils**: dashmap, futures
+- **Utils**: dashmap, futures, chrono, uuid
 
 ## Important Notes
 - Edition 2024 is used
