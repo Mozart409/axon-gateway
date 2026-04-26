@@ -297,10 +297,10 @@ Completed:
 - [x] **Tool filtering**: Support `allowed_tools` config per token/group
 - [x] **Resource/Prompt proxying**: Forward MCP resources and prompts
 - [x] **Multi-token auth**: Named tokens with fine-grained permissions
+- [x] **SSE streaming**: MCP SSE transport support (`/mcp/sse`)
 
 To make it production-ready:
 
-- [ ] **SSE streaming**: Full bidirectional SSE session support
 - [ ] **OpenID/OAuth**: More auth options beyond simple tokens
 
 ## Project Structure
