@@ -19,7 +19,7 @@
         config.allowUnfree = true;
         overlays = [rust-overlay.overlays.default];
       };
-      rust = pkgs.rust-bin.nightly."2026-02-15".default.override {
+      rust = pkgs.rust-bin.stable."1.95.0".default.override {
         extensions = ["rustfmt" "clippy" "rust-src"];
       };
     in {
