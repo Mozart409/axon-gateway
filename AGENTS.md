@@ -148,3 +148,4 @@ Pre-push:
 - SSE and HTTP transports both use rmcp's `StreamableHttpClientTransport`
 - Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
 - `auth_token` in `[gateway]` config only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard routes
+- Runtime image is Chainguard `wolfi-base` (minimal): it ships **no** `curl`/`wget` and busybox has no `wget` applet. The Compose healthchecks probe `/health` with `wget`, so the Dockerfile must `apk add --no-cache wget` for them to pass — keep that line in sync with the `healthcheck:` blocks in `example/compose.yml` and `example/compose.local.yml`
