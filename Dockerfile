@@ -30,6 +30,11 @@ LABEL org.opencontainers.image.title="axon-gateway" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}"
 
+# `wget` is not part of wolfi-base (and busybox here has no wget applet), but the
+# compose healthchecks probe /health with it. Add the tiny Wolfi package so the
+# documented healthcheck actually passes instead of hanging on "unhealthy".
+RUN apk add --no-cache wget
+
 COPY --from=builder /build/target/release/axon-gateway /usr/local/bin/axon-gateway
 COPY LICENSE licenses.html /usr/share/licenses/axon-gateway/
 COPY static /app/static

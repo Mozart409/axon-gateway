@@ -83,6 +83,29 @@ MCP_GATEWAY_CONFIG=config.toml cargo run
 }
 ```
 
+## Container Deployment
+
+Prebuilt images are published to `ghcr.io/mozart409/axon-gateway`. Example
+Compose files live in [`example/`](example/):
+
+- `compose.yml` — runs the published image (`ghcr.io/mozart409/axon-gateway:latest`)
+- `compose.local.yml` — builds the image from this repo
+
+```bash
+# from example/, with a config.toml alongside it
+podman compose -f compose.yml up -d   # or: docker compose
+```
+
+Mount your config read-only at `/app/config.toml` and pass it as the command
+argument (both example files already do this).
+
+> **Healthcheck note:** the runtime image is the minimal Chainguard
+> `wolfi-base`, which ships **no HTTP client** — no `curl`, no `wget`, and its
+> busybox has no `wget` applet. The Compose healthchecks probe `/health` with
+> `wget`, so the Dockerfile installs the tiny Wolfi `wget` package
+> (`apk add --no-cache wget`) specifically to make that check pass. Drop that
+> line only if you also remove the `healthcheck:` blocks from the Compose files.
+
 ## API Endpoints
 
 | Endpoint                                | Method | Description                                         |
