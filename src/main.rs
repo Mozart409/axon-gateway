@@ -112,8 +112,19 @@ async fn main() -> Result<()> {
     let gateway =
         GatewayActor::spawn_with_mailbox(GatewayActor::new(config, registry), mailbox::unbounded());
 
-    // Give actors time to initialize
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait until the gateway actor has finished initializing. kameo runs
+    // `on_start` (which spawns every backend) to completion before the actor
+    // starts processing its mailbox, so this `ask` only resolves once the
+    // gateway is ready — a deterministic replacement for a fixed-duration sleep.
+    match gateway.ask(crate::gateway::GetStatus).await {
+        Ok(status) => {
+            tracing::info!(
+                "Gateway initialized with {} backend(s)",
+                status.backend_count
+            );
+        }
+        Err(e) => tracing::warn!("Gateway readiness check failed: {e:?}"),
+    }
 
     // Start config file watcher for hot reload
     if let Err(e) = watcher::start_config_watcher(&config_path, gateway.clone()) {
