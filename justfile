@@ -24,3 +24,9 @@ down:
 
 clippy: clear
     cargo clippy -- -D clippy::pedantic
+
+audit: clear
+    cargo audit
+
+deny: clear
+    cargo deny check
