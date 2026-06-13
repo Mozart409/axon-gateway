@@ -3,6 +3,11 @@
 set unstable
 set dotenv-load
 
+# OCI image label values (populate the ARGs the Dockerfile declares).
+version := `grep '^version' Cargo.toml | head -1 | cut -d'"' -f2`
+revision := `git rev-parse HEAD 2>/dev/null || echo unknown`
+created := `date -u +%Y-%m-%dT%H:%M:%SZ`
+
 default:
     just --choose
 
@@ -10,10 +15,13 @@ clear:
     clear
 
 oci-build: clear
-    podman build -t axon-gateway:latest .
+    podman build \
+        --build-arg VERSION={{version}} \
+        --build-arg REVISION={{revision}} \
+        --build-arg CREATED={{created}} \
+        -t axon-gateway:latest .
 
-trivy: clear
-    podman build -t axon-gateway:latest .
+trivy: oci-build
     trivy image axon-gateway:latest
 
 up: clear
