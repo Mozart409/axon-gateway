@@ -19,8 +19,7 @@ pre-commit:
     - name: keep-sorted
       run: keep-sorted {staged_files}
       stage_fixed: true
-# keep-sorted end 
-
+  # keep-sorted end 
 pre-push:
   parallel: true
   jobs:
@@ -30,5 +29,4 @@ pre-push:
       run: cargo clippy -- -D clippy::pedantic
     - name: test
       run: cargo test
-
-# keep-sorted end 
+  # keep-sorted end 
