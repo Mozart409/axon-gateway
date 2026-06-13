@@ -22,11 +22,23 @@ up: clear
 down:
     podman compose -f example/compose.local.yml down -v
 
+fmt: clear
+    cargo fmt --all --check
+
 clippy: clear
-    cargo clippy -- -D clippy::pedantic
+    cargo clippy --all-targets --locked -- -D warnings -D clippy::pedantic
+
+test: clear
+    cargo test --locked
+
+cov: clear
+    cargo llvm-cov --locked --summary-only
 
 audit: clear
     cargo audit
 
 deny: clear
     cargo deny check
+
+# Run the full CI gate locally (matches .github/workflows/ci.yml)
+ci: fmt clippy test deny audit
