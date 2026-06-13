@@ -45,26 +45,15 @@ allow = []
 allow-workspace = false
 deny = []
 skip = [
-    "bitflags",
     "getrandom",
     "hashbrown",
     "r-efi",
     "rand",
     "rand_core",
     "windows-sys",
-    "windows-targets",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
-    "windows_x86_64_msvc",
     "wit-bindgen",
 ]
-skip-tree = [
-    { crate = "thiserror@1", reason = "jni and metrics-exporter-prometheus use thiserror v1" },
-]
+skip-tree = []
 
 [sources]
 unknown-registry = "warn"
