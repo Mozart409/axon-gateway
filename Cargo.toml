@@ -2,6 +2,7 @@
 name = "axon-gateway"
 version = "0.1.6"
 edition = "2024"
+rust-version = "1.94"
 license = "MIT"
 description = "A high-performance MCP gateway that aggregates multiple Model Context Protocol servers behind a single endpoint"
 repository = "https://github.com/Mozart409/axon-gateway"
@@ -50,3 +51,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 
 # keep-sorted end
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
