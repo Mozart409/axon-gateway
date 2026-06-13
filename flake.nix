@@ -30,6 +30,7 @@
           # keep-sorted start
           act
           bacon
+          cargo-audit
           cargo-deny
           cargo-workspaces
           claude-code
