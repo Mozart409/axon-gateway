@@ -112,9 +112,9 @@ impl Message<HandleRequest> for GatewayActor {
         match request.method.as_str() {
             // Initialize handshake
             "initialize" => JsonRpcResponse::success(
-                request.id,
+                request.id.clone(),
                 serde_json::json!({
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": "2025-11-25",
                     "serverInfo": {
                         "name": "axon-gateway",
                         "version": env!("CARGO_PKG_VERSION")
@@ -128,19 +128,21 @@ impl Message<HandleRequest> for GatewayActor {
             ),
 
             // Liveness check used by MCP clients/inspectors
-            "ping" => JsonRpcResponse::success(request.id, serde_json::json!({})),
+            "ping" => JsonRpcResponse::success(request.id.clone(), serde_json::json!({})),
 
             // List all tools from all backends
             "tools/list" => match self.registry.ask(ListTools).await {
                 Ok(tools) => JsonRpcResponse::success(
-                    request.id,
+                    request.id.clone(),
                     serde_json::json!({
                         "tools": tools
                     }),
                 ),
-                Err(e) => {
-                    JsonRpcResponse::error(request.id, -32000, format!("Failed to list tools: {e}"))
-                }
+                Err(e) => JsonRpcResponse::error(
+                    request.id.clone(),
+                    -32000,
+                    format!("Failed to list tools: {e}"),
+                ),
             },
 
             // Execute a tool
@@ -167,7 +169,7 @@ impl Message<HandleRequest> for GatewayActor {
                     Ok(route) => route,
                     Err(e) => {
                         return JsonRpcResponse::error(
-                            request.id,
+                            request.id.clone(),
                             -32000,
                             format!("Failed to resolve tool: {e}"),
                         );
@@ -185,7 +187,7 @@ impl Message<HandleRequest> for GatewayActor {
                             &backend_name,
                         ) {
                             return JsonRpcResponse::error(
-                                request.id,
+                                request.id.clone(),
                                 -32000,
                                 format!("Permission denied: {e}"),
                             );
@@ -211,7 +213,7 @@ impl Message<HandleRequest> for GatewayActor {
                                         &original_tool_name,
                                         start.elapsed().as_secs_f64(),
                                     );
-                                    JsonRpcResponse::success(request.id, content)
+                                    JsonRpcResponse::success(request.id.clone(), content)
                                 }
                                 Err(e) => {
                                     crate::metrics::record_tool_call_error(
@@ -224,7 +226,7 @@ impl Message<HandleRequest> for GatewayActor {
                                         start.elapsed().as_secs_f64(),
                                     );
                                     JsonRpcResponse::error(
-                                        request.id,
+                                        request.id.clone(),
                                         -32000,
                                         format!("Failed to call backend: {e}"),
                                     )
@@ -232,14 +234,14 @@ impl Message<HandleRequest> for GatewayActor {
                             }
                         } else {
                             JsonRpcResponse::error(
-                                request.id,
+                                request.id.clone(),
                                 -32000,
                                 format!("Backend '{backend_name}' not available"),
                             )
                         }
                     }
                     None => JsonRpcResponse::error(
-                        request.id,
+                        request.id.clone(),
                         -32601,
                         format!("Unknown tool: {tool_name}"),
                     ),
@@ -271,7 +273,7 @@ impl Message<HandleRequest> for GatewayActor {
                 }
 
                 JsonRpcResponse::success(
-                    request.id,
+                    request.id.clone(),
                     serde_json::json!({
                         "resources": all_resources
                     }),
@@ -298,23 +300,23 @@ impl Message<HandleRequest> for GatewayActor {
                             })
                             .await
                         {
-                            Ok(result) => JsonRpcResponse::success(request.id, result),
+                            Ok(result) => JsonRpcResponse::success(request.id.clone(), result),
                             Err(e) => JsonRpcResponse::error(
-                                request.id,
+                                request.id.clone(),
                                 -32000,
                                 format!("Failed to read resource: {e:?}"),
                             ),
                         }
                     } else {
                         JsonRpcResponse::error(
-                            request.id,
+                            request.id.clone(),
                             -32000,
                             format!("Backend '{backend_name}' not found"),
                         )
                     }
                 } else {
                     JsonRpcResponse::error(
-                        request.id,
+                        request.id.clone(),
                         -32602,
                         format!("Invalid resource URI format: {uri}"),
                     )
@@ -345,7 +347,7 @@ impl Message<HandleRequest> for GatewayActor {
                 }
 
                 JsonRpcResponse::success(
-                    request.id,
+                    request.id.clone(),
                     serde_json::json!({
                         "prompts": all_prompts
                     }),
@@ -376,37 +378,39 @@ impl Message<HandleRequest> for GatewayActor {
                             })
                             .await
                         {
-                            Ok(result) => JsonRpcResponse::success(request.id, result),
+                            Ok(result) => JsonRpcResponse::success(request.id.clone(), result),
                             Err(e) => JsonRpcResponse::error(
-                                request.id,
+                                request.id.clone(),
                                 -32000,
                                 format!("Failed to get prompt: {e:?}"),
                             ),
                         }
                     } else {
                         JsonRpcResponse::error(
-                            request.id,
+                            request.id.clone(),
                             -32000,
                             format!("Backend '{backend_name}' not found"),
                         )
                     }
                 } else {
                     JsonRpcResponse::error(
-                        request.id,
+                        request.id.clone(),
                         -32602,
                         format!("Invalid prompt name format (expected 'backend_name'): {name}"),
                     )
                 }
             }
 
-            // Notifications (no response needed, but we return success)
+            // Notifications (no response needed per JSON-RPC spec)
             "notifications/initialized" => {
-                JsonRpcResponse::success(request.id, serde_json::json!({}))
+                // Notifications don't require a response
+                // Return success with the same id if present
+                JsonRpcResponse::success(request.id.clone(), serde_json::json!({}))
             }
 
             // Unknown method
             _ => JsonRpcResponse::error(
-                request.id,
+                request.id.clone(),
                 -32601,
                 format!("Method not found: {}", request.method),
             ),
@@ -468,11 +472,12 @@ impl Message<HandleGroupRequest> for GatewayActor {
                 })
                 .await
             {
-                Ok(tools) => {
-                    JsonRpcResponse::success(request.id, serde_json::json!({ "tools": tools }))
-                }
+                Ok(tools) => JsonRpcResponse::success(
+                    request.id.clone(),
+                    serde_json::json!({ "tools": tools }),
+                ),
                 Err(e) => JsonRpcResponse::error(
-                    request.id,
+                    request.id.clone(),
                     -32000,
                     format!("Failed to list tools for group '{}': {e}", msg.group_name),
                 ),
@@ -931,7 +936,7 @@ mod tests {
 
             let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
             assert_eq!(req.method, "tools/list");
-            assert_eq!(req.id, serde_json::json!(1));
+            assert_eq!(req.id, Some(serde_json::json!(1)));
         }
 
         #[test]
@@ -948,6 +953,7 @@ mod tests {
 
             let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
             assert_eq!(req.method, "tools/call");
+            assert_eq!(req.id, Some(serde_json::json!("req-123")));
             assert_eq!(
                 req.params.get("name").and_then(|v| v.as_str()),
                 Some("backend_my_tool")
@@ -988,6 +994,19 @@ mod tests {
             let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
             assert_eq!(req.method, "ping");
             assert_eq!(req.params, serde_json::Value::Null);
+        }
+
+        #[test]
+        fn deserializes_notification_without_id() {
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }"#;
+
+            let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(req.method, "notifications/initialized");
+            assert!(req.id.is_none());
         }
     }
 
