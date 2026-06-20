@@ -200,7 +200,8 @@ impl NamespacedPrompt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    pub id: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<serde_json::Value>,
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
@@ -210,7 +211,8 @@ pub struct JsonRpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, Reply)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
-    pub id: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,7 +228,7 @@ pub struct JsonRpcError {
 }
 
 impl JsonRpcResponse {
-    pub fn success(id: serde_json::Value, result: serde_json::Value) -> Self {
+    pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
@@ -235,7 +237,7 @@ impl JsonRpcResponse {
         }
     }
 
-    pub fn error(id: serde_json::Value, code: i32, message: impl Into<String>) -> Self {
+    pub fn error(id: Option<serde_json::Value>, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
@@ -521,11 +523,13 @@ mod tests {
 
         #[test]
         fn success_response_has_result() {
-            let resp =
-                JsonRpcResponse::success(serde_json::json!(1), serde_json::json!({"data": "test"}));
+            let resp = JsonRpcResponse::success(
+                Some(serde_json::json!(1)),
+                serde_json::json!({"data": "test"}),
+            );
 
             assert_eq!(resp.jsonrpc, "2.0");
-            assert_eq!(resp.id, serde_json::json!(1));
+            assert_eq!(resp.id, Some(serde_json::json!(1)));
             assert!(resp.result.is_some());
             assert!(resp.error.is_none());
         }
@@ -533,10 +537,10 @@ mod tests {
         #[test]
         fn error_response_has_error() {
             let resp =
-                JsonRpcResponse::error(serde_json::json!("req-1"), -32600, "Invalid request");
+                JsonRpcResponse::error(Some(serde_json::json!("req-1")), -32600, "Invalid request");
 
             assert_eq!(resp.jsonrpc, "2.0");
-            assert_eq!(resp.id, serde_json::json!("req-1"));
+            assert_eq!(resp.id, Some(serde_json::json!("req-1")));
             assert!(resp.result.is_none());
 
             let err = resp.error.unwrap();

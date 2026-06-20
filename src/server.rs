@@ -465,7 +465,7 @@ async fn fetch_backend_prompts(state: &AppState, backend_name: &str) -> Vec<Prom
         .ask(HandleRequest {
             request: JsonRpcRequest {
                 jsonrpc: String::from("2.0"),
-                id: json!("ui-backend-prompts"),
+                id: Some(json!("ui-backend-prompts")),
                 method: String::from("prompts/list"),
                 params: json!({}),
             },
@@ -509,7 +509,7 @@ async fn fetch_backend_resources(state: &AppState, backend_name: &str) -> Vec<Re
         .ask(HandleRequest {
             request: JsonRpcRequest {
                 jsonrpc: String::from("2.0"),
-                id: json!("ui-backend-resources"),
+                id: Some(json!("ui-backend-resources")),
                 method: String::from("resources/list"),
                 params: json!({}),
             },
