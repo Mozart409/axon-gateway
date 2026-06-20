@@ -20,6 +20,13 @@ pre-commit:
       run: keep-sorted {staged_files}
       stage_fixed: true
   # keep-sorted end 
+commit-msg:
+  parallel: true
+  jobs:
+    # keep-sorted start
+    - name: cog
+      run: cog verify --file {1}
+    # keep-sorted end
 pre-push:
   parallel: true
   jobs:
