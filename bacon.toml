@@ -116,6 +116,7 @@ command = [
     "-i", "styles/input.css",
     "-o", "styles/output.css",
     "--watch",
+    "--minify",
 ]
 need_stdout = true
 allow_warnings = true
