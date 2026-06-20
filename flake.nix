@@ -49,7 +49,6 @@
         ];
         shellHook = ''
           lefthook install
-          cog install-hook
         '';
       };
     });
