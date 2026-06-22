@@ -234,6 +234,39 @@ Token permissions:
 - `allowed_backends`: List of backend names (supports `*` wildcard)
 - `allowed_tools`: List of tool name patterns (supports `*` wildcard)
 
+## Rate Limiting
+
+Requests are rate-limited **per token** using a fixed 1-minute window. There is
+a single setting, `rate_limit_per_minute`, configurable at two levels:
+
+```toml
+[gateway]
+bind = "0.0.0.0:8080"
+rate_limit_per_minute = 100   # global default applied to every token
+
+[[tokens]]
+name = "admin"
+token = "${ADMIN_TOKEN}"
+rate_limit_per_minute = 1000  # per-token override
+
+[[tokens]]
+name = "readonly"
+token = "${READONLY_TOKEN}"
+# no value → falls back to the global default (100)
+```
+
+Semantics:
+
+- **Default: `0`** — both the global and per-token values default to `0`, which
+  means **unlimited**. Rate limiting is **off** until you set a non-zero value.
+- **Resolution**: a per-token `rate_limit_per_minute > 0` overrides the global
+  value; a per-token `0` (or omitted) falls back to the global default.
+- **Window**: fixed 1-minute window per token; the counter resets once a full
+  minute has elapsed (not a sliding window or token bucket).
+- **Simple shared-token auth** (`auth_token`, no named `[[tokens]]`) is not
+  rate-limited. Use named tokens to enforce limits.
+- Exceeding the limit returns an auth error (HTTP 429).
+
 ## Tool Groups
 
 Expose subsets of tools via different path prefixes:

@@ -12,7 +12,11 @@ base_url = "http://localhost:8080"
 # auth_token = "your-secret-token-here"
 auth_token = "${AXON_GATEWAY_TOKEN}"  # from .env or process env
 
-# Optional: global rate limit (requests per minute per token, 0 = unlimited)
+# Optional: global rate limit, in requests per minute per token.
+# Default: 0 (unlimited) — rate limiting is off until you set a non-zero value.
+# Uses a fixed 1-minute window per token. A per-token `rate_limit_per_minute`
+# (see [[tokens]] below) overrides this global default.
+# Note: simple shared `auth_token` auth is NOT rate-limited; use named tokens.
 # rate_limit_per_minute = 0
 
 # --- Backend MCP Servers ---
@@ -89,7 +93,7 @@ enabled = false
 # token = "${CLAUDE_AGENT_TOKEN}"
 # # allowed_tools = []  # empty = all tools
 # # allowed_backends = []  # empty = all backends
-# # rate_limit_per_minute = 0  # 0 = unlimited
+# # rate_limit_per_minute = 0  # 0 = use global default
 
 # Example: restricted agent
 # [[tokens]]
