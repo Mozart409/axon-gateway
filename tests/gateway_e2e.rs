@@ -5,91 +5,17 @@
 //! That covers the actual wiring: config loading, actor startup, graceful
 //! readiness, auth middleware, and the JSON-RPC surface.
 
-use std::process::{Child, Command};
-use std::time::Duration;
+mod support;
 
-const BIN: &str = env!("CARGO_BIN_EXE_axon-gateway");
-const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
-
-/// A running gateway process bound to an ephemeral port. Killed on drop.
-struct TestServer {
-    child: Child,
-    base: String,
-    config_path: std::path::PathBuf,
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.config_path);
-    }
-}
-
-/// Grab a free TCP port by binding to :0 and releasing it. A small race window
-/// exists before the gateway rebinds, which is acceptable for tests.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
-}
-
-/// Spawn the gateway binary with a generated config and wait until it is ready.
-async fn start_server(auth_token: Option<&str>) -> TestServer {
-    let port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let base = format!("http://{bind}");
-
-    let auth_line = auth_token.map_or_else(String::new, |t| format!("auth_token = \"{t}\"\n"));
-    // `backends` is a required root-level key, so it must appear before the
-    // first `[table]` header.
-    let config = format!(
-        "backends = []\n\n[gateway]\nbind = \"{bind}\"\nbase_url = \"{base}\"\n{auth_line}"
-    );
-
-    let config_path =
-        std::env::temp_dir().join(format!("axon-e2e-{}-{port}.toml", std::process::id()));
-    std::fs::write(&config_path, config).expect("write config");
-
-    let child = Command::new(BIN)
-        .arg(&config_path)
-        // ServeFile routes resolve assets relative to CWD.
-        .current_dir(MANIFEST_DIR)
-        .env("RUST_LOG", "warn")
-        .spawn()
-        .expect("gateway binary should start");
-
-    let server = TestServer {
-        child,
-        base: base.clone(),
-        config_path,
-    };
-
-    // Poll /health (unauthenticated) until the server is accepting requests.
-    let client = reqwest::Client::new();
-    let health = format!("{base}/health");
-    for _ in 0..100 {
-        if let Ok(resp) = client.get(&health).send().await
-            && resp.status().is_success()
-        {
-            return server;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("gateway did not become ready within 10s");
-}
-
-fn rpc(method: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": {}
-    })
-}
+use support::{ConfigBuilder, Gateway, free_port, rpc};
 
 #[tokio::test]
 async fn serves_status_and_mcp_without_auth() {
-    let server = start_server(None).await;
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let base = format!("http://{bind}");
+    let config = ConfigBuilder::new(&bind).render();
+    let server = Gateway::start(&config, &base).await;
     let client = reqwest::Client::new();
 
     // Health.
@@ -157,7 +83,11 @@ async fn serves_status_and_mcp_without_auth() {
 #[tokio::test]
 async fn enforces_bearer_auth_on_mcp() {
     let token = "s3cret-token";
-    let server = start_server(Some(token)).await;
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let base = format!("http://{bind}");
+    let config = ConfigBuilder::new(&bind).auth_token(token).render();
+    let server = Gateway::start(&config, &base).await;
     let client = reqwest::Client::new();
     let mcp = format!("{}/mcp", server.base);
 
