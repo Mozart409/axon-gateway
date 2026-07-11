@@ -51,7 +51,6 @@ skip = [
     "rand",
     "rand_core",
     "windows-sys",
-    "wit-bindgen",
 ]
 skip-tree = []
 
