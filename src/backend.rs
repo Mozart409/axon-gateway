@@ -1163,6 +1163,24 @@ mod tests {
 
     mod circuit_breaker {
         use super::*;
+        use rstest::rstest;
+
+        /// The circuit opens on exactly the Nth consecutive failure, for a
+        /// range of configured thresholds.
+        #[rstest]
+        #[case(1)]
+        #[case(2)]
+        #[case(3)]
+        #[case(5)]
+        fn circuit_opens_on_configured_threshold(#[case] threshold: u32) {
+            let mut cb = CircuitBreaker::new(threshold, 60);
+            for _ in 1..threshold {
+                assert!(!cb.record_failure(), "should stay closed below threshold");
+                assert!(!cb.is_open());
+            }
+            assert!(cb.record_failure(), "the threshold-th failure opens it");
+            assert!(cb.is_open());
+        }
 
         #[test]
         fn new_circuit_breaker_is_closed() {
@@ -1243,6 +1261,7 @@ mod tests {
 
     mod calculate_backoff {
         use super::*;
+        use rstest::rstest;
 
         fn backoff_for_attempts(attempts: u32) -> Duration {
             let backoff_secs = BASE_BACKOFF_SECS.saturating_mul(2u64.saturating_pow(attempts));
@@ -1255,18 +1274,31 @@ mod tests {
             assert_eq!(backoff, Duration::from_secs(BASE_BACKOFF_SECS));
         }
 
-        #[test]
-        fn backoff_doubles_each_attempt() {
-            assert_eq!(backoff_for_attempts(0), Duration::from_secs(1));
-            assert_eq!(backoff_for_attempts(1), Duration::from_secs(2));
-            assert_eq!(backoff_for_attempts(2), Duration::from_secs(4));
-            assert_eq!(backoff_for_attempts(3), Duration::from_secs(8));
+        /// Backoff is `2^attempt` seconds while below the cap.
+        #[rstest]
+        #[case(0, 1)]
+        #[case(1, 2)]
+        #[case(2, 4)]
+        #[case(3, 8)]
+        #[case(4, 16)]
+        #[case(8, 256)]
+        fn backoff_doubles_each_attempt(#[case] attempts: u32, #[case] expected_secs: u64) {
+            assert_eq!(
+                backoff_for_attempts(attempts),
+                Duration::from_secs(expected_secs)
+            );
         }
 
-        #[test]
-        fn backoff_caps_at_max() {
-            let backoff = backoff_for_attempts(20);
-            assert_eq!(backoff, Duration::from_secs(MAX_BACKOFF_SECS));
+        /// Once `2^attempt` exceeds the cap, backoff saturates at the maximum.
+        #[rstest]
+        #[case(9)]
+        #[case(20)]
+        #[case(63)]
+        fn backoff_caps_at_max(#[case] attempts: u32) {
+            assert_eq!(
+                backoff_for_attempts(attempts),
+                Duration::from_secs(MAX_BACKOFF_SECS)
+            );
         }
     }
 
