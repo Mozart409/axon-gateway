@@ -73,6 +73,40 @@ async fn adding_a_backend_hot_reloads_new_tools() {
 }
 
 #[tokio::test]
+async fn atomic_replace_of_config_hot_reloads() {
+    let backend = MockBackend::start(&["echo", "add"]).await;
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let base = format!("http://{bind}");
+
+    // Start with no backends.
+    let empty = ConfigBuilder::new(&bind).render();
+    let server = Gateway::start(&empty, &base).await;
+    let client = reqwest::Client::new();
+    assert_eq!(tool_count(&client, &server.base).await, 0);
+
+    // Replace the config via rename(2) rather than an in-place write. A watcher
+    // bound to the file's inode would miss this (the watch follows the old,
+    // now-detached inode); the directory-level watch must still catch it.
+    let with_backend = ConfigBuilder::new(&bind)
+        .http_backend("mock", &backend.url())
+        .render();
+    server.replace_config_atomically(&with_backend);
+
+    let count = poll_until(60, Duration::from_millis(250), || async {
+        let n = tool_count(&client, &server.base).await;
+        (n >= 2).then_some(n)
+    })
+    .await;
+    assert_eq!(
+        count,
+        Some(2),
+        "atomically replaced config should still hot-reload"
+    );
+    assert_eq!(backend_count(&client, &server.base).await, 1);
+}
+
+#[tokio::test]
 async fn removing_a_backend_hot_reloads_tools_away() {
     let backend = MockBackend::start(&["echo"]).await;
     let port = free_port();
