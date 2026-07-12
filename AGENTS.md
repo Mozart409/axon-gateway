@@ -149,10 +149,10 @@ Pre-push:
 - Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
 - `auth_token` in `[gateway]` config only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard routes
 - Runtime image is Chainguard `wolfi-base` (minimal): it ships **no** `curl`/`wget` and busybox has no `wget` applet. The Compose healthchecks probe `/health` with `wget`, so the Dockerfile must `apk add --no-cache wget` for them to pass — keep that line in sync with the `healthcheck:` blocks in `example/compose.yml` and `example/compose.local.yml`
-
 ## Version Synchronization
 When updating the Rust version, ensure consistency across:
 1. **flake.nix**: `rust-bin.stable."X.Y.Z"` (line 22)
 2. **Dockerfile**: `FROM rust:X.Y-bookworm AS builder` (line 2)
+3. **.github/workflows/ci.yml**: MSRV check `toolchain: "X.Y"` (line 80)
 
-Both must use the same Rust version to avoid build discrepancies.
+All three must use the same Rust version to avoid build discrepancies.
