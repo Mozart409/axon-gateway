@@ -1,5 +1,5 @@
 # Stage 1: Build (optimized for compile speed)
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.96-bookworm AS builder
 
 WORKDIR /build
 
@@ -36,7 +36,6 @@ LABEL org.opencontainers.image.title="axon-gateway" \
 RUN apk add --no-cache wget
 
 COPY --from=builder /build/target/release/axon-gateway /usr/local/bin/axon-gateway
-COPY LICENSE licenses.html /usr/share/licenses/axon-gateway/
 COPY static /app/static
 COPY styles/output.css /app/styles/output.css
 
