@@ -19,14 +19,14 @@ pre-commit:
     - name: keep-sorted
       run: keep-sorted {staged_files}
       stage_fixed: true
-  # keep-sorted end 
+      # keep-sorted end 
 commit-msg:
   parallel: true
   jobs:
     # keep-sorted start
     - name: cog
       run: cog verify --file {1}
-    # keep-sorted end
+      # keep-sorted end
 pre-push:
   parallel: true
   jobs:
@@ -34,6 +34,8 @@ pre-push:
     - name: clippy-pedantic
       glob: "*.rs"
       run: cargo clippy -- -D clippy::pedantic
+    - name: podman-build
+      run: just oci-build
     - name: test
       run: cargo test
   # keep-sorted end 
