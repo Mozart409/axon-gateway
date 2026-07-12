@@ -2,6 +2,19 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.3.2 - 2026-07-12
+#### Bug Fixes
+- (**tools**) add docker build before push - (9c09c2f) - Amadeus Mader
+#### Documentation
+- (**agents**) add check for rust versions everywhere - (180586d) - Amadeus Mader
+- (**agents**) add a notch to llm to check rust versions - (29ad3ba) - Amadeus Mader
+#### Continuous Integration
+- (**deps**) upgrade rust version - (cbfa024) - Amadeus Mader
+#### Miscellaneous Chores
+- (**deps**) upgrade flake and docker rust versions - (cee113d) - Amadeus Mader
+
+- - -
+
 ## v0.3.1 - 2026-07-12
 #### Bug Fixes
 - (**watcher**) use async channel + watch parent dir for reload - (dfcdd77) - Amadeus Mader
