@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.3.1 - 2026-07-12
+#### Bug Fixes
+- (**watcher**) use async channel + watch parent dir for reload - (dfcdd77) - Amadeus Mader
+#### Miscellaneous Chores
+- (**license**) delete license html - (8cad095) - Amadeus Mader
+
+- - -
+
 ## v0.3.0 - 2026-07-11
 #### Features
 - (**cog**) update release script to include cog - (fc7c1ac) - Amadeus Mader
