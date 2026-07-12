@@ -148,6 +148,22 @@ impl Gateway {
         std::fs::write(self.config.path(), config).expect("rewrite config");
     }
 
+    /// Atomically replace the config file via `rename(2)` — the way editors and
+    /// atomic config deploys (e.g. a symlink/store swap) mutate a file. This
+    /// detaches any inotify watch bound to the *original* inode, so it exercises
+    /// the watcher's directory-level watching rather than a file-inode watch.
+    pub fn replace_config_atomically(&self, config: &str) {
+        let dir = self
+            .config
+            .path()
+            .parent()
+            .expect("config has a parent dir");
+        let mut tmp = NamedTempFile::new_in(dir).expect("create sibling temp config");
+        std::io::Write::write_all(&mut tmp, config.as_bytes()).expect("write new config");
+        tmp.persist(self.config.path())
+            .expect("atomic rename over config");
+    }
+
     /// Poll `/health` (unauthenticated) until the server accepts requests.
     async fn wait_ready(&self) {
         let client = reqwest::Client::new();
