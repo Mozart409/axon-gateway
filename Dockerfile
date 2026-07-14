@@ -1,5 +1,5 @@
 # Stage 1: Build (optimized for compile speed)
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96.1-bookworm AS builder
 
 WORKDIR /build
 

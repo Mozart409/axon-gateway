@@ -2,7 +2,7 @@
 name = "axon-gateway"
 version = "0.3.2"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.96.1"
 license = "MIT"
 description = "A high-performance MCP gateway that aggregates multiple Model Context Protocol servers behind a single endpoint"
 repository = "https://github.com/Mozart409/axon-gateway"
