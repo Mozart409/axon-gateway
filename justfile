@@ -14,6 +14,11 @@ default:
 clear:
     clear
 
+# Sync main against both git remotes: fetch, fast-forward/merge, then push
+# origin (Forgejo, canonical) first and github second. See scripts/sync-remotes.sh.
+sync-remotes:
+    @./scripts/sync-remotes.sh
+
 oci-build: clear
     podman build \
         --build-arg VERSION={{version}} \
