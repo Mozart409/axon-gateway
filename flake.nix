@@ -32,6 +32,7 @@
           bacon
           cargo-audit
           cargo-deny
+          cargo-edit
           cargo-workspaces
           claude-code
           cocogitto

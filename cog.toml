@@ -14,7 +14,7 @@ pre_bump_hooks = [
     # Sync the [package] version in Cargo.toml to the version cog computed,
     # then refresh the lockfile entry. cog stages and commits both files as
     # part of the bump commit.
-    "sed -i '0,/^version = .*/s//version = \"{{version}}\"/' Cargo.toml",
+    "cargo set-version --package axon-gateway {{version}}",
     "cargo update --offline --package axon-gateway --precise {{version}}",
 ]
 post_bump_hooks = []
