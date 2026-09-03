@@ -2,6 +2,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.3.3 - 2026-09-03
+#### Bug Fixes
+- (**container**) added registry - (cb02a2b) - developmentbot
+- (**deps**) patch h2 RUSTSEC-2026-0258, bump event-listener and chacha20 - (6431876) - developmentbot
+#### Documentation
+- correct kameo version in AGENTS.md - (904911a) - developmentbot
+#### Build system
+- (**deps**) bump taiki-e/install-action in the github-actions group - (bab57d1) - dependabot[bot]
+#### Refactoring
+- (**cog**) remove sed for cargo-edit - (90becec) - macbook-pro
+#### Miscellaneous Chores
+- (**deps**) upgrade to rust 1.96.1 - (e07b6d4) - Amadeus Mader
+- (**tools**) add script for syncing remotes - (557ef55) - macbook-pro
+
+- - -
+
 ## v0.3.2 - 2026-07-12
 #### Bug Fixes
 - (**tools**) add docker build before push - (9c09c2f) - Amadeus Mader
