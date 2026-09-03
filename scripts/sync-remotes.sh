@@ -11,6 +11,10 @@
 #             multiple push URLs on one remote (that poisons the
 #             remote-tracking reflog and can silently drop commits on the
 #             next rebase; see AGENTS.md §3 "Git Remotes").
+# Tags:       synced the same way, canonical first. Tags (e.g. cog's release
+#             tags) don't fast-forward like branches — if a name resolves to
+#             different commits on the two remotes, `git fetch`/`git push`
+#             refuse to clobber it and the script aborts instead of guessing.
 #
 # Anything it cannot resolve safely (diverged history with the canonical
 # remote, merge conflicts, dirty tree) aborts with instructions instead of
@@ -42,8 +46,8 @@ fi
 # --- fetch ----------------------------------------------------------------
 
 info "fetching $canonical and $mirror"
-git fetch "$canonical" --prune
-git fetch "$mirror" --prune
+git fetch "$canonical" --tags --prune
+git fetch "$mirror" --tags --prune
 
 # The mirror branch may not exist yet on a fresh remote.
 mirror_ref=""
@@ -89,7 +93,13 @@ git push "$canonical" "$branch"
 info "pushing $branch to $mirror"
 git push "$mirror" "$branch"
 
-# --- verify ---------------------------------------------------------------
+info "pushing tags to $canonical"
+git push "$canonical" --tags
+
+info "pushing tags to $mirror"
+git push "$mirror" --tags
+
+# --- verify -----------------------------------------------------------
 
 head_sha=$(git rev-parse "$branch")
 for ref in "$canonical/$branch" "$mirror/$branch"; do
@@ -99,4 +109,23 @@ for ref in "$canonical/$branch" "$mirror/$branch"; do
   fi
 done
 
-info "in sync: $branch = $canonical/$branch = $mirror/$branch (${head_sha:0:7})"
+# Every local tag must exist on both remotes (name -> same object).
+remote_tag_names() {
+  git ls-remote --tags "$1" | awk -F/ '{sub(/\^\{\}$/, "", $NF); print $NF}' | sort -u
+}
+
+local_tags=$(git tag -l | sort)
+if [ -n "$local_tags" ]; then
+  for remote in "$canonical" "$mirror"; do
+    remote_tags=$(remote_tag_names "$remote")
+    while IFS= read -r t; do
+      [ -z "$t" ] && continue
+      if ! printf '%s\n' "$remote_tags" | grep -qxF "$t"; then
+        err "$remote is missing tag $t — still out of sync"
+        exit 1
+      fi
+    done <<<"$local_tags"
+  done
+fi
+
+info "in sync: $branch = $canonical/$branch = $mirror/$branch (${head_sha:0:7}); tags match on both remotes"
