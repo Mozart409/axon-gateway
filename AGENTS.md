@@ -124,7 +124,7 @@ Pre-push:
 ### Dependencies
 - **Async**: tokio (full features)
 - **Actors**: kameo (0.22)
-- **MCP Protocol**: rmcp (1.5) with features:
+- **MCP Protocol**: rmcp (3.4) with features:
   - `client` - Client service types
   - `server` - Server service types
   - `transport-child-process` - Stdio transport via child process

@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -47,8 +47,8 @@ struct MockHandler {
 }
 
 impl ServerHandler for MockHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("mock-backend", "0.0.0"))
     }
 
@@ -64,7 +64,7 @@ impl ServerHandler for MockHandler {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let arguments = request.arguments.clone().map_or(Value::Null, Value::Object);
 
@@ -76,13 +76,12 @@ impl ServerHandler for MockHandler {
         if self.state.failing.contains(&name) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "mock backend deliberately failed tool '{name}'"
-            ))]));
+            ))])
+            .into());
         }
 
         // Echo the call back so tests can assert on routing and payload.
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "{name}:{arguments}"
-        ))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{name}:{arguments}"))]).into())
     }
 }
 
