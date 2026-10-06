@@ -163,7 +163,8 @@ repo releases with them.
 ## Rust Versions
 - **Toolchain** (dev shell, local builds): fenix stable from `flake.lock`, no
   version literal. In yggdrasil it moves with `nix flake update fenix` at the
-  root.
+  root; then `just lock-axon` re-pins this project's own `flake.lock` to the
+  root's nixpkgs/fenix/flake-parts for the export.
 - **Dockerfile** `FROM rust:X.Y.Z-bookworm` (line 2): the image cannot read
   `flake.lock`, so keep it equal to the toolchain's `rustc --version` after a
   fenix bump.
