@@ -19,7 +19,7 @@ cargo test <test_name>
 # Run clippy (standard)
 cargo clippy
 
-# Run clippy with pedantic warnings (as configured in lefthook.yml)
+# Run clippy with pedantic warnings
 cargo clippy -- -W clippy::pedantic
 
 # Always run pedantic clippy and fix all reported issues
@@ -149,10 +149,18 @@ Pre-push:
 - Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
 - `auth_token` in `[gateway]` config only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard routes
 - Runtime image is Chainguard `wolfi-base` (minimal): it ships **no** `curl`/`wget` and busybox has no `wget` applet. The Compose healthchecks probe `/health` with `wget`, so the Dockerfile must `apk add --no-cache wget` for them to pass — keep that line in sync with the `healthcheck:` blocks in `example/compose.yml` and `example/compose.local.yml`
+## Tooling (yggdrasil monorepo)
+The dev shell, justfile, lefthook and cog verify are the root ones; this
+project no longer has its own `flake.nix`, `justfile` or `lefthook.yml`. Run
+recipes from the repo root: `just axon-ci`, `axon-clippy`, `axon-test`,
+`axon-oci-build`, `axon-up`/`axon-down`. `cog.toml` and `release.sh` stay
+because the exported GitHub repo releases with them.
+
 ## Version Synchronization
 When updating the Rust version, ensure consistency across:
-1. **flake.nix**: `rust-bin.stable."X.Y.Z"` (line 22)
+1. **Cargo.toml**: `rust-version = "X.Y.Z"`
 2. **Dockerfile**: `FROM rust:X.Y-bookworm AS builder` (line 2)
 3. **.github/workflows/ci.yml**: MSRV check `toolchain: "X.Y"` (line 80)
 
-All three must use the same Rust version to avoid build discrepancies.
+All three must use the same Rust version to avoid build discrepancies. The dev
+shell is the yggdrasil root one (floating fenix stable), so it pins nothing.
