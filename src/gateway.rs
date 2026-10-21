@@ -6,7 +6,7 @@
 //! - Route tool calls, resource reads, and prompt gets to appropriate backends
 //! - Graceful error handling when backends fail
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::BoxError;
@@ -27,7 +27,7 @@ use crate::registry::{
 };
 use crate::types::{
     BackendInfo, JsonRpcRequest, JsonRpcResponse, NamespacedPrompt, NamespacedResource,
-    PromptDefinition, ResourceDefinition,
+    PromptDefinition, ResourceDefinition, ToolDefinition,
 };
 
 /// The main gateway actor
@@ -146,7 +146,60 @@ struct RequestRouter {
     backends: Arc<HashMap<String, ActorRef<BackendActor>>>,
 }
 
+/// Whether a token may see and call the namespaced tool `tool_name` of
+/// `backend_name`: both the backend ACL and the tool patterns must allow it.
+fn tool_permitted(identity: Option<&TokenIdentity>, backend_name: &str, tool_name: &str) -> bool {
+    AuthManager::check_backend_permission(identity, backend_name).is_ok()
+        && AuthManager::check_tool_permission(identity, tool_name).is_ok()
+}
+
+/// Whether a token is restricted at all (`None` and empty lists = unrestricted).
+fn is_restricted(identity: Option<&TokenIdentity>) -> bool {
+    identity.is_some_and(|id| !id.allowed_backends.is_empty() || !id.allowed_tools.is_empty())
+}
+
 impl RequestRouter {
+    /// Backends the caller may access.
+    fn permitted_backends<'a>(
+        &'a self,
+        identity: Option<&'a TokenIdentity>,
+    ) -> impl Iterator<Item = (&'a String, &'a ActorRef<BackendActor>)> + 'a {
+        self.backends
+            .iter()
+            .filter(move |(name, _)| AuthManager::check_backend_permission(identity, name).is_ok())
+    }
+
+    /// Drop the tools the caller is not allowed to call.
+    ///
+    /// The owning backend comes from the registry's routing table rather than
+    /// the name prefix, since backend names may themselves contain `_`.
+    async fn filter_tools(
+        &self,
+        tools: Vec<ToolDefinition>,
+        identity: Option<&TokenIdentity>,
+    ) -> Vec<ToolDefinition> {
+        if !is_restricted(identity) {
+            return tools;
+        }
+
+        let backends = self
+            .registry
+            .ask(GetBackendStatus)
+            .await
+            .unwrap_or_default();
+        let permitted: HashSet<&str> = backends
+            .iter()
+            .flat_map(|backend| backend.tools.iter())
+            .filter(|tool| tool_permitted(identity, &tool.backend_name, &tool.namespaced_name))
+            .map(|tool| tool.namespaced_name.as_str())
+            .collect();
+
+        tools
+            .into_iter()
+            .filter(|tool| permitted.contains(tool.name.as_str()))
+            .collect()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn handle_request(
         &self,
@@ -181,7 +234,7 @@ impl RequestRouter {
                 Ok(tools) => JsonRpcResponse::success(
                     request.id.clone(),
                     serde_json::json!({
-                        "tools": tools
+                        "tools": self.filter_tools(tools, identity).await
                     }),
                 ),
                 Err(e) => JsonRpcResponse::error(
@@ -297,7 +350,7 @@ impl RequestRouter {
             "resources/list" => {
                 let mut all_resources: Vec<ResourceDefinition> = Vec::new();
 
-                for (backend_name, backend) in self.backends.iter() {
+                for (backend_name, backend) in self.permitted_backends(identity) {
                     // ask() returns Result<T, SendError<M, E>> when Reply = Result<T, E>
                     match backend.ask(ListResources).await {
                         Ok(resources) => {
@@ -337,7 +390,13 @@ impl RequestRouter {
                 // Parse the namespaced URI to find backend and original URI
                 // Format: "{backend}://{original_uri}"
                 if let Some((backend_name, original_uri)) = uri.split_once("://") {
-                    if let Some(backend) = self.backends.get(backend_name) {
+                    if let Err(e) = AuthManager::check_backend_permission(identity, backend_name) {
+                        JsonRpcResponse::error(
+                            request.id.clone(),
+                            -32000,
+                            format!("Permission denied: {e}"),
+                        )
+                    } else if let Some(backend) = self.backends.get(backend_name) {
                         crate::metrics::record_resource_read(backend_name);
                         match backend
                             .ask(ReadResource {
@@ -372,7 +431,7 @@ impl RequestRouter {
             "prompts/list" => {
                 let mut all_prompts: Vec<PromptDefinition> = Vec::new();
 
-                for (backend_name, backend) in self.backends.iter() {
+                for (backend_name, backend) in self.permitted_backends(identity) {
                     match backend.ask(ListPrompts).await {
                         Ok(prompts) => {
                             // Namespace the prompts
@@ -414,7 +473,13 @@ impl RequestRouter {
                 // Parse the namespaced name to find backend and original name
                 // Format: "{backend}_{original_name}"
                 if let Some((backend_name, original_name)) = name.split_once('_') {
-                    if let Some(backend) = self.backends.get(backend_name) {
+                    if let Err(e) = AuthManager::check_backend_permission(identity, backend_name) {
+                        JsonRpcResponse::error(
+                            request.id.clone(),
+                            -32000,
+                            format!("Permission denied: {e}"),
+                        )
+                    } else if let Some(backend) = self.backends.get(backend_name) {
                         crate::metrics::record_prompt_get(backend_name);
                         match backend
                             .ask(GetPrompt {
@@ -538,7 +603,7 @@ impl RequestRouter {
             {
                 Ok(tools) => JsonRpcResponse::success(
                     request.id.clone(),
-                    serde_json::json!({ "tools": tools }),
+                    serde_json::json!({ "tools": self.filter_tools(tools, identity).await }),
                 ),
                 Err(e) => JsonRpcResponse::error(
                     request.id.clone(),
@@ -1137,6 +1202,169 @@ mod tests {
 
             assert_eq!(parts[0], "backend");
             assert_eq!(parts[1], "tool_with_many_underscores");
+        }
+    }
+
+    mod token_acl {
+        use kameo::mailbox;
+
+        use super::*;
+        use crate::config::GatewayConfig;
+        use crate::registry::UpdateBackend;
+        use crate::types::BackendState;
+
+        fn tool(name: &str) -> ToolDefinition {
+            ToolDefinition {
+                name: name.to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn identity(allowed_backends: &[&str], allowed_tools: &[&str]) -> Arc<TokenIdentity> {
+            Arc::new(TokenIdentity {
+                name: String::from("agent"),
+                allowed_tools: allowed_tools.iter().map(ToString::to_string).collect(),
+                allowed_backends: allowed_backends.iter().map(ToString::to_string).collect(),
+                rate_limit_per_minute: 0,
+            })
+        }
+
+        /// A gateway with no backend actors, whose registry knows the tools of
+        /// `public`, `secret` and `public_extra` (a name that shares a prefix).
+        async fn gateway() -> ActorRef<GatewayActor> {
+            let registry =
+                RegistryActor::spawn_with_mailbox(RegistryActor::new(), mailbox::unbounded());
+            for (backend, tools) in [
+                ("public", vec!["read", "write"]),
+                ("secret", vec!["dump"]),
+                ("public_extra", vec!["thing"]),
+            ] {
+                registry
+                    .ask(UpdateBackend {
+                        name: backend.to_string(),
+                        state: BackendState::Connected,
+                        tools: tools.into_iter().map(tool).collect(),
+                        error: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let config = Config {
+                gateway: GatewayConfig {
+                    bind: String::from("127.0.0.1:0"),
+                    base_url: String::from("http://127.0.0.1:0"),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: Vec::new(),
+                tokens: Vec::new(),
+                groups: Vec::new(),
+            };
+            GatewayActor::spawn_with_mailbox(
+                GatewayActor::new(config, registry),
+                mailbox::unbounded(),
+            )
+        }
+
+        async fn call(
+            gateway: &ActorRef<GatewayActor>,
+            method: &str,
+            params: serde_json::Value,
+            identity: Option<Arc<TokenIdentity>>,
+        ) -> JsonRpcResponse {
+            gateway
+                .ask(HandleRequest {
+                    request: JsonRpcRequest {
+                        jsonrpc: String::from("2.0"),
+                        id: Some(serde_json::json!(1)),
+                        method: method.to_string(),
+                        params,
+                    },
+                    identity,
+                })
+                .await
+                .unwrap()
+        }
+
+        fn tool_names(response: &JsonRpcResponse) -> Vec<String> {
+            let mut names: Vec<String> = response.result.as_ref().unwrap()["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        async fn tools_list_is_unfiltered_without_restrictions() {
+            let gateway = gateway().await;
+            let all = call(&gateway, "tools/list", serde_json::json!({}), None).await;
+            assert_eq!(tool_names(&all).len(), 4);
+
+            let open = identity(&[], &[]);
+            let open = call(&gateway, "tools/list", serde_json::json!({}), Some(open)).await;
+            assert_eq!(tool_names(&open).len(), 4);
+        }
+
+        #[tokio::test]
+        async fn tools_list_hides_backends_outside_the_token_acl() {
+            let gateway = gateway().await;
+            let id = identity(&["public"], &[]);
+            let response = call(&gateway, "tools/list", serde_json::json!({}), Some(id)).await;
+            // `public_extra_thing` starts with `public_` but belongs to another
+            // backend, so it must stay hidden.
+            assert_eq!(tool_names(&response), ["public_read", "public_write"]);
+        }
+
+        #[tokio::test]
+        async fn tools_list_applies_tool_patterns() {
+            let gateway = gateway().await;
+            let id = identity(&[], &["public_read", "secret_*"]);
+            let response = call(&gateway, "tools/list", serde_json::json!({}), Some(id)).await;
+            assert_eq!(tool_names(&response), ["public_read", "secret_dump"]);
+        }
+
+        #[tokio::test]
+        async fn resources_read_rejects_backend_outside_the_token_acl() {
+            let gateway = gateway().await;
+            let id = identity(&["public"], &[]);
+            let params = serde_json::json!({ "uri": "secret://file.txt" });
+            let response = call(&gateway, "resources/read", params, Some(id)).await;
+            let error = response.error.expect("must be denied");
+            assert!(
+                error.message.contains("Permission denied"),
+                "{}",
+                error.message
+            );
+        }
+
+        #[tokio::test]
+        async fn prompts_get_rejects_backend_outside_the_token_acl() {
+            let gateway = gateway().await;
+            let id = identity(&["public"], &[]);
+            let params = serde_json::json!({ "name": "secret_prompt" });
+            let response = call(&gateway, "prompts/get", params, Some(id)).await;
+            let error = response.error.expect("must be denied");
+            assert!(
+                error.message.contains("Permission denied"),
+                "{}",
+                error.message
+            );
+        }
+
+        #[tokio::test]
+        async fn permitted_backend_is_not_denied() {
+            let gateway = gateway().await;
+            let id = identity(&["public"], &[]);
+            let params = serde_json::json!({ "uri": "public://file.txt" });
+            let response = call(&gateway, "resources/read", params, Some(id)).await;
+            // No backend actor exists in this test, so it gets past the ACL and
+            // fails on lookup instead.
+            let error = response.error.expect("no backend actor");
+            assert!(error.message.contains("not found"), "{}", error.message);
         }
     }
 }
