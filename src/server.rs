@@ -722,13 +722,30 @@ fn verify_auth(
     }
 }
 
+/// Answer a JSON-RPC notification (a message without an `id`).
+///
+/// Notifications get no JSON-RPC response; the Streamable HTTP transport
+/// acknowledges them with `202 Accepted` and an empty body. The gateway has
+/// nothing to do for any of them (`initialized`, `cancelled`, ...), so they are
+/// not forwarded.
+fn accept_notification(request: &JsonRpcRequest) -> Option<Response> {
+    if request.id.is_some() {
+        return None;
+    }
+    tracing::debug!(method = %request.method, "Accepted JSON-RPC notification");
+    Some(StatusCode::ACCEPTED.into_response())
+}
+
 /// Handle POST /mcp - JSON-RPC over HTTP
 async fn handle_mcp_request(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     let identity = verify_auth(&headers, &state.auth_manager.load())?;
+    if let Some(accepted) = accept_notification(&request) {
+        return Ok(accepted);
+    }
 
     // For tool calls, check tool-level permissions
     if request.method == "tools/call"
@@ -751,7 +768,7 @@ async fn handle_mcp_request(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 /// Handle GET /mcp/sse - Server-Sent Events endpoint
@@ -787,8 +804,11 @@ async fn handle_group_request(
     headers: HeaderMap,
     Path(group_name): Path<String>,
     Json(request): Json<JsonRpcRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<Response, StatusCode> {
     let identity = verify_auth(&headers, &state.auth_manager.load())?;
+    if let Some(accepted) = accept_notification(&request) {
+        return Ok(accepted);
+    }
 
     // For tool calls, check tool-level permissions
     if request.method == "tools/call"
@@ -812,7 +832,7 @@ async fn handle_group_request(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 /// List available tool groups
@@ -1245,6 +1265,53 @@ mod tests {
                 .get("access-control-allow-origin")
                 .is_none()
         );
+    }
+
+    async fn post_mcp(uri: &str, body: serde_json::Value) -> (StatusCode, Vec<u8>) {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .method(http::Method::POST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        (status, body.to_vec())
+    }
+
+    #[rstest::rstest]
+    #[case("/mcp", "notifications/initialized")]
+    #[case("/mcp", "notifications/cancelled")]
+    #[case("/mcp/group/any", "notifications/initialized")]
+    #[tokio::test]
+    async fn notifications_get_202_with_empty_body(#[case] uri: &str, #[case] method: &str) {
+        let (status, body) = post_mcp(
+            uri,
+            json!({ "jsonrpc": "2.0", "method": method, "params": {} }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty(), "notification body must be empty");
+    }
+
+    #[tokio::test]
+    async fn requests_with_id_still_get_a_json_response() {
+        let (status, body) = post_mcp(
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(payload["id"], 7);
     }
 
     #[test]
