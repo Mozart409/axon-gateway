@@ -2,6 +2,31 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.4.0 - 2026-10-21
+#### Features
+- (**axon**) add lock-axon to pin the export lock to the root - (dabff76) - Amadeus Mader
+- (**axon**) sync the dependency upgrade from github - (af5bc1e) - Amadeus Mader
+- (**rust**) share one toolchain, wire axon, dashboard and surrealkit - (9839f22) - Amadeus Mader
+#### Bug Fixes
+- (**axon**) run the container as nonroot on a digest-pinned wolfi base - (55b8e2a) - Amadeus Mader
+- (**axon**) answer JSON-RPC notifications with 202 and an empty body - (eda4fa2) - Amadeus Mader
+- (**axon**) reject invalid custom backend headers in config validation - (70f54eb) - Amadeus Mader
+- (**axon**) load config on the blocking pool during reloads - (4fcb17b) - Amadeus Mader
+- (**axon**) rebuild auth tokens on config hot reload - (4806743) - Amadeus Mader
+- (**axon**) drop permissive CORS and reject cross-site UI actions - (bdc02fb) - Amadeus Mader
+- (**axon**) enforce token backend and tool ACLs on lists, resource reads and prompt gets - (4327cdf) - Amadeus Mader
+- (**axon**) serve MCP requests outside the gateway actor so slow calls do not block it - (7ae0fae) - Amadeus Mader
+- (**sync**) also push tags to all remotes - (0a7d5ea) - macbook-pro
+#### Miscellaneous Chores
+- (**axon**) move clippy pedantic and panic denies into a lints table - (ed35fc3) - Amadeus Mader
+- (**axon**) drop stale notification bug todo - (32ffed3) - Amadeus Mader
+- (**axon**) fold axon-gateway tooling into the root - (4f5eabb) - Amadeus Mader
+- (**deps**) pin subflake locks to the root flake.lock revisions - (aebd49e) - Amadeus Mader
+- (**repo**) pin subflake locks to the root lock with one lock-sub recipe and a drift guard - (38a25f2) - Amadeus Mader
+- (**rust**) delete the dead woodpecker configs and axon sync-remotes - (70c5101) - Amadeus Mader
+
+- - -
+
 ## v0.3.3 - 2026-09-03
 #### Bug Fixes
 - (**container**) added registry - (cb02a2b) - developmentbot
