@@ -1,0 +1,8 @@
+# `[lints.clippy]` in Cargo.toml denies the panicking shortcuts (`unwrap_used`,
+# `expect_used`, `panic`, `indexing_slicing`) in production code. Tests are a
+# legitimate place for them (a failed `unwrap()` in a test is the assertion),
+# so exempt test code here instead of sprinkling `#[allow(...)]` at call sites.
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true

@@ -7,7 +7,7 @@
 //! - Token resolution from request headers
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -201,6 +201,41 @@ impl AuthManager {
     }
 }
 
+/// A hot-swappable [`AuthManager`], so token changes apply on config reload.
+///
+/// Readers take a cheap `Arc` snapshot per request; a reload swaps in a new
+/// manager and carries the rate-limit windows over.
+#[derive(Clone)]
+pub struct SharedAuth(Arc<RwLock<Arc<AuthManager>>>);
+
+impl SharedAuth {
+    pub fn new(manager: AuthManager) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(manager))))
+    }
+
+    /// The current manager.
+    pub fn load(&self) -> Arc<AuthManager> {
+        Arc::clone(&self.0.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Rebuild the manager from a freshly loaded config.
+    pub fn reload(&self, gateway_config: &GatewayConfig, tokens: &[TokenConfig]) {
+        let mut manager = AuthManager::new(gateway_config, tokens);
+        let mut current = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        manager.rate_limits = Arc::clone(&current.rate_limits);
+        *current = Arc::new(manager);
+        tracing::info!(
+            "Auth reloaded: {} named token(s), shared token {}",
+            tokens.len(),
+            if gateway_config.auth_token.is_some() {
+                "set"
+            } else {
+                "unset"
+            }
+        );
+    }
+}
+
 /// Constant-time string comparison to prevent timing attacks
 fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
@@ -354,6 +389,59 @@ mod tests {
         // 4th should be rate limited
         assert!(matches!(
             auth.validate_token("secret"),
+            Err(AuthError::RateLimited { .. })
+        ));
+    }
+
+    fn gateway_config(auth_token: Option<&str>, rate_limit_per_minute: u32) -> GatewayConfig {
+        GatewayConfig {
+            bind: "0.0.0.0:8080".to_string(),
+            base_url: "http://localhost:8080".to_string(),
+            auth_token: auth_token.map(String::from),
+            rate_limit_per_minute,
+        }
+    }
+
+    fn token(name: &str, value: &str) -> TokenConfig {
+        TokenConfig {
+            name: name.to_string(),
+            token: value.to_string(),
+            allowed_tools: vec![],
+            allowed_backends: vec![],
+            rate_limit_per_minute: 0,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn shared_auth_reload_applies_token_changes() {
+        let auth = SharedAuth::new(AuthManager::new(
+            &gateway_config(None, 0),
+            &[token("old", "tok_old")],
+        ));
+        assert!(auth.load().validate_token("tok_old").is_ok());
+        assert!(auth.load().validate_token("tok_new").is_err());
+
+        auth.reload(&gateway_config(None, 0), &[token("new", "tok_new")]);
+        assert!(auth.load().validate_token("tok_old").is_err());
+        let identity = auth.load().validate_token("tok_new").unwrap().unwrap();
+        assert_eq!(identity.name, "new");
+
+        // Dropping every token turns auth off again.
+        auth.reload(&gateway_config(None, 0), &[]);
+        assert!(!auth.load().auth_required());
+    }
+
+    #[test]
+    fn shared_auth_reload_keeps_rate_limit_windows() {
+        let auth = SharedAuth::new(AuthManager::new(&gateway_config(Some("s"), 2), &[]));
+        assert!(auth.load().validate_token("s").is_ok());
+        assert!(auth.load().validate_token("s").is_ok());
+
+        // A reload must not hand a fresh quota to a client that used it up.
+        auth.reload(&gateway_config(Some("s"), 2), &[]);
+        assert!(matches!(
+            auth.load().validate_token("s"),
             Err(AuthError::RateLimited { .. })
         ));
     }

@@ -5,6 +5,14 @@
 //! gateway is running and assert that backends are added and removed live,
 //! without a restart.
 
+// Integration tests are test code: exempt them from the panic-family denies.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
 mod support;
 
 use std::time::Duration;
@@ -137,4 +145,54 @@ async fn removing_a_backend_hot_reloads_tools_away() {
     .await;
     assert_eq!(gone, Some(()), "tools should disappear after reload");
     assert_eq!(backend_count(&client, &server.base).await, 0);
+}
+
+/// HTTP status of an authenticated `tools/list` call.
+async fn status_with_token(client: &reqwest::Client, base: &str, token: &str) -> u16 {
+    client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(token)
+        .json(&rpc("tools/list"))
+        .send()
+        .await
+        .expect("tools/list request")
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn token_change_applies_on_hot_reload() {
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let base = format!("http://{bind}");
+
+    let config = ConfigBuilder::new(&bind).auth_token("old-token").render();
+    let server = Gateway::start(&config, &base).await;
+    let client = reqwest::Client::new();
+    assert_eq!(
+        status_with_token(&client, &server.base, "old-token").await,
+        200
+    );
+    assert_eq!(
+        status_with_token(&client, &server.base, "new-token").await,
+        401
+    );
+
+    // Rotate the token in the config file.
+    server.rewrite_config(&ConfigBuilder::new(&bind).auth_token("new-token").render());
+
+    let rotated = poll_until(60, Duration::from_millis(250), || async {
+        (status_with_token(&client, &server.base, "new-token").await == 200).then_some(())
+    })
+    .await;
+    assert_eq!(
+        rotated,
+        Some(()),
+        "new token should be accepted after reload"
+    );
+    assert_eq!(
+        status_with_token(&client, &server.base, "old-token").await,
+        401,
+        "old token must be revoked after reload"
+    );
 }

@@ -5,6 +5,14 @@
 //! That covers the actual wiring: config loading, actor startup, graceful
 //! readiness, auth middleware, and the JSON-RPC surface.
 
+// Integration tests are test code: exempt them from the panic-family denies.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
 mod support;
 
 use support::{ConfigBuilder, Gateway, free_port, rpc};

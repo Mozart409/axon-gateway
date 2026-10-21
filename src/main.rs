@@ -31,7 +31,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use kameo::actor::Spawn;
 use kameo::mailbox;
 
-use crate::auth::AuthManager;
+use crate::auth::{AuthManager, SharedAuth};
 use crate::config::Config;
 use crate::gateway::GatewayActor;
 use crate::registry::RegistryActor;
@@ -88,8 +88,8 @@ async fn main() -> Result<()> {
     tracing::info!("Prometheus metrics available at /metrics");
 
     // Initialize auth manager
-    let auth_manager = Arc::new(AuthManager::new(&config.gateway, &config.tokens));
-    if auth_manager.auth_required() {
+    let auth_manager = SharedAuth::new(AuthManager::new(&config.gateway, &config.tokens));
+    if auth_manager.load().auth_required() {
         tracing::info!("Authentication enabled");
     } else {
         tracing::warn!("No authentication configured - gateway is open");
@@ -127,7 +127,9 @@ async fn main() -> Result<()> {
     }
 
     // Start config file watcher for hot reload
-    if let Err(e) = watcher::start_config_watcher(&config_path, gateway.clone()) {
+    if let Err(e) =
+        watcher::start_config_watcher(&config_path, gateway.clone(), auth_manager.clone())
+    {
         tracing::warn!(
             "Failed to start config watcher: {}. Hot reload disabled.",
             e
@@ -162,6 +164,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "without signal handlers the gateway cannot shut down cleanly, so fail loudly"
+)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 

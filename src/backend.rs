@@ -1323,7 +1323,7 @@ mod tests {
             let tools = [make_tool("a"), make_tool("b"), make_tool("c")];
 
             // Empty allowed_tools means no filtering - all tools returned
-            assert!(config.allowed_tools.is_empty());
+            assert_eq!(config.allowed_tools, Vec::<String>::new());
             assert_eq!(tools.len(), 3);
         }
 

@@ -218,6 +218,15 @@ impl Config {
         Ok(config)
     }
 
+    /// [`Config::load`] for async contexts: the file and `.env` reads are
+    /// blocking, so run them on the blocking pool instead of a runtime worker.
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || Self::load(path))
+            .await
+            .map_err(|e| ConfigError::ReadError(std::io::Error::other(e)))?
+    }
+
     fn resolve_env_vars(&mut self, env_vars: &HashMap<String, String>) -> Result<(), ConfigError> {
         self.gateway.bind = resolve_placeholders(&self.gateway.bind, "gateway.bind", env_vars)?;
         self.gateway.base_url =
@@ -313,6 +322,22 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         for backend in &self.backends {
+            // Reject bad custom headers here instead of silently dropping them
+            // when the backend connects.
+            for (name, value) in &backend.headers {
+                let invalid = |part| ConfigError::InvalidHeader {
+                    backend: backend.name.clone(),
+                    header: name.clone(),
+                    part,
+                };
+                if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    return Err(invalid("name"));
+                }
+                if http::HeaderValue::from_str(value).is_err() {
+                    return Err(invalid("value"));
+                }
+            }
+
             match backend.transport {
                 TransportType::Sse | TransportType::Http => {
                     if backend.url.is_none() {
@@ -631,6 +656,64 @@ mod tests {
             config.validate().expect("valid config should pass");
         }
 
+        fn config_with_header(name: &str, value: &str) -> Config {
+            Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: vec![BackendConfig {
+                    name: "hdr".to_string(),
+                    transport: TransportType::Http,
+                    url: Some("http://localhost:3000".to_string()),
+                    headers: HashMap::from([(name.to_string(), value.to_string())]),
+                    ..Default::default()
+                }],
+                tokens: vec![],
+                groups: vec![],
+            }
+        }
+
+        #[test]
+        fn valid_custom_header_passes() {
+            config_with_header("X-Api-Key", "secret")
+                .validate()
+                .expect("valid header should pass");
+        }
+
+        #[test]
+        fn invalid_header_name_is_rejected() {
+            let error = config_with_header("Bad Header", "v")
+                .validate()
+                .expect_err("space in header name");
+            match error {
+                ConfigError::InvalidHeader {
+                    backend,
+                    header,
+                    part,
+                } => {
+                    assert_eq!(backend, "hdr");
+                    assert_eq!(header, "Bad Header");
+                    assert_eq!(part, "name");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn invalid_header_value_is_rejected_without_leaking_it() {
+            let error = config_with_header("X-Api-Key", "line\nbreak-secret")
+                .validate()
+                .expect_err("newline in header value");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidHeader { part: "value", .. }
+            ));
+            assert!(!error.to_string().contains("secret"), "{error}");
+        }
+
         #[test]
         fn valid_stdio_config_passes() {
             let config = Config {
@@ -824,7 +907,30 @@ tools = ["*_read", "*_list", "*_get"]
             );
 
             assert_eq!(config.groups[1].name, "readonly");
-            assert!(config.groups[1].backends.is_empty());
+            assert_eq!(config.groups[1].backends, Vec::<String>::new());
+        }
+    }
+
+    mod load_async {
+        use super::*;
+
+        #[tokio::test]
+        async fn loads_a_config_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, "backends = []\n[gateway]\nbind = \"127.0.0.1:0\"\n").unwrap();
+
+            let config = Config::load_async(&path).await.unwrap();
+            assert_eq!(config.gateway.bind, "127.0.0.1:0");
+        }
+
+        #[tokio::test]
+        async fn missing_file_is_a_read_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let error = Config::load_async(dir.path().join("absent.toml"))
+                .await
+                .expect_err("missing file must fail");
+            assert!(matches!(error, ConfigError::ReadError(_)), "{error:?}");
         }
     }
 
@@ -840,7 +946,7 @@ tools = ["*_read", "*_list", "*_get"]
             assert_eq!(config.health_check_interval_secs, 30);
             assert_eq!(config.max_consecutive_failures, 3);
             assert_eq!(config.circuit_breaker_cooldown_secs, 60);
-            assert!(config.allowed_tools.is_empty());
+            assert_eq!(config.allowed_tools, Vec::<String>::new());
             assert!(config.headers.is_empty());
             assert!(config.env.is_empty());
         }

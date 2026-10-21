@@ -39,6 +39,15 @@ pub enum ConfigError {
 
     #[error("backend '{name}' uses stdio transport but has no command")]
     MissingCommand { name: String },
+
+    /// The header value is left out of the message on purpose: it is often a
+    /// credential.
+    #[error("backend '{backend}' has an invalid {part} in custom header '{header}'")]
+    InvalidHeader {
+        backend: String,
+        header: String,
+        part: &'static str,
+    },
 }
 
 /// Server errors

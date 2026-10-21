@@ -5,6 +5,14 @@
 //! backend, aggregate and namespace its tools, and route `tools/call` to the
 //! backend that owns the tool.
 
+// Integration tests are test code: exempt them from the panic-family denies.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
 mod support;
 
 use std::time::Duration;
@@ -201,4 +209,75 @@ async fn tool_level_backend_error_propagates() {
         "expected tool-level error to propagate, got {resp:?}"
     );
     assert_eq!(backend.call_count("boom"), 1);
+}
+
+#[tokio::test]
+async fn slow_tool_call_does_not_block_other_requests() {
+    let slow = support::mock_backend::MockBackendBuilder::new()
+        .slow_tool("wait", Duration::from_secs(4))
+        .build()
+        .await;
+    let fast = MockBackend::start(&["echo"]).await;
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let base = format!("http://{bind}");
+    let config = ConfigBuilder::new(&bind)
+        .http_backend("slow", &slow.url())
+        .http_backend("fast", &fast.url())
+        .render();
+    let server = Gateway::start(&config, &base).await;
+    let client = reqwest::Client::new();
+
+    wait_for_tools(&client, &server.base, 2).await;
+
+    // Start the slow call and wait until it has reached the backend.
+    let slow_call = {
+        let client = client.clone();
+        let url = format!("{}/mcp", server.base);
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .json(&rpc_call("slow_wait", serde_json::json!({})))
+                .send()
+                .await
+                .expect("slow call")
+                .json::<serde_json::Value>()
+                .await
+                .expect("slow json")
+        })
+    };
+    poll_until(100, Duration::from_millis(20), || async {
+        (slow.call_count("wait") == 1).then_some(())
+    })
+    .await
+    .expect("slow call should reach the backend");
+
+    // While it is in flight, status, listing and other backends stay responsive.
+    let started = std::time::Instant::now();
+    let status = client
+        .get(format!("{}/status", server.base))
+        .send()
+        .await
+        .expect("status request");
+    assert!(status.status().is_success());
+    assert_eq!(list_tool_names(&client, &server.base).await.len(), 2);
+    let resp: serde_json::Value = client
+        .post(format!("{}/mcp", server.base))
+        .json(&rpc_call("fast_echo", serde_json::json!({})))
+        .send()
+        .await
+        .expect("fast call")
+        .json()
+        .await
+        .expect("fast json");
+    assert!(resp["result"].is_object(), "got {resp:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "requests were blocked behind the slow call for {:?}",
+        started.elapsed()
+    );
+    assert!(!slow_call.is_finished(), "slow call finished too early");
+
+    let slow_resp = slow_call.await.expect("slow task");
+    assert!(slow_resp["result"].is_object(), "got {slow_resp:?}");
 }

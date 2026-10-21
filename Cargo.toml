@@ -45,7 +45,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "1.1"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.7", features = ["fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
@@ -56,3 +56,16 @@ uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rstest = "0.27"
 tempfile = "3"
+
+# Pedantic is on for every build, not only via CI flags. Test code is exempt
+# from the panic-family denies through `clippy.toml`.
+[lints.clippy]
+# keep-sorted start
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+pedantic = { level = "warn", priority = -1 }
+unused_async_trait_impl = "allow" # kameo/rmcp handlers are written `async fn` by convention
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+# keep-sorted end
