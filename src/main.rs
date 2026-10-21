@@ -162,6 +162,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "without signal handlers the gateway cannot shut down cleanly, so fail loudly"
+)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 

@@ -16,20 +16,16 @@ cargo test
 # Run a single test
 cargo test <test_name>
 
-# Run clippy (standard)
+# Run clippy (pedantic is enabled by the [lints.clippy] table in Cargo.toml)
 cargo clippy
-
-# Run clippy with pedantic warnings
-cargo clippy -- -W clippy::pedantic
-
-# Always run pedantic clippy and fix all reported issues
-cargo clippy -- -W clippy::pedantic
 
 # Format code
 cargo fmt
 
-# Check all targets with clippy
-cargo clippy --all-targets -- -D warnings
+# The CI gate: all targets, warnings denied (same as `just axon-clippy`).
+# Don't add `-D clippy::pedantic` on the command line: it would override the
+# per-lint allows in Cargo.toml.
+cargo clippy --all-targets --locked -- -D warnings
 
 # Run bacon (background code checker)
 bacon
@@ -119,7 +115,12 @@ Lefthook runs automatically on commit:
 
 Pre-push:
 - `cargo test` - run all tests
-- `cargo clippy -- -W clippy::pedantic` - pedantic lint check
+- `cargo clippy` - pedantic lint check (via `[lints.clippy]`)
+
+Lints live in `Cargo.toml` `[lints.clippy]`: pedantic warns, and
+`unwrap_used`/`expect_used`/`panic`/`indexing_slicing` are denied in
+production code. `clippy.toml` exempts `#[test]` code; the integration test
+crates under `tests/` allow them at crate level.
 
 ### Dependencies
 - **Async**: tokio (full features)

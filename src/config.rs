@@ -824,7 +824,7 @@ tools = ["*_read", "*_list", "*_get"]
             );
 
             assert_eq!(config.groups[1].name, "readonly");
-            assert!(config.groups[1].backends.is_empty());
+            assert_eq!(config.groups[1].backends, Vec::<String>::new());
         }
     }
 
@@ -840,7 +840,7 @@ tools = ["*_read", "*_list", "*_get"]
             assert_eq!(config.health_check_interval_secs, 30);
             assert_eq!(config.max_consecutive_failures, 3);
             assert_eq!(config.circuit_breaker_cooldown_secs, 60);
-            assert!(config.allowed_tools.is_empty());
+            assert_eq!(config.allowed_tools, Vec::<String>::new());
             assert!(config.headers.is_empty());
             assert!(config.env.is_empty());
         }

@@ -590,9 +590,9 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
 
     // Add request ID to response headers
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert("x-request-id", request_id.parse().unwrap());
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
 
     // Record HTTP request metrics
     crate::metrics::record_http_request(&method, &path, response.status().as_u16());

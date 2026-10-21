@@ -5,6 +5,14 @@
 //! backend, aggregate and namespace its tools, and route `tools/call` to the
 //! backend that owns the tool.
 
+// Integration tests are test code: exempt them from the panic-family denies.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
 mod support;
 
 use std::time::Duration;

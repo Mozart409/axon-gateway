@@ -5,6 +5,14 @@
 //! gateway is running and assert that backends are added and removed live,
 //! without a restart.
 
+// Integration tests are test code: exempt them from the panic-family denies.
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+
 mod support;
 
 use std::time::Duration;

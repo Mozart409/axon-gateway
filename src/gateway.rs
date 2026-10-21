@@ -1044,7 +1044,7 @@ mod tests {
             let json = serde_json::to_value(&result).unwrap();
             assert_eq!(json["added"].as_array().unwrap().len(), 2);
             assert_eq!(json["removed"].as_array().unwrap().len(), 1);
-            assert!(json["errors"].as_array().unwrap().is_empty());
+            assert_eq!(json["errors"], serde_json::json!([]));
         }
 
         #[test]
