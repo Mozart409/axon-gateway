@@ -14,7 +14,9 @@ COPY src ./src
 RUN cargo build --release --locked
 
 # Stage 2: Runtime (minimal Wolfi image)
-FROM cgr.dev/chainguard/wolfi-base:latest
+# Pinned by digest (the multi-arch index of `latest` on 2026-10-21) so a build
+# is reproducible; bump it deliberately to pick up Wolfi package updates.
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:81211e15a86ea1d5357f284482af45730c51de45eaf10ad9ce205d6bfc2df323
 
 ARG VERSION
 ARG REVISION
@@ -41,6 +43,11 @@ COPY styles/output.css /app/styles/output.css
 
 WORKDIR /app
 
-EXPOSE 8080 
+# Run as wolfi-base's `nonroot` user (65532), spelled numerically so it holds
+# without reading /etc/passwd and so static scanners (trivy DS-0002) see it.
+# The gateway only reads /app and its config; it needs no write access.
+USER 65532:65532
+
+EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/axon-gateway"]
