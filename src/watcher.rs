@@ -10,6 +10,7 @@ use kameo::actor::ActorRef;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+use crate::auth::SharedAuth;
 use crate::config::Config;
 use crate::gateway::{GatewayActor, ReloadConfig};
 
@@ -27,6 +28,7 @@ use crate::gateway::{GatewayActor, ReloadConfig};
 pub fn start_config_watcher(
     config_path: impl AsRef<Path>,
     gateway: ActorRef<GatewayActor>,
+    auth: SharedAuth,
 ) -> Result<(), notify::Error> {
     let config_path = config_path.as_ref().to_path_buf();
     let config_path_display = config_path.display().to_string();
@@ -103,6 +105,8 @@ pub fn start_config_watcher(
             // Try to load the new config
             match Config::load(&config_path) {
                 Ok(new_config) => {
+                    auth.reload(&new_config.gateway, &new_config.tokens);
+
                     // Send reload message to gateway
                     match gateway.ask(ReloadConfig { config: new_config }).await {
                         Ok(result) => {

@@ -43,7 +43,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use uuid::Uuid;
 
-use crate::auth::{AuthError, AuthManager, TokenIdentity};
+use crate::auth::{AuthError, AuthManager, SharedAuth, TokenIdentity};
 use crate::config::Config;
 use crate::error::ServerError;
 use crate::gateway::{
@@ -58,7 +58,7 @@ mod views;
 #[derive(Clone)]
 pub struct AppState {
     pub gateway: ActorRef<GatewayActor>,
-    pub auth_manager: Arc<AuthManager>,
+    pub auth_manager: SharedAuth,
     pub config_path: Option<String>,
     pub base_url: String,
     pub ui_events: broadcast::Sender<UiEvent>,
@@ -372,36 +372,15 @@ async fn handle_ui_reload_config(
     })?;
 
     let flash = match Config::load(config_path) {
-        Ok(new_config) => match state.gateway.ask(ReloadConfig { config: new_config }).await {
-            Ok(result) => {
-                publish_ui_event(
-                    &state.ui_events,
-                    UiEvent::ConfigReloaded {
-                        added: result.added.clone(),
-                        removed: result.removed.clone(),
-                        errors: result.errors.clone(),
-                    },
-                );
-                let message = format!(
-                    "Config reloaded (added: {}, removed: {}, errors: {})",
-                    result.added.len(),
-                    result.removed.len(),
-                    result.errors.len()
-                );
-                FlashMessage {
-                    level: if result.errors.is_empty() {
-                        FlashLevel::Success
-                    } else {
-                        FlashLevel::Info
-                    },
-                    message,
-                }
-            }
-            Err(e) => FlashMessage {
-                level: FlashLevel::Error,
-                message: format!("Config reload failed: {e:?}"),
-            },
-        },
+        Ok(new_config) => {
+            state
+                .auth_manager
+                .reload(&new_config.gateway, &new_config.tokens);
+            reload_flash(
+                state.gateway.ask(ReloadConfig { config: new_config }).await,
+                &state,
+            )
+        }
         Err(e) => FlashMessage {
             level: FlashLevel::Error,
             message: format!("Failed to read config: {e}"),
@@ -411,6 +390,43 @@ async fn handle_ui_reload_config(
     publish_ui_event(&state.ui_events, UiEvent::Flash(flash.clone()));
     refresh_ui_backend_snapshot(&state).await;
     Ok(Html(views::render_flash(&flash).into_string()))
+}
+
+/// Turn the gateway's reload reply into a flash message (and announce it).
+fn reload_flash<E: std::fmt::Debug>(
+    reply: Result<crate::gateway::ReloadResult, E>,
+    state: &AppState,
+) -> FlashMessage {
+    match reply {
+        Ok(result) => {
+            publish_ui_event(
+                &state.ui_events,
+                UiEvent::ConfigReloaded {
+                    added: result.added.clone(),
+                    removed: result.removed.clone(),
+                    errors: result.errors.clone(),
+                },
+            );
+            let message = format!(
+                "Config reloaded (added: {}, removed: {}, errors: {})",
+                result.added.len(),
+                result.removed.len(),
+                result.errors.len()
+            );
+            FlashMessage {
+                level: if result.errors.is_empty() {
+                    FlashLevel::Success
+                } else {
+                    FlashLevel::Info
+                },
+                message,
+            }
+        }
+        Err(e) => FlashMessage {
+            level: FlashLevel::Error,
+            message: format!("Config reload failed: {e:?}"),
+        },
+    }
 }
 
 fn publish_ui_event(sender: &broadcast::Sender<UiEvent>, event: UiEvent) {
@@ -712,7 +728,7 @@ async fn handle_mcp_request(
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let identity = verify_auth(&headers, &state.auth_manager)?;
+    let identity = verify_auth(&headers, &state.auth_manager.load())?;
 
     // For tool calls, check tool-level permissions
     if request.method == "tools/call"
@@ -749,7 +765,7 @@ async fn handle_mcp_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager)?;
+    let _identity = verify_auth(&headers, &state.auth_manager.load())?;
 
     // For SSE transport, we send an initial "endpoint" message
     // Real implementation would maintain a session and stream responses
@@ -772,7 +788,7 @@ async fn handle_group_request(
     Path(group_name): Path<String>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let identity = verify_auth(&headers, &state.auth_manager)?;
+    let identity = verify_auth(&headers, &state.auth_manager.load())?;
 
     // For tool calls, check tool-level permissions
     if request.method == "tools/call"
@@ -964,7 +980,7 @@ mod tests {
 
         AppState {
             gateway,
-            auth_manager: Arc::new(AuthManager::new(
+            auth_manager: SharedAuth::new(AuthManager::new(
                 &GatewayConfig {
                     bind: String::from("127.0.0.1:0"),
                     base_url: String::from("http://127.0.0.1:8080"),
