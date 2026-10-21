@@ -148,7 +148,7 @@ crates under `tests/` allow them at crate level.
 - Config file is TOML format with sections `[gateway]` and `[[backends]]`
 - SSE and HTTP transports both use rmcp's `StreamableHttpClientTransport`
 - Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
-- `auth_token` in `[gateway]` config only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard routes
+- `auth_token` in `[gateway]` config only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard routes. The unauthenticated UI is intended (it sits on the homelab network), so the guard against other web pages is: no CORS layer at all (don't add `CorsLayer::permissive()` back), and the state-changing `POST /ui/actions/*` routes go through `reject_cross_site_middleware`, which returns 403 when `Sec-Fetch-Site` is not `same-origin`/`none` or the `Origin` matches neither `Host` nor `base_url`. Requests without either header (curl) pass
 - Runtime image is Chainguard `wolfi-base` (minimal): it ships **no** `curl`/`wget` and busybox has no `wget` applet. The Compose healthchecks probe `/health` with `wget`, so the Dockerfile must `apk add --no-cache wget` for them to pass — keep that line in sync with the `healthcheck:` blocks in `example/compose.yml` and `example/compose.local.yml`
 ## Tooling (yggdrasil monorepo)
 In yggdrasil the dev shell, justfile, lefthook and cog verify are the root

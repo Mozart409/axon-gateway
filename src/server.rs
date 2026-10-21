@@ -38,7 +38,6 @@ use kameo::actor::ActorRef;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeFile;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -96,19 +95,10 @@ pub struct FlashMessage {
 
 /// Create the Axum router
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Landing page
-        .route("/", get(handle_landing))
-        // MCP endpoints
-        .route("/mcp", post(handle_mcp_request))
-        .route("/mcp/sse", get(handle_mcp_sse))
-        .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
-        .route_service("/favicon.svg", ServeFile::new("static/favicon.svg"))
-        // UI endpoints
-        .route("/ui", get(handle_ui))
-        .route("/ui/backends/{name}", get(handle_ui_backend_detail))
-        .route("/ui/events", get(handle_ui_events))
-        .route("/ui/partials/backends", get(handle_ui_backends_partial))
+    // State-changing dashboard actions. The UI has no login (it lives on the
+    // homelab network), so refuse requests a browser marks as cross-site:
+    // otherwise any web page could drive them with a plain form POST.
+    let ui_actions = Router::new()
         .route(
             "/ui/actions/backends/{name}/reconnect",
             post(handle_ui_reconnect_backend),
@@ -122,6 +112,28 @@ pub fn create_router(state: AppState) -> Router {
             post(handle_ui_enable_backend),
         )
         .route("/ui/actions/reload", post(handle_ui_reload_config))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            reject_cross_site_middleware,
+        ));
+
+    // No CORS layer: nothing here is meant to be called from another origin's
+    // page, and without `Access-Control-Allow-*` headers browsers keep other
+    // sites from reading `/status/detailed`, `/mcp` and friends.
+    Router::new()
+        // Landing page
+        .route("/", get(handle_landing))
+        // MCP endpoints
+        .route("/mcp", post(handle_mcp_request))
+        .route("/mcp/sse", get(handle_mcp_sse))
+        .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
+        .route_service("/favicon.svg", ServeFile::new("static/favicon.svg"))
+        // UI endpoints
+        .route("/ui", get(handle_ui))
+        .route("/ui/backends/{name}", get(handle_ui_backend_detail))
+        .route("/ui/events", get(handle_ui_events))
+        .route("/ui/partials/backends", get(handle_ui_backends_partial))
+        .merge(ui_actions)
         // Status endpoints
         .route("/health", get(health_check))
         .route("/build", get(get_build_info))
@@ -134,7 +146,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/metrics", get(prometheus_metrics))
         // Middleware
         .layer(middleware::from_fn(request_id_middleware))
-        .layer(CorsLayer::permissive())
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
@@ -600,6 +611,71 @@ async fn request_id_middleware(mut request: Request<axum::body::Body>, next: Nex
     response
 }
 
+/// Reject requests that a browser reports as coming from another site.
+async fn reject_cross_site_middleware(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if is_cross_site(request.headers(), &state.base_url) {
+        tracing::warn!(
+            path = %request.uri().path(),
+            origin = ?request.headers().get(http::header::ORIGIN),
+            "Rejected cross-site UI action"
+        );
+        return (StatusCode::FORBIDDEN, "cross-site request rejected").into_response();
+    }
+    next.run(request).await
+}
+
+/// Whether a request was sent by a page on another origin.
+///
+/// Browsers send `Sec-Fetch-Site` (trusted when present: only `same-origin`
+/// and `none`, i.e. user-initiated, pass) and `Origin` on POSTs. The `Origin`
+/// must match the request's `Host` or the configured `base_url`. Requests with
+/// neither header come from non-browser clients (curl, scripts) and are not a
+/// CSRF vector, so they pass.
+fn is_cross_site(headers: &HeaderMap, base_url: &str) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return !matches!(site.to_str(), Ok("same-origin" | "none"));
+    }
+
+    let Some(origin) = headers.get(http::header::ORIGIN) else {
+        return false;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return true;
+    };
+    let Some(origin_authority) = authority_of(origin) else {
+        return true; // includes the opaque `null` origin
+    };
+
+    let host_matches = headers
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|host| host.eq_ignore_ascii_case(origin_authority));
+    let base_matches = origin_of(base_url)
+        .is_some_and(|base| base.eq_ignore_ascii_case(origin.trim_end_matches('/')));
+
+    !(host_matches || base_matches)
+}
+
+/// The `host[:port]` part of an `http(s)://host[:port][/path]` URL.
+fn authority_of(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (!authority.is_empty()).then_some(authority)
+}
+
+/// The `scheme://host[:port]` origin of an `http(s)` URL.
+fn origin_of(url: &str) -> Option<&str> {
+    let authority = authority_of(url)?;
+    let scheme_len = url.find("://")? + 3;
+    url.get(..scheme_len + authority.len())
+}
+
 /// Extract and validate auth token from request headers.
 ///
 /// Returns `Ok(Some(identity))` for named tokens, `Ok(None)` for shared
@@ -1053,5 +1129,112 @@ mod tests {
             .expect("body should be readable");
         let html = String::from_utf8(body.to_vec()).expect("html should be utf-8");
         assert!(html.contains("Reconnect failed"));
+    }
+
+    async fn post_ui_action(headers: &[(&str, &str)]) -> StatusCode {
+        let app = create_router(test_state());
+        let mut builder = Request::builder()
+            .uri("/ui/actions/backends/missing/reconnect")
+            .method(http::Method::POST);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        app.oneshot(builder.body(Body::empty()).expect("request should build"))
+            .await
+            .expect("router should respond")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn ui_action_rejects_cross_site_origin() {
+        let status = post_ui_action(&[
+            ("host", "axon.homelab.internal"),
+            ("origin", "https://evil.example"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ui_action_rejects_null_origin() {
+        let status = post_ui_action(&[("host", "axon.homelab.internal"), ("origin", "null")]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[rstest::rstest]
+    #[case("cross-site")]
+    #[case("same-site")]
+    #[tokio::test]
+    async fn ui_action_rejects_cross_site_fetch_metadata(#[case] site: &str) {
+        // Sec-Fetch-Site wins even when the Origin looks right.
+        let status = post_ui_action(&[
+            ("host", "axon.homelab.internal"),
+            ("origin", "https://axon.homelab.internal"),
+            ("sec-fetch-site", site),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ui_action_accepts_same_origin_browser_request() {
+        let status = post_ui_action(&[
+            ("host", "axon.homelab.internal"),
+            ("origin", "https://axon.homelab.internal"),
+            ("sec-fetch-site", "same-origin"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ui_action_accepts_origin_matching_host_without_fetch_metadata() {
+        let status = post_ui_action(&[
+            ("host", "axon.homelab.internal:8080"),
+            ("origin", "http://axon.homelab.internal:8080"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ui_action_accepts_origin_matching_base_url() {
+        // Behind a proxy that rewrites Host, the configured base_url still matches.
+        let status = post_ui_action(&[
+            ("host", "10.0.0.5:8080"),
+            ("origin", "http://127.0.0.1:8080"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn responses_carry_no_cors_headers() {
+        let app = create_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status/detailed")
+                    .header("origin", "https://evil.example")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn origin_helpers_parse_urls() {
+        assert_eq!(authority_of("https://a.lan:9/x"), Some("a.lan:9"));
+        assert_eq!(authority_of("null"), None);
+        assert_eq!(origin_of("http://a.lan:8080/ui"), Some("http://a.lan:8080"));
     }
 }
