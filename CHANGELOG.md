@@ -2,6 +2,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.4.1 - 2026-10-21
+#### Bug Fixes
+- (**axon**) match the dockerfile rust image to the flake's 1.99.1 - (a91b75e) - Amadeus Mader
+- (**axon**) bump rustls, rustls-webpki and webpki-root-certs for RUSTSEC-2026-0346..0349, 0382 and 0383 - (7c4eb7b) - Amadeus Mader
+
+- - -
+
 ## v0.4.0 - 2026-10-21
 #### Features
 - (**axon**) add lock-axon to pin the export lock to the root - (dabff76) - Amadeus Mader
