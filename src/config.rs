@@ -322,6 +322,22 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         for backend in &self.backends {
+            // Reject bad custom headers here instead of silently dropping them
+            // when the backend connects.
+            for (name, value) in &backend.headers {
+                let invalid = |part| ConfigError::InvalidHeader {
+                    backend: backend.name.clone(),
+                    header: name.clone(),
+                    part,
+                };
+                if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    return Err(invalid("name"));
+                }
+                if http::HeaderValue::from_str(value).is_err() {
+                    return Err(invalid("value"));
+                }
+            }
+
             match backend.transport {
                 TransportType::Sse | TransportType::Http => {
                     if backend.url.is_none() {
@@ -638,6 +654,64 @@ mod tests {
             };
 
             config.validate().expect("valid config should pass");
+        }
+
+        fn config_with_header(name: &str, value: &str) -> Config {
+            Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                },
+                backends: vec![BackendConfig {
+                    name: "hdr".to_string(),
+                    transport: TransportType::Http,
+                    url: Some("http://localhost:3000".to_string()),
+                    headers: HashMap::from([(name.to_string(), value.to_string())]),
+                    ..Default::default()
+                }],
+                tokens: vec![],
+                groups: vec![],
+            }
+        }
+
+        #[test]
+        fn valid_custom_header_passes() {
+            config_with_header("X-Api-Key", "secret")
+                .validate()
+                .expect("valid header should pass");
+        }
+
+        #[test]
+        fn invalid_header_name_is_rejected() {
+            let error = config_with_header("Bad Header", "v")
+                .validate()
+                .expect_err("space in header name");
+            match error {
+                ConfigError::InvalidHeader {
+                    backend,
+                    header,
+                    part,
+                } => {
+                    assert_eq!(backend, "hdr");
+                    assert_eq!(header, "Bad Header");
+                    assert_eq!(part, "name");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn invalid_header_value_is_rejected_without_leaking_it() {
+            let error = config_with_header("X-Api-Key", "line\nbreak-secret")
+                .validate()
+                .expect_err("newline in header value");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidHeader { part: "value", .. }
+            ));
+            assert!(!error.to_string().contains("secret"), "{error}");
         }
 
         #[test]
