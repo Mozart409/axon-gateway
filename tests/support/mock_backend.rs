@@ -10,8 +10,9 @@
 //! gateway routed correctly, and individual tools can be configured to return
 //! tool-level errors.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
@@ -38,6 +39,7 @@ pub struct CallRecord {
 struct MockState {
     tools: Vec<Tool>,
     failing: HashSet<String>,
+    slow: HashMap<String, Duration>,
     calls: Mutex<Vec<CallRecord>>,
 }
 
@@ -72,6 +74,10 @@ impl ServerHandler for MockHandler {
             tool: name.clone(),
             arguments: arguments.clone(),
         });
+
+        if let Some(delay) = self.state.slow.get(&name) {
+            tokio::time::sleep(*delay).await;
+        }
 
         if self.state.failing.contains(&name) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
@@ -136,6 +142,7 @@ impl MockBackend {
 pub struct MockBackendBuilder {
     tools: Vec<Tool>,
     failing: HashSet<String>,
+    slow: HashMap<String, Duration>,
 }
 
 impl MockBackendBuilder {
@@ -143,7 +150,15 @@ impl MockBackendBuilder {
         Self {
             tools: Vec::new(),
             failing: HashSet::new(),
+            slow: HashMap::new(),
         }
+    }
+
+    /// Add a tool that succeeds, but only after sleeping for `delay`.
+    pub fn slow_tool(mut self, name: &str, delay: Duration) -> Self {
+        self.tools.push(make_tool(name));
+        self.slow.insert(name.to_string(), delay);
+        self
     }
 
     /// Add a tool that succeeds (echoes its arguments).
@@ -164,6 +179,7 @@ impl MockBackendBuilder {
         let state = Arc::new(MockState {
             tools: self.tools,
             failing: self.failing,
+            slow: self.slow,
             calls: Mutex::new(Vec::new()),
         });
 

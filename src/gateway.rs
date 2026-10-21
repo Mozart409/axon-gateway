@@ -13,6 +13,7 @@ use crate::error::BoxError;
 use kameo::actor::{Actor, ActorRef, Spawn};
 use kameo::mailbox;
 use kameo::message::{Context, Message};
+use kameo::reply::DelegatedReply;
 
 use crate::auth::{AuthManager, TokenIdentity};
 use crate::backend::{
@@ -33,7 +34,9 @@ use crate::types::{
 pub struct GatewayActor {
     config: Config,
     registry: ActorRef<RegistryActor>,
-    backends: HashMap<String, ActorRef<BackendActor>>,
+    /// Copy-on-write so request tasks can hold a snapshot while the actor
+    /// adds or removes backends.
+    backends: Arc<HashMap<String, ActorRef<BackendActor>>>,
 }
 
 impl GatewayActor {
@@ -41,7 +44,21 @@ impl GatewayActor {
         Self {
             config,
             registry,
-            backends: HashMap::new(),
+            backends: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// Mutable access to the backend map (clones it if a request task still
+    /// holds the previous snapshot).
+    fn backends_mut(&mut self) -> &mut HashMap<String, ActorRef<BackendActor>> {
+        Arc::make_mut(&mut self.backends)
+    }
+
+    /// Snapshot of the routing state for serving a request outside the actor.
+    fn router(&self) -> RequestRouter {
+        RequestRouter {
+            registry: self.registry.clone(),
+            backends: Arc::clone(&self.backends),
         }
     }
 
@@ -65,7 +82,7 @@ impl GatewayActor {
             let backend_actor = BackendActor::new(backend_config.clone(), self.registry.clone());
             let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
 
-            self.backends.insert(backend_config.name.clone(), actor_ref);
+            Arc::make_mut(&mut self.backends).insert(backend_config.name.clone(), actor_ref);
 
             tracing::info!("Initialized backend: {}", backend_config.name);
         }
@@ -97,16 +114,45 @@ pub struct HandleRequest {
 }
 
 impl Message<HandleRequest> for GatewayActor {
-    type Reply = JsonRpcResponse;
+    type Reply = DelegatedReply<JsonRpcResponse>;
 
-    #[allow(clippy::too_many_lines)]
+    /// Only snapshots the routing state here; the backend round trip runs in a
+    /// spawned task so a slow tool call never blocks the gateway's mailbox
+    /// (status, UI, hot reload and every other client).
     async fn handle(
         &mut self,
         msg: HandleRequest,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let request = msg.request;
+        let router = self.router();
+        let (delegated, sender) = ctx.reply_sender();
+        tokio::spawn(async move {
+            let response = router
+                .handle_request(msg.request, msg.identity.as_deref())
+                .await;
+            if let Some(sender) = sender {
+                sender.send(response);
+            }
+        });
+        delegated
+    }
+}
 
+/// A snapshot of the gateway's routing state, cheap to clone, used to serve one
+/// request outside the actor.
+#[derive(Clone)]
+struct RequestRouter {
+    registry: ActorRef<RegistryActor>,
+    backends: Arc<HashMap<String, ActorRef<BackendActor>>>,
+}
+
+impl RequestRouter {
+    #[allow(clippy::too_many_lines)]
+    async fn handle_request(
+        &self,
+        request: JsonRpcRequest,
+        identity: Option<&TokenIdentity>,
+    ) -> JsonRpcResponse {
         tracing::debug!("Handling MCP request: {}", request.method);
 
         match request.method.as_str() {
@@ -182,10 +228,9 @@ impl Message<HandleRequest> for GatewayActor {
                         original_tool_name,
                     }) => {
                         // Check backend permission
-                        if let Err(e) = AuthManager::check_backend_permission(
-                            msg.identity.as_deref(),
-                            &backend_name,
-                        ) {
+                        if let Err(e) =
+                            AuthManager::check_backend_permission(identity, &backend_name)
+                        {
                             return JsonRpcResponse::error(
                                 request.id.clone(),
                                 -32000,
@@ -252,7 +297,7 @@ impl Message<HandleRequest> for GatewayActor {
             "resources/list" => {
                 let mut all_resources: Vec<ResourceDefinition> = Vec::new();
 
-                for (backend_name, backend) in &self.backends {
+                for (backend_name, backend) in self.backends.iter() {
                     // ask() returns Result<T, SendError<M, E>> when Reply = Result<T, E>
                     match backend.ask(ListResources).await {
                         Ok(resources) => {
@@ -327,7 +372,7 @@ impl Message<HandleRequest> for GatewayActor {
             "prompts/list" => {
                 let mut all_prompts: Vec<PromptDefinition> = Vec::new();
 
-                for (backend_name, backend) in &self.backends {
+                for (backend_name, backend) in self.backends.iter() {
                     match backend.ask(ListPrompts).await {
                         Ok(prompts) => {
                             // Namespace the prompts
@@ -454,21 +499,40 @@ pub struct HandleGroupRequest {
 }
 
 impl Message<HandleGroupRequest> for GatewayActor {
-    type Reply = JsonRpcResponse;
+    type Reply = DelegatedReply<JsonRpcResponse>;
 
     async fn handle(
         &mut self,
         msg: HandleGroupRequest,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let request = msg.request.clone();
+        let router = self.router();
+        let (delegated, sender) = ctx.reply_sender();
+        tokio::spawn(async move {
+            let response = router
+                .handle_group_request(msg.request, msg.identity.as_deref(), &msg.group_name)
+                .await;
+            if let Some(sender) = sender {
+                sender.send(response);
+            }
+        });
+        delegated
+    }
+}
 
+impl RequestRouter {
+    async fn handle_group_request(
+        &self,
+        request: JsonRpcRequest,
+        identity: Option<&TokenIdentity>,
+        group_name: &str,
+    ) -> JsonRpcResponse {
         // For tools/list, return group-filtered tools
         if request.method == "tools/list" {
             return match self
                 .registry
                 .ask(ListToolGroup {
-                    group_name: msg.group_name.clone(),
+                    group_name: group_name.to_string(),
                 })
                 .await
             {
@@ -479,20 +543,13 @@ impl Message<HandleGroupRequest> for GatewayActor {
                 Err(e) => JsonRpcResponse::error(
                     request.id.clone(),
                     -32000,
-                    format!("Failed to list tools for group '{}': {e}", msg.group_name),
+                    format!("Failed to list tools for group '{group_name}': {e}"),
                 ),
             };
         }
 
         // For all other methods, delegate to the normal handler
-        self.handle(
-            HandleRequest {
-                request: msg.request,
-                identity: msg.identity,
-            },
-            ctx,
-        )
-        .await
+        self.handle_request(request, identity).await
     }
 }
 
@@ -626,7 +683,7 @@ impl Message<AddBackend> for GatewayActor {
         let backend_actor = BackendActor::new(msg.config, self.registry.clone());
         let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
 
-        self.backends.insert(name.clone(), actor_ref);
+        self.backends_mut().insert(name.clone(), actor_ref);
         tracing::info!("Added backend: {name}",);
 
         Ok(())
@@ -647,7 +704,7 @@ impl Message<RemoveBackendMsg> for GatewayActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_ref = self
-            .backends
+            .backends_mut()
             .remove(&msg.name)
             .ok_or_else(|| format!("Backend '{}' not found", msg.name))?;
 
@@ -683,7 +740,7 @@ impl Message<DisableBackendMsg> for GatewayActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_ref = self
-            .backends
+            .backends_mut()
             .remove(&msg.backend_name)
             .ok_or_else(|| format!("Backend '{}' not found", msg.backend_name))?;
 
@@ -751,7 +808,8 @@ impl Message<EnableBackendMsg> for GatewayActor {
         // Spawn backend actor
         let backend_actor = BackendActor::new(backend_config, self.registry.clone());
         let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
-        self.backends.insert(msg.backend_name.clone(), actor_ref);
+        self.backends_mut()
+            .insert(msg.backend_name.clone(), actor_ref);
 
         tracing::info!("Enabled backend: {}", msg.backend_name);
         Ok(())
@@ -787,7 +845,7 @@ impl Message<ReloadConfig> for GatewayActor {
 
         // Remove backends that are no longer in config
         for name in current_names.difference(&new_names) {
-            if let Some(actor_ref) = self.backends.remove(name) {
+            if let Some(actor_ref) = self.backends_mut().remove(name) {
                 if let Err(e) = actor_ref.stop_gracefully().await {
                     errors.push(format!("Failed to stop '{name}': {e:?}"));
                 }
@@ -825,7 +883,8 @@ impl Message<ReloadConfig> for GatewayActor {
                     BackendActor::new(backend_config.clone(), self.registry.clone());
                 let actor_ref =
                     BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
-                self.backends.insert(backend_config.name.clone(), actor_ref);
+                self.backends_mut()
+                    .insert(backend_config.name.clone(), actor_ref);
                 added.push(backend_config.name.clone());
             }
         }
