@@ -218,6 +218,15 @@ impl Config {
         Ok(config)
     }
 
+    /// [`Config::load`] for async contexts: the file and `.env` reads are
+    /// blocking, so run them on the blocking pool instead of a runtime worker.
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || Self::load(path))
+            .await
+            .map_err(|e| ConfigError::ReadError(std::io::Error::other(e)))?
+    }
+
     fn resolve_env_vars(&mut self, env_vars: &HashMap<String, String>) -> Result<(), ConfigError> {
         self.gateway.bind = resolve_placeholders(&self.gateway.bind, "gateway.bind", env_vars)?;
         self.gateway.base_url =
@@ -825,6 +834,29 @@ tools = ["*_read", "*_list", "*_get"]
 
             assert_eq!(config.groups[1].name, "readonly");
             assert_eq!(config.groups[1].backends, Vec::<String>::new());
+        }
+    }
+
+    mod load_async {
+        use super::*;
+
+        #[tokio::test]
+        async fn loads_a_config_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, "backends = []\n[gateway]\nbind = \"127.0.0.1:0\"\n").unwrap();
+
+            let config = Config::load_async(&path).await.unwrap();
+            assert_eq!(config.gateway.bind, "127.0.0.1:0");
+        }
+
+        #[tokio::test]
+        async fn missing_file_is_a_read_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let error = Config::load_async(dir.path().join("absent.toml"))
+                .await
+                .expect_err("missing file must fail");
+            assert!(matches!(error, ConfigError::ReadError(_)), "{error:?}");
         }
     }
 

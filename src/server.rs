@@ -371,7 +371,7 @@ async fn handle_ui_reload_config(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let flash = match Config::load(config_path) {
+    let flash = match Config::load_async(config_path).await {
         Ok(new_config) => {
             state
                 .auth_manager

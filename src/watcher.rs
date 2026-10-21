@@ -103,7 +103,7 @@ pub fn start_config_watcher(
             tracing::info!("Config file changed, reloading...");
 
             // Try to load the new config
-            match Config::load(&config_path) {
+            match Config::load_async(&config_path).await {
                 Ok(new_config) => {
                     auth.reload(&new_config.gateway, &new_config.tokens);
 
