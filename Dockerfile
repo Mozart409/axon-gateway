@@ -1,5 +1,5 @@
 # Stage 1: Build (optimized for compile speed)
-FROM docker.io/library/rust:1.99.0-bookworm AS builder
+FROM docker.io/library/rust:1.99.1-bookworm AS builder
 
 WORKDIR /build
 
