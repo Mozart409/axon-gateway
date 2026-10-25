@@ -2,6 +2,20 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.4.2 - 2026-10-25
+#### Features
+- (**axon**) update cargo dependencies - (58bd006) - Amadeus Mader
+- (**deps**) upgrade flake - (bbc9309) - Amadeus Mader
+- (**deps**) upgrade flake - (6827a80) - Amadeus Mader
+- (**deps**) upgrade flake - (d46ea63) - Amadeus Mader
+#### Continuous Integration
+- (**axon**) drop dependabot version updates on the github mirror - (866f42e) - Amadeus Mader
+#### Miscellaneous Chores
+- (**axon**) skip duplicate crates in cargo-deny - (52e2511) - Amadeus Mader
+- (**axon**) update cargo dependencies - (70200b1) - Amadeus Mader
+- (**axon**) bump setup-rust-toolchain to v2 and install-action - (1ebd6fd) - Amadeus Mader
+
+- - -
 ## v0.4.1 - 2026-10-21
 #### Bug Fixes
 - (**axon**) match the dockerfile rust image to the flake's 1.99.1 - (a91b75e) - Amadeus Mader
