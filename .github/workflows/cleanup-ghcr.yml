@@ -1,0 +1,40 @@
+name: Cleanup GHCR images
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily, 3am UTC
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Log what would be deleted without deleting"
+        type: boolean
+        default: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      # NOTE: Do NOT use actions/delete-package-versions with
+      # delete-only-untagged-versions here. The release pushes a multi-arch
+      # manifest list (amd64 + arm64); the tag only points at the list, and each
+      # per-arch child manifest is an *untagged* package version. That action is
+      # not manifest-list-aware and deletes those children, leaving the tagged
+      # list pointing at nothing ("manifest unknown" on pull).
+      # dataaxiom/ghcr-cleanup-action walks the manifest tree: it keeps children
+      # referenced by a kept image and deletes them with a deleted one.
+      #
+      # Keep the 5 newest releases. One release is one tagged image: its
+      # `vX.Y.Z` tag (and `latest` on the newest) sit on the same index.
+      - name: Keep the newest releases and delete untagged images
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          packages: axon-gateway
+          exclude-tags: latest
+          keep-n-tagged: 5
+          delete-untagged: true
+          # After cleanup, warn if any surviving multi-arch image is missing a
+          # platform child.
+          validate: true
+          dry-run: ${{ inputs.dry-run || false }}
