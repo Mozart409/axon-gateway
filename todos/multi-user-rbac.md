@@ -52,7 +52,9 @@ Non-goals:
   cancellation, no sessions. `/mcp/sse` (`handle_mcp_sse`) is a stub that only
   emits an `endpoint` event.
 - Tool groups (`[[groups]]`, `ToolGroupConfig`, routed at `/mcp/group/{name}`)
-  are path-based filters, not an access control concept.
+  are path-based filters, not an access control concept. They become toolsets
+  (`[[toolsets]]`, `/mcp/toolset/{name}`, section 4) because "groups" now means
+  RBAC groups.
 - No per-user state at all: no users, no personal backends, no per-user
   credentials. Backends are global and share one credential.
 - Metrics (`/metrics`) have no principal dimension; there are no traces; there
@@ -78,6 +80,15 @@ Non-goals:
 | 12 | Admin JSON API is the single write path | UI, CLI and tests share one service layer |
 | 13 | Keep existing `axon_*` metric names | No breaking rename for existing dashboards |
 | 14 | Postgres LISTEN/NOTIFY for replica fan-out | No extra infrastructure |
+| 15 | Two layers: grants (security, admin-only) and views (convenience, can only narrow) | A user can tidy their tool list without ever touching what they are allowed to do |
+| 16 | Users are opted in to every backend granted to their groups and may opt out per backend or tool; an opt-out is not a deny. Grants carry a `mandatory` flag (default false) that blocks opt-out | Less noise for users, compliance tools stay on |
+| 17 | Personal MCP servers are never shared with groups; only admins create shared backends and grant them to IdP-mapped groups | Sharing is an admin decision with an audit trail |
+| 18 | `[[groups]]` becomes `[[toolsets]]`, `/mcp/group/{name}` becomes `/mcp/toolset/{name}`; old names stay as deprecated aliases for one minor release | "groups" now means RBAC groups; toolsets are view layer, applied after grants |
+| 19 | Audit metadata is always recorded; arguments go to a separate `audit_arguments` table with shorter retention (default 30 days, metadata 1 year) | Arguments are the sensitive part and need their own lifetime |
+| 20 | Reading arguments needs `audit.read_sensitive` (not part of `auditor`); every read is audited | Separation of duties |
+| 21 | Default argument capture follows MCP tool annotations: `readOnlyHint: true` none, otherwise redacted; admins override per backend and tool glob | Safe default, evidence where it matters |
+| 22 | Work deployment is Kubernetes with 3 replicas: ingress hashes on `Mcp-Session-Id`, rate limits live in Postgres, singleton jobs run under an advisory lock | Pod-local MCP sessions, shared limits (see 7) |
+| 23 | The work IdP is Entra ID through the generic OIDC path; app roles carry the groups | No provider-specific code, no groups-overage (see 5) |
 
 ## 4. Domain model
 
@@ -98,7 +109,8 @@ Group `source` is one of:
 - `config`: declared in `config.toml`, read-only.
 - `idp`: membership derived from a claim value at login. The IdP mapping is
   `(provider, claim value) -> group`, because Entra emits group object IDs, not
-  names. Mapping rows live in config or the DB.
+  names (unless app roles are used, see the Entra recipe in section 5). Mapping
+  rows live in config or the DB.
 - `local`: created in the UI, members added by admins.
 
 Built-in group `authenticated`: every user is a member, so admin-assigned shared
@@ -107,8 +119,8 @@ backends reach all users without per-user work.
 Membership from IdP claims is refreshed at every login. The claim path is
 configurable (`groups`, `roles`, or nested such as `realm_access.roles`).
 Entra groups-overage (more than ~200 groups: no groups claim, a link instead):
-v1 documents using app roles instead; a Graph lookup is a later item (verify the
-exact limit per provider docs).
+the answer is app roles, see the Entra recipe in section 5; a Graph lookup stays
+a later fallback (verify the exact limit per provider docs).
 
 ### Roles and permissions
 
@@ -118,7 +130,7 @@ A role is a named set of permissions. Built-ins:
 | --- | --- |
 | `admin` | all |
 | `backend-admin` | `backends.view`, `backends.manage`, `catalog.manage` |
-| `auditor` | `audit.read`, `backends.view` (read-only views) |
+| `auditor` | `audit.read`, `backends.view` (read-only views; not `audit.read_sensitive`) |
 | `member` | `personal_backends.create`, use granted tools, manage own MCPs and tokens |
 
 Custom roles come in Phase 7.
@@ -135,7 +147,8 @@ Custom roles come in Phase 7.
 | `roles.manage` | custom roles |
 | `service_accounts.manage` | service accounts and their tokens |
 | `tokens.manage_all` | list/revoke any user's tokens |
-| `audit.read` | audit log and usage views |
+| `audit.read` | audit log and usage views (metadata only) |
+| `audit.read_sensitive` | read recorded tool arguments; `admin` has it, `auditor` does not by default; every read is itself audited |
 
 Role bindings: `role -> group | principal`. The bootstrap admin comes from an
 `admin_groups` mapping in config (Phase 1).
@@ -149,6 +162,32 @@ Role bindings: `role -> group | principal`. The bootstrap admin comes from an
 - optional `read_only = true`: only tools whose MCP annotations carry
   `readOnlyHint: true` pass. Tools without the annotation are treated as not
   read-only.
+- optional `mandatory = true` (default `false`): users cannot opt out of it
+  (example: Hindsight memory, a compliance tool).
+
+### Grants vs views
+
+Two layers with different jobs:
+
+- **Grants layer = security.** What a principal is allowed to call. Only admins
+  change it.
+- **View layer = convenience.** What appears in a principal's `tools/list`. It
+  can only narrow, never widen. It consists of per-user opt-outs and toolsets.
+
+Rules:
+
+- Users are opted in automatically to every backend granted to their groups and
+  can opt out per backend and per tool.
+- An opt-out is not a deny: the user can opt back in at any time. Opt-outs never
+  show up in the explain view as denials; they appear as "hidden by you".
+- Grants marked `mandatory` cannot be opted out of.
+- A toolset is a named subset of tools (view layer, filters after grants).
+  Admins define shared toolsets ("coding", "ops"); users define their own; a PAT
+  may pin one. Config `[[toolsets]]` (`ToolGroupConfig` renamed) routes at
+  `/mcp/toolset/{name}`; `[[groups]]` and `/mcp/group/{name}` stay as deprecated
+  aliases for one minor release. The name changed because "groups" now means RBAC
+  groups. The user's opt-outs are their default view.
+- Opt-out, opt-in and toolset changes trigger `notifications/tools/list_changed`.
 
 ### Evaluation
 
@@ -161,7 +200,11 @@ Role bindings: `role -> group | principal`. The bootstrap admin comes from an
   token loses it at once (policy is evaluated per request, not baked into the
   token).
 - Multi-user mode is deny-by-default: no grant, no tool.
-- Tool groups (`/mcp/group/{name}`) are a further filter applied after policy.
+- Final `tools/list` = policy (grants intersected with the PAT scope), minus the
+  user's opt-outs (except `mandatory` grants), filtered by the selected toolset.
+- `tools/call` enforcement uses the grants layer, but a tool hidden by the view
+  is also rejected, with a clear error ("hidden by your view, re-enable it"), so
+  agents do not call tools the user removed. Re-enabling it needs no admin.
 
 ## 5. Authentication
 
@@ -198,6 +241,27 @@ group = "engineering"
   RP-initiated logout.
 - CSRF token on all forms, in addition to the existing Sec-Fetch-Site/Origin
   middleware.
+
+### Provider recipes
+
+The mechanism stays generic OIDC; recipes only say what to configure at the IdP.
+
+**Entra ID (work IdP).**
+
+- Define app roles (for example `axon.admin`, `axon.it`, `axon.sales`) on the
+  app registration and assign Entra groups to them. Set `groups_claim = "roles"`:
+  the values are readable names, so no GUID mapping and no groups-overage.
+- Alternative: `groupMembershipClaims = ApplicationGroup` limits the `groups`
+  claim to groups assigned to the app (GUIDs, so `group_map` is needed).
+- Use the single-tenant v2 issuer `https://login.microsoftonline.com/{tenant-id}/v2.0`;
+  the multi-tenant `common` endpoint fails strict issuer validation.
+- Phase 7 resource-server mode needs "Expose an API" (the app ID URI is the
+  audience) and v2 access tokens in the manifest (`api.requestedAccessTokenVersion: 2`
+  in the Microsoft Graph manifest, `accessTokenAcceptedVersion: 2` in the
+  legacy one).
+
+**Keycloak:** `groups_claim = "realm_access.roles"`, or add a groups mapper and use
+`groups`. **PocketID:** the `groups` claim.
 
 ### Agents, phase A: PATs and service accounts
 
@@ -247,9 +311,13 @@ allowed only in standalone mode and logs a warning at startup.
 
 ### Scopes
 
-- **shared**: declared in config or created by an admin.
-- **personal**: owned by a user, visible only to them. Sharing a personal backend
-  with groups the owner belongs to is a possible later feature (open question).
+- **shared**: declared in config or created by an admin. Only admins create
+  shared backends, and they grant them to IdP-mapped groups.
+- **personal**: owned by a user, visible only to them. Personal backends cannot be
+  shared with groups.
+
+Example grants: IT gets `forgejo`, `prom`, `loki`; Sales gets `crm`; everyone
+(via `authenticated`) gets `hindsight`. A user in several groups gets the union.
 
 ### Credential modes (per backend)
 
@@ -315,22 +383,50 @@ src/crypto/       # envelope encryption, token hashing
   instances spawn lazily on first use and stop after an idle timeout; caps on
   concurrent per-user actors.
 - **tools/list per principal**: shared registry view plus personal backends,
-  filtered by policy. Tool groups are a further filter, never a bypass.
+  filtered by policy. Opt-outs and toolsets are a further view filter, never a
+  bypass.
 - **MCP transport**: replace the hand-rolled JSON-RPC handler and the SSE stub
   with spec-compliant Streamable HTTP (rmcp server side), so
   `notifications/tools/list_changed` (on grant or backend change), progress and
   cancellation reach clients.
 - **Horizontal scaling**: sessions are stateless or sticky; durable state lives
   in Postgres; config/grant changes fan out across replicas via LISTEN/NOTIFY.
-  Rate limits stay per-instance in v1 (documented), shared later.
+  Rate limits are shared; see "Kubernetes / multi-replica" below.
 - **Admin JSON API** `/api/v1/...` is the single write path. The HTMX UI and a
   future CLI call the same service layer. Writes to config-managed objects
   return 409.
 - **UI pages**: Login (provider picker); My tools (effective tools and why:
   which group/grant), My MCP servers, My tokens, Catalog. Admin: Shared
   backends, Catalog, Users, Groups and IdP mappings, Roles, Service accounts,
-  Audit log, Gateway settings. A "why can/can't I use this tool" explain view is
-  valuable for support.
+  Audit log, Gateway settings. My tools also holds the opt-outs and toolsets. A
+  "why can/can't I use this tool" explain view is valuable for support.
+
+### Kubernetes / multi-replica
+
+The work deployment is Kubernetes with 3 replicas.
+
+- **Sessions.** MCP Streamable HTTP sessions are pod-local. The ingress hashes
+  on the `Mcp-Session-Id` header (nginx-ingress `upstream-hash-by`) as the
+  default; keep handlers stateless where possible.
+- **Backend connections.** Every pod holds its own backend connections and runs
+  its own health checks: 3x connections and pings to backends. Fine for HTTP;
+  stdio servers are spawned per pod, which matters only for stateful servers.
+- **Rate limits** must be shared: Postgres-backed counters, replacing the
+  per-instance limiter. Allowed interim: the limit divided by the replica count,
+  documented.
+- **Singleton jobs** (audit and argument retention, token expiry,
+  inactive-user suspension) run under a Postgres advisory lock. sqlx migrations
+  already take a lock.
+- **ConfigMap hot reload.** The kubelet swaps a `..data` symlink, so the watcher
+  must watch the config directory, not the file. `src/watcher.rs` already
+  watches the parent directory, but its callback keeps only events whose path
+  file name equals the config file name, which drops the `..data` swap events;
+  extend the filter to accept `..data` (to do, verify in a test with a
+  kubelet-style layout).
+- **Helm chart** (`deploy/helm/axon-gateway/`): Deployment, PodDisruptionBudget,
+  liveness and readiness on `/livez` and `/readyz`, ServiceMonitor, secrets
+  (OIDC client secret, KEK, DB URL) from a k8s Secret or external-secrets.
+  Graceful shutdown drains SSE streams.
 
 ## 8. Observability
 
@@ -350,8 +446,8 @@ src/crypto/       # envelope encryption, token hashing
   labels by default (cardinality); opt-in, and prefer trace exemplars.
 - **Audit log**: append-only Postgres table: who, principal, auth method, token
   id, action, target, tool, outcome, duration, trace id, client IP, user agent.
-  Covers admin actions and tool calls. Tool arguments are not stored by default;
-  configurable `none | hash | redacted` (key denylist) `| full`. Retention job.
+  Covers admin actions and tool calls. Arguments are handled separately (see
+  Audit arguments). Retention job.
   Also emitted as a structured log event (`target = "axon::audit"`) for
   Loki/any SIEM. UI: audit view with filters and a per-user usage page.
 - **Health**: `/livez`; `/readyz` (DB reachable, migrations applied, config
@@ -360,12 +456,40 @@ src/crypto/       # envelope encryption, token hashing
   Prometheus alert rules (backend down, error rate, auth failure spike, DB down,
   OIDC provider unreachable).
 
+### Audit arguments
+
+- Metadata is always recorded: who, principal, auth method, token id, tool,
+  outcome, duration, trace id, client IP, user agent.
+- Arguments go to a separate table `audit_arguments` with its own, shorter
+  retention: default 30 days for arguments, 1 year for metadata, both
+  configurable.
+- Reading arguments requires `audit.read_sensitive` (`admin` has it, `auditor`
+  does not by default). Every read of arguments is itself audited.
+- Default capture follows MCP tool annotations: `destructiveHint: true` ->
+  redacted; `readOnlyHint: true` -> none; no annotation -> redacted. (Verify: the
+  MCP spec defaults `destructiveHint` to true when `readOnlyHint` is false, so
+  unannotated tools count as potentially destructive.)
+- Redaction masks values whose keys match a denylist (password, secret, token,
+  authorization, api_key, cookie, ...) and truncates long values (configurable,
+  for example 2 KiB). Tool results are never stored by default.
+- Admin overrides per backend and per tool glob: `none | redacted | full`, plus
+  per-key drop lists. Examples: `pg*_run_query` = `full` (the query is the
+  evidence); `forgejo_create_file` = `redacted` with `content` dropped.
+  Config-declared overrides are read-only like other config objects.
+- Compliance: GDPR applies (purpose limitation, retention, data-subject
+  requests). In Germany with a works council, per-employee activity logging is a
+  technical system suited to monitoring behaviour, so co-determination under
+  section 87(1) no. 6 BetrVG applies; involve the council before enabling `full`
+  capture.
+
 ## 9. Security checklist
 
 - [ ] Threat model written down (malicious user, compromised PAT, hostile
       personal backend, compromised IdP claim, insider admin).
 - [ ] Rate-limit login, callback and token-mint endpoints.
 - [ ] No secrets, tokens or tool arguments in logs or spans.
+- [ ] Audit arguments: redaction denylist, `audit.read_sensitive` gate, works
+      council and GDPR review before enabling `full`.
 - [ ] CSP header on the UI (no inline script beyond what is hashed/nonced).
 - [ ] Cookie flags (`__Host-`, Secure, HttpOnly, SameSite=Lax); session rotation.
 - [ ] CSRF tokens plus Sec-Fetch-Site/Origin check.
@@ -428,7 +552,14 @@ src/crypto/       # envelope encryption, token hashing
 - [ ] Config layer merged read-only (`source = config`); 409 on write.
 - [ ] IdP group mapping with configurable claim path.
 - [ ] Per-principal `tools/list` and `tools/call` enforcement.
-- [ ] Explain view ("why can/can't I use this tool").
+- [ ] Grants `mandatory` flag; view layer (per-user opt-outs); hidden tools
+      rejected on `tools/call` with a "hidden by your view" error.
+- [ ] Rename `[[groups]]`/`ToolGroupConfig` to `[[toolsets]]`, route
+      `/mcp/toolset/{name}`; keep `[[groups]]` and `/mcp/group/{name}` as
+      deprecated aliases for one minor release.
+- [ ] Explain view ("why can/can't I use this tool"); opt-outs shown as "hidden
+      by you".
+- [ ] "My tools" page with the opt-out UI.
 - [ ] Admin UI for groups and grants; `/api/v1` write path.
 - [ ] Audit log for admin actions.
 - Exit: two users with different groups see and can call different tools.
@@ -441,7 +572,9 @@ src/crypto/       # envelope encryption, token hashing
 - [ ] Legacy `auth_token` / `[[tokens]]` mapped to config service accounts;
       deprecation warning.
 - [ ] Deprovisioning rules (inactivity, disabled user).
-- [ ] Tool-call audit.
+- [ ] User-defined toolsets and PAT toolset pinning.
+- [ ] Tool-call audit, with argument capture policy (annotation defaults,
+      overrides), `audit_arguments` table and `audit.read_sensitive`.
 - [ ] Break-glass CLI `axon-gateway admin ...`.
 - Exit: an agent authenticates with a PAT and is limited to its owner's policy
   intersected with its scope.
@@ -449,9 +582,15 @@ src/crypto/       # envelope encryption, token hashing
 ### Phase 4 - Spec-compliant MCP transport
 
 - [ ] Streamable HTTP server side via rmcp.
-- [ ] `notifications/tools/list_changed` on grant/backend changes.
+- [ ] `notifications/tools/list_changed` on grant/backend changes and on opt-out
+      or toolset changes.
 - [ ] Progress and cancellation passthrough.
 - [ ] LISTEN/NOTIFY fan-out; multi-replica notes in the docs.
+- [ ] Shared rate limits (Postgres counters).
+- [ ] Singleton jobs under a Postgres advisory lock (retention, token expiry,
+      inactive-user suspension).
+- [ ] Config watcher accepts the kubelet `..data` symlink swap (directory watch,
+      adjust the file-name filter).
 - [ ] Remove the SSE stub.
 - Exit: a spec-conformant client receives list_changed after a grant change;
   two replicas stay consistent.
@@ -470,7 +609,9 @@ src/crypto/       # envelope encryption, token hashing
 ### Phase 6 - Observability completion
 
 - [ ] New metrics (section 8), pool and OIDC metrics.
-- [ ] Audit UI, retention job, per-user usage page.
+- [ ] Audit UI, retention job (metadata 1 year, arguments 30 days, both
+      configurable), per-user usage page.
+- [ ] Helm chart under `deploy/helm/axon-gateway/` (section 7).
 - [ ] Grafana dashboard and alert rules in `example/observability/`.
 - [ ] `traceparent` propagation to backends and MCP `_meta`.
 - Exit: dashboards and alerts load against a running instance.
@@ -483,7 +624,7 @@ src/crypto/       # envelope encryption, token hashing
 - [ ] Token-exchange passthrough (RFC 8693).
 - [ ] SCIM 2.0.
 - [ ] Custom roles.
-- [ ] Entra groups-overage lookup (if the work IdP needs it).
+- [ ] Entra groups-overage Graph lookup (fallback only; app roles are the default, section 5).
 
 ### Homelab rollout (the user does all deploys)
 
@@ -504,11 +645,8 @@ src/crypto/       # envelope encryption, token hashing
 
 ## 12. Open questions
 
-- Work deployment target: Kubernetes/Helm chart or VM/container, and replica
-  count (drives the rate-limit and session design).
-- Which IdP at work; if Entra, groups-overage work moves up.
-- May personal backends be shared with groups?
-- Tool-argument audit default for compliance (`none`, `hash`, `redacted`, `full`).
 - Per-user Prometheus labels: allow at all?
-- Do `/mcp/group/{name}` tool groups stay, or fold into grants?
 - Minimum supported MCP protocol version.
+- Are stdio backends allowed at all on Kubernetes, or only HTTP sidecars and
+  services?
+- Should the rate-limit store move off Postgres if it becomes hot?
