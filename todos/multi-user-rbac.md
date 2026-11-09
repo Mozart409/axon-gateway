@@ -30,6 +30,8 @@ Goals:
 - Spec-compliant MCP transport (notifications, progress, cancellation).
 - OpenTelemetry, Prometheus, audit log, health endpoints suitable for operations.
 - Safe by default: SSRF guard, stdio admin-only, encrypted secrets, hashed tokens.
+- Good defaults over config options: a knob is added only when a real
+  deployment needs it.
 
 Non-goals:
 
@@ -87,8 +89,14 @@ Non-goals:
 | 19 | Audit metadata is always recorded; arguments go to a separate `audit_arguments` table with shorter retention (default 30 days, metadata 1 year) | Arguments are the sensitive part and need their own lifetime |
 | 20 | Reading arguments needs `audit.read_sensitive` (not part of `auditor`); every read is audited | Separation of duties |
 | 21 | Default argument capture follows MCP tool annotations: `readOnlyHint: true` none, otherwise redacted; admins override per backend and tool glob | Safe default, evidence where it matters |
-| 22 | Work deployment is Kubernetes with 3 replicas: ingress hashes on `Mcp-Session-Id`, rate limits live in Postgres, singleton jobs run under an advisory lock | Pod-local MCP sessions, shared limits (see 7) |
+| 22 | Work deployment is Kubernetes with 3 replicas: the 2026-07-28 path is stateless, ingress hashes on `Mcp-Session-Id` only for older clients, rate limits live in Postgres, singleton jobs run under an advisory lock | Pod-local sessions for old clients only, shared limits (see 7) |
 | 23 | The work IdP is Entra ID through the generic OIDC path; app roles carry the groups | No provider-specific code, no groups-overage (see 5) |
+| 24 | Good defaults over config options; a knob is added only when a real deployment needs it | Fewer settings to document, test and get wrong |
+| 25 | No stdio backends on Kubernetes: axon refuses to start with one when `KUBERNETES_SERVICE_HOST` is set; stdio-only servers run as their own Deployment behind a stdio-to-HTTP bridge and are added as HTTP backends | stdio is code execution in the pod and pod-local; no config switch needed |
+| 26 | Prometheus gets one per-user counter, `axon_user_tool_calls_total{user, backend, outcome}`, with the internal user UUID and no option; no `tool` label on it, no user label on histograms; per-user latency comes from traces | Cardinality: 300 users x 200 tools x ~12 buckets is about 720k series |
+| 27 | MCP versions: clients 2025-06-18, 2025-11-25, 2026-07-28; backends every version rmcp knows; stateless-first around 2026-07-28 | See "Protocol versions" in 7 |
+| 28 | Rate limits stay in Postgres as shared counters for now | No extra infrastructure; revisit if they show up in database load (see 12) |
+| 29 | One shared instance per backend with a shared credential; per-user instances only for `per_user` and personal backends | Identity is enforced in axon before the call, so per-user connections would only multiply connections (see "Backend instances" in 7) |
 
 ## 4. Domain model
 
@@ -187,6 +195,7 @@ Rules:
   `/mcp/toolset/{name}`; `[[groups]]` and `/mcp/group/{name}` stay as deprecated
   aliases for one minor release. The name changed because "groups" now means RBAC
   groups. The user's opt-outs are their default view.
+- Hidden tools are absent from `tools/list`, so a harness never sees them.
 - Opt-out, opt-in and toolset changes trigger `notifications/tools/list_changed`.
 
 ### Evaluation
@@ -202,9 +211,11 @@ Rules:
 - Multi-user mode is deny-by-default: no grant, no tool.
 - Final `tools/list` = policy (grants intersected with the PAT scope), minus the
   user's opt-outs (except `mandatory` grants), filtered by the selected toolset.
-- `tools/call` enforcement uses the grants layer, but a tool hidden by the view
-  is also rejected, with a clear error ("hidden by your view, re-enable it"), so
-  agents do not call tools the user removed. Re-enabling it needs no admin.
+- `tools/call` enforcement uses the grants layer, and a tool hidden by the view
+  is also rejected. The rejection is the standard unknown-tool error, exactly as
+  for a tool that does not exist: hidden must look like absent, with no special
+  case. It only catches clients that use a stale cached list. Re-enabling a
+  hidden tool needs no admin.
 
 ## 5. Authentication
 
@@ -378,17 +389,14 @@ src/crypto/       # envelope encryption, token hashing
 - **Policy engine** replaces AuthManager's ad-hoc checks:
   `Authorizer::effective_policy(principal) -> Policy`, cached (moka) by
   principal and policy version; invalidated on grant/group/role changes.
-- **Registry becomes multi-scope**: instances keyed by
-  `(backend id, credential owner)`. Shared instances as today; per-user
-  instances spawn lazily on first use and stop after an idle timeout; caps on
-  concurrent per-user actors.
 - **tools/list per principal**: shared registry view plus personal backends,
   filtered by policy. Opt-outs and toolsets are a further view filter, never a
   bypass.
 - **MCP transport**: replace the hand-rolled JSON-RPC handler and the SSE stub
   with spec-compliant Streamable HTTP (rmcp server side), so
   `notifications/tools/list_changed` (on grant or backend change), progress and
-  cancellation reach clients.
+  cancellation reach clients. Versions and statelessness: see "Protocol
+  versions" below.
 - **Horizontal scaling**: sessions are stateless or sticky; durable state lives
   in Postgres; config/grant changes fan out across replicas via LISTEN/NOTIFY.
   Rate limits are shared; see "Kubernetes / multi-replica" below.
@@ -401,19 +409,62 @@ src/crypto/       # envelope encryption, token hashing
   Audit log, Gateway settings. My tools also holds the opt-outs and toolsets. A
   "why can/can't I use this tool" explain view is valuable for support.
 
+### Protocol versions
+
+- **Client-facing:** accept 2025-06-18, 2025-11-25 and 2026-07-28. The minimum
+  is 2025-06-18, the first revision with the OAuth resource-server model
+  (RFC 9728) that Phase 7 builds on.
+- **Backend-facing:** every version rmcp knows, including 2024-11-05, because
+  axon does not control backends. rmcp 3.9 knows exactly five versions
+  (`ProtocolVersion::KNOWN_VERSIONS`): 2024-11-05, 2025-03-26, 2025-06-18,
+  2025-11-25, 2026-07-28.
+- **Stateless-first:** build the new transport around 2026-07-28, which drops
+  the `initialize` handshake (SEP-2567; lifecycle data goes in each request's
+  `_meta`). With no session state, any pod serves any request. `Mcp-Session-Id`
+  ingress affinity is needed only for pre-2026-07-28 clients.
+- **Standard headers:** SEP-2243 (`Mcp-Method`, `Mcp-Name`, from 2026-07-28) lets
+  the ingress, the rate limiter and metrics see the method and tool without
+  parsing the body. Axon emits and consumes them.
+
+### Backend instances
+
+- A backend with a shared credential (for example Prometheus with one service
+  token) has ONE instance per pod, shared by all users. Identity and permissions
+  are enforced in axon before the call, so per-user connections would only
+  multiply connections and health checks.
+- Per-user instances exist only for `per_user`-credential backends and personal
+  backends. They start on first use and stop after an idle timeout (default 10
+  minutes, fixed); caps on concurrent per-user instances apply.
+- Shared backends stay connected and health-checked by default, so backend-down
+  alerts keep working. An optional per-backend `idle_disconnect_secs` lets one
+  scale to zero. Its tool definitions stay cached, so `tools/list` needs no live
+  connection, the first call pays the connect cost, and the UI and metrics show
+  state `idle` (not down).
+- **Existing bug (Phase 0):** `BackendActor`'s `CallTool` handler awaits
+  `call_tool` inside the message handler (`src/backend.rs` around line 838).
+  kameo processes one message at a time, so all calls to a backend are
+  serialized and one slow call (for example a long `prom_query_range`) blocks
+  every other user. Fix: the actor owns only the connection lifecycle (connect,
+  reconnect, health, circuit breaker). Calls run concurrently on a cloned rmcp
+  peer handle (`rmcp::Peer` is `Clone`: an mpsc sender plus `Arc`s), capped by a per-backend
+  semaphore (fixed default, for example 32 in flight). Circuit-breaker
+  accounting still updates from call outcomes.
+
 ### Kubernetes / multi-replica
 
 The work deployment is Kubernetes with 3 replicas.
 
-- **Sessions.** MCP Streamable HTTP sessions are pod-local. The ingress hashes
-  on the `Mcp-Session-Id` header (nginx-ingress `upstream-hash-by`) as the
-  default; keep handlers stateless where possible.
+- **Sessions.** The 2026-07-28 path is stateless, so any pod serves any
+  request. Sessions for older clients are pod-local: the ingress hashes on the
+  `Mcp-Session-Id` header (nginx-ingress `upstream-hash-by`) for them only.
 - **Backend connections.** Every pod holds its own backend connections and runs
   its own health checks: 3x connections and pings to backends. Fine for HTTP;
-  stdio servers are spawned per pod, which matters only for stateful servers.
+  there are no stdio backends on Kubernetes: axon refuses to start with one
+  when `KUBERNETES_SERVICE_HOST` is set (no config switch). A stdio-only MCP
+  server runs as its own Deployment behind a stdio-to-HTTP bridge and is added
+  as an HTTP backend.
 - **Rate limits** must be shared: Postgres-backed counters, replacing the
-  per-instance limiter. Allowed interim: the limit divided by the replica count,
-  documented.
+  per-instance limiter.
 - **Singleton jobs** (audit and argument retention, token expiry,
   inactive-user suspension) run under a Postgres advisory lock. sqlx migrations
   already take a lock.
@@ -442,8 +493,13 @@ The work deployment is Kubernetes with 3 replicas.
 - **Metrics**: keep existing `axon_*` names. Add `axon_authn_total{method,result}`,
   `axon_authz_denied_total{reason}`, `axon_active_sessions`,
   `axon_user_backends{state}`, `axon_tokens_active`, principal-type labels,
-  database pool metrics, OIDC provider latency/errors. No user id on Prometheus
-  labels by default (cardinality); opt-in, and prefer trace exemplars.
+  database pool metrics, OIDC provider latency/errors,
+  `axon_backend_inflight_calls{backend}`.
+- **Per-user metric:** one counter, `axon_user_tool_calls_total{user, backend,
+  outcome}`, where `user` is the stable internal axon user id (UUID); there is no
+  option for it. No `tool` label on it and no user label on histograms, for
+  cardinality (300 users x 200 tools x ~12 buckets is about 720k series).
+  Per-user latency comes from traces.
 - **Audit log**: append-only Postgres table: who, principal, auth method, token
   id, action, target, tool, outcome, duration, trace id, client IP, user agent.
   Covers admin actions and tool calls. Arguments are handled separately (see
@@ -530,6 +586,11 @@ The work deployment is Kubernetes with 3 replicas.
       wire `axon-ci`.
 - [ ] Extract `authz/` policy engine from `AuthManager` with current semantics
       and tests.
+- [ ] Fix `BackendActor` call serialization (`src/backend.rs` ~838): the actor
+      owns only the connection lifecycle; calls run concurrently on a cloned
+      rmcp peer, capped by a per-backend semaphore (fixed, ~32 in flight);
+      circuit-breaker accounting still updates from outcomes. Test: two slow
+      calls to one backend run in parallel.
 - [ ] OTel tracing foundation (`[telemetry]`, OTLP exporter, request spans).
 - [ ] `/livez`, `/readyz`; keep `/health`.
 - Exit: all existing tests pass unchanged; no `[database]` means identical
@@ -553,7 +614,8 @@ The work deployment is Kubernetes with 3 replicas.
 - [ ] IdP group mapping with configurable claim path.
 - [ ] Per-principal `tools/list` and `tools/call` enforcement.
 - [ ] Grants `mandatory` flag; view layer (per-user opt-outs); hidden tools
-      rejected on `tools/call` with a "hidden by your view" error.
+      rejected on `tools/call` with the standard unknown-tool error (hidden looks
+      like absent).
 - [ ] Rename `[[groups]]`/`ToolGroupConfig` to `[[toolsets]]`, route
       `/mcp/toolset/{name}`; keep `[[groups]]` and `/mcp/group/{name}` as
       deprecated aliases for one minor release.
@@ -581,7 +643,13 @@ The work deployment is Kubernetes with 3 replicas.
 
 ### Phase 4 - Spec-compliant MCP transport
 
-- [ ] Streamable HTTP server side via rmcp.
+- [ ] Streamable HTTP server side via rmcp: stateless 2026-07-28 path first
+      (no `initialize`, lifecycle data in `_meta`), session path for older
+      clients; accept 2025-06-18, 2025-11-25, 2026-07-28 from clients.
+- [ ] Emit and consume SEP-2243 headers (`Mcp-Method`, `Mcp-Name`); rate limiter
+      and metrics read them instead of parsing the body.
+- [ ] Refuse to start with a stdio backend when `KUBERNETES_SERVICE_HOST` is set;
+      document the stdio-to-HTTP bridge Deployment pattern.
 - [ ] `notifications/tools/list_changed` on grant/backend changes and on opt-out
       or toolset changes.
 - [ ] Progress and cancellation passthrough.
@@ -600,7 +668,10 @@ The work deployment is Kubernetes with 3 replicas.
 - [ ] Personal backends with namespacing rules.
 - [ ] Egress policy and SSRF guard; stdio admin-only.
 - [ ] `crypto/` envelope encryption, `AXON_KEK_FILE`, KEK rotation.
-- [ ] Per-user backend actors with idle stop and caps.
+- [ ] Per-user backend instances (`per_user` and personal only) with idle stop
+      (10 minutes, fixed) and caps.
+- [ ] Optional per-backend `idle_disconnect_secs` for shared backends: cached
+      tool definitions, connect on first call, state `idle` in UI and metrics.
 - [ ] Catalog and `per_user` credentials.
 - [ ] Per-user quotas.
 - Exit: a user adds a personal HTTP MCP and a catalog backend with their own
@@ -608,7 +679,9 @@ The work deployment is Kubernetes with 3 replicas.
 
 ### Phase 6 - Observability completion
 
-- [ ] New metrics (section 8), pool and OIDC metrics.
+- [ ] New metrics (section 8), including `axon_user_tool_calls_total{user,
+      backend, outcome}` and `axon_backend_inflight_calls{backend}`; pool and
+      OIDC metrics.
 - [ ] Audit UI, retention job (metadata 1 year, arguments 30 days, both
       configurable), per-user usage page.
 - [ ] Helm chart under `deploy/helm/axon-gateway/` (section 7).
@@ -643,10 +716,7 @@ The work deployment is Kubernetes with 3 replicas.
   upgrade path.
 - [ ] Update GOALS.md, README and AGENTS.md as each phase lands.
 
-## 12. Open questions
+## 12. Revisit later
 
-- Per-user Prometheus labels: allow at all?
-- Minimum supported MCP protocol version.
-- Are stdio backends allowed at all on Kubernetes, or only HTTP sidecars and
-  services?
-- Should the rate-limit store move off Postgres if it becomes hot?
+- Move rate-limit counters to Valkey/Redis (GCRA in an atomic Lua script) if
+  they show up in database load.
