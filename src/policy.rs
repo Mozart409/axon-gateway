@@ -1,7 +1,9 @@
-//! RBAC policy: groups, tool grants and the view layer
+//! RBAC policy: groups, roles, tool grants and the view layer
 //!
-//! Pure logic, no I/O. [`RbacConfig`] is the config layer; [`Policy`] compiles it
-//! and maps a login to groups; [`EffectivePolicy`] is the allow-only union of the
+//! Pure logic, no I/O. [`RbacConfig`] is the config layer and [`RbacSnapshot`] the
+//! rows the database manages; [`Policy`] merges both (config wins on a name clash),
+//! maps a login to groups and a user to [`Permissions`] (built-in [`Role`]s and the
+//! [`Permission`]s they carry); [`EffectivePolicy`] is the allow-only union of the
 //! grants of a user's groups and decides what a tool call may do. [`OptOuts`] is
 //! the view layer: it only narrows what [`EffectivePolicy::visible`] shows and
 //! never denies anything.
@@ -11,7 +13,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::authz::tool_matches_pattern;
 
@@ -31,6 +34,231 @@ pub struct RbacConfig {
     /// `[[rbac.grants]]`: which group may use which backend's tools
     #[serde(default)]
     pub grants: Vec<GrantConfig>,
+    /// `[[rbac.role_bindings]]`: which group holds which role
+    #[serde(default)]
+    pub role_bindings: Vec<RoleBindingConfig>,
+}
+
+/// A built-in role: a named set of [`Permission`]s
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    /// Everything
+    Admin,
+    /// Manages shared backends and the catalog
+    BackendAdmin,
+    /// Reads the audit log and the backend views
+    Auditor,
+    /// Every logged-in user
+    Member,
+}
+
+impl Role {
+    /// Every role, in declaration order
+    pub const ALL: [Role; 4] = [Role::Admin, Role::BackendAdmin, Role::Auditor, Role::Member];
+
+    /// The role's name in config, the API and the database
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::BackendAdmin => "backend-admin",
+            Role::Auditor => "auditor",
+            Role::Member => "member",
+        }
+    }
+
+    /// The role with this name
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.as_str() == value)
+    }
+
+    /// What the role allows
+    pub fn permissions(self) -> &'static [Permission] {
+        match self {
+            Role::Admin => &Permission::ALL,
+            Role::BackendAdmin => &[
+                Permission::BackendsView,
+                Permission::BackendsManage,
+                Permission::CatalogManage,
+            ],
+            Role::Auditor => &[Permission::AuditRead, Permission::BackendsView],
+            Role::Member => &[Permission::PersonalBackendsCreate],
+        }
+    }
+}
+
+/// One thing a role may allow
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Permission {
+    /// Gateway settings, reload, break-glass operations
+    GatewayAdmin,
+    /// See shared backends and their status
+    BackendsView,
+    /// Create, edit and disable shared backends
+    BackendsManage,
+    /// Publish and edit catalog templates
+    CatalogManage,
+    /// Add personal MCP servers
+    PersonalBackendsCreate,
+    /// Disable users, assign roles, see users
+    UsersManage,
+    /// Groups, `IdP` mappings, memberships and grants
+    GroupsManage,
+    /// Custom roles
+    RolesManage,
+    /// Service accounts and their tokens
+    ServiceAccountsManage,
+    /// List and revoke any user's tokens
+    TokensManageAll,
+    /// Audit log and usage views (metadata only)
+    AuditRead,
+    /// Read recorded tool arguments
+    AuditReadSensitive,
+}
+
+impl Permission {
+    /// Every permission, in declaration order
+    pub const ALL: [Permission; 12] = [
+        Permission::GatewayAdmin,
+        Permission::BackendsView,
+        Permission::BackendsManage,
+        Permission::CatalogManage,
+        Permission::PersonalBackendsCreate,
+        Permission::UsersManage,
+        Permission::GroupsManage,
+        Permission::RolesManage,
+        Permission::ServiceAccountsManage,
+        Permission::TokensManageAll,
+        Permission::AuditRead,
+        Permission::AuditReadSensitive,
+    ];
+
+    /// The permission's name in the API and the docs
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::GatewayAdmin => "gateway.admin",
+            Permission::BackendsView => "backends.view",
+            Permission::BackendsManage => "backends.manage",
+            Permission::CatalogManage => "catalog.manage",
+            Permission::PersonalBackendsCreate => "personal_backends.create",
+            Permission::UsersManage => "users.manage",
+            Permission::GroupsManage => "groups.manage",
+            Permission::RolesManage => "roles.manage",
+            Permission::ServiceAccountsManage => "service_accounts.manage",
+            Permission::TokensManageAll => "tokens.manage_all",
+            Permission::AuditRead => "audit.read",
+            Permission::AuditReadSensitive => "audit.read_sensitive",
+        }
+    }
+}
+
+/// Who a role binding applies to
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleSubject {
+    /// Every member of the group
+    Group(String),
+    /// One user
+    User(Uuid),
+}
+
+/// A role granted to a group or a user
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleBinding {
+    /// Database row id; `None` for a binding from config
+    pub id: Option<i64>,
+    /// The role granted
+    pub role: Role,
+    /// Who holds it
+    pub subject: RoleSubject,
+}
+
+/// `[[rbac.role_bindings]]`: a role granted to a group
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoleBindingConfig {
+    /// The role granted
+    pub role: Role,
+    /// A declared group or [`AUTHENTICATED_GROUP`]
+    pub group: String,
+}
+
+/// The database-managed RBAC rows, as the store loads them
+#[derive(Debug, Clone, Default)]
+pub struct RbacSnapshot {
+    /// Database groups with their `IdP` mappings
+    pub groups: Vec<RbacGroupConfig>,
+    /// `(user id, group name)`, database groups only
+    pub memberships: Vec<(Uuid, String)>,
+    /// `(grant id, grant)`
+    pub grants: Vec<(i64, GrantConfig)>,
+    /// Role bindings; `id` is always `Some`
+    pub role_bindings: Vec<RoleBinding>,
+}
+
+/// Where a group, grant or binding is managed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// `config.toml`, read-only
+    Config,
+    /// The dashboard or the API
+    Local,
+}
+
+/// A group as the dashboard lists it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupView {
+    /// Unique name
+    pub name: String,
+    /// Free text shown next to the group
+    pub description: Option<String>,
+    /// Where the group is managed
+    pub source: Source,
+    /// `IdP` claim values whose holders are members
+    pub idp: Vec<IdpMapping>,
+}
+
+/// A grant as the dashboard lists it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantView {
+    /// Database row id; `None` for a grant from config
+    pub id: Option<i64>,
+    /// Where the grant is managed
+    pub source: Source,
+    /// The grant itself
+    pub grant: GrantSummary,
+}
+
+/// The effective roles and permissions of a user
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Permissions {
+    roles: BTreeSet<Role>,
+    permissions: BTreeSet<Permission>,
+}
+
+impl Permissions {
+    fn add(&mut self, role: Role) {
+        self.roles.insert(role);
+        self.permissions.extend(role.permissions());
+    }
+
+    /// Whether some role of the user carries the permission
+    pub fn has(&self, permission: Permission) -> bool {
+        self.permissions.contains(&permission)
+    }
+
+    /// The user's roles, in [`Role`] order
+    pub fn roles(&self) -> impl Iterator<Item = Role> + '_ {
+        self.roles.iter().copied()
+    }
+
+    /// Whether the user holds [`Role::Admin`]
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the admin dashboard uses it next")
+    )]
+    pub fn is_admin(&self) -> bool {
+        self.roles.contains(&Role::Admin)
+    }
 }
 
 /// A group declared in config
@@ -76,11 +304,72 @@ pub struct GrantConfig {
     pub mandatory: bool,
 }
 
-fn valid_group_name(name: &str) -> bool {
-    !name.is_empty()
+/// The name rule for groups from config and the API: `[a-z0-9_-]+`, 1 to 64 characters,
+/// and not [`AUTHENTICATED_GROUP`].
+///
+/// # Errors
+///
+/// Returns a message naming the problem.
+pub fn validate_group_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
         && name
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !valid {
+        return Err(format!(
+            "rbac group name {name:?} must match [a-z0-9_-]+ and be 1 to 64 characters"
+        ));
+    }
+    if name == AUTHENTICATED_GROUP {
+        return Err(format!(
+            "rbac group name {AUTHENTICATED_GROUP:?} is built in and cannot be declared"
+        ));
+    }
+    Ok(())
+}
+
+/// Check one grant: its group is known to the policy, its backend is among `backends`,
+/// `include` is not empty and no pattern is an empty string.
+///
+/// # Errors
+///
+/// Returns a message naming the first problem found.
+pub fn validate_grant(
+    grant: &GrantConfig,
+    policy: &Policy,
+    backends: &[&str],
+) -> Result<(), String> {
+    if !policy.has_group(&grant.group) {
+        return Err(format!(
+            "rbac grant for backend {:?} names unknown group {:?}",
+            grant.backend, grant.group
+        ));
+    }
+    if !backends.contains(&grant.backend.as_str()) {
+        return Err(format!(
+            "rbac grant for group {:?} names unknown backend {:?}",
+            grant.group, grant.backend
+        ));
+    }
+    if grant.include.is_empty() {
+        return Err(format!(
+            "rbac grant for group {:?} on backend {:?} has an empty include list",
+            grant.group, grant.backend
+        ));
+    }
+    if grant
+        .include
+        .iter()
+        .chain(&grant.exclude)
+        .any(|pattern| pattern.trim().is_empty())
+    {
+        return Err(format!(
+            "rbac grant for group {:?} on backend {:?} has an empty tool pattern",
+            grant.group, grant.backend
+        ));
+    }
+    Ok(())
 }
 
 impl RbacConfig {
@@ -92,17 +381,7 @@ impl RbacConfig {
     pub fn validate(&self, backends: &[&str], providers: &[&str]) -> Result<(), String> {
         let mut names: HashSet<&str> = HashSet::new();
         for group in &self.groups {
-            if !valid_group_name(&group.name) {
-                return Err(format!(
-                    "rbac group name {:?} must match [a-z0-9_-]+",
-                    group.name
-                ));
-            }
-            if group.name == AUTHENTICATED_GROUP {
-                return Err(format!(
-                    "rbac group name {AUTHENTICATED_GROUP:?} is built in and cannot be declared"
-                ));
-            }
+            validate_group_name(&group.name)?;
             if !names.insert(group.name.as_str()) {
                 return Err(format!("duplicate rbac group {:?}", group.name));
             }
@@ -132,6 +411,15 @@ impl RbacConfig {
                 return Err(format!(
                     "rbac grant for group {:?} on backend {:?} has an empty include list",
                     grant.group, grant.backend
+                ));
+            }
+        }
+        for binding in &self.role_bindings {
+            if binding.group != AUTHENTICATED_GROUP && !names.contains(binding.group.as_str()) {
+                return Err(format!(
+                    "rbac role binding for role {:?} names unknown group {:?}",
+                    binding.role.as_str(),
+                    binding.group
                 ));
             }
         }
@@ -231,35 +519,130 @@ struct GroupDef {
     name: String,
     description: Option<String>,
     idp: Vec<IdpMapping>,
+    source: Source,
 }
 
-/// Compiled groups and grants
-#[derive(Debug, Clone)]
-pub struct Policy {
-    groups: Vec<GroupDef>,
-    grants: Vec<GrantSummary>,
-}
-
-impl Policy {
-    /// Compile a (validated) config
-    pub fn from_config(config: &RbacConfig) -> Self {
+impl GroupDef {
+    fn new(group: &RbacGroupConfig, source: Source) -> Self {
         Self {
-            groups: config
-                .groups
-                .iter()
-                .map(|group| GroupDef {
-                    name: group.name.clone(),
-                    description: group.description.clone(),
-                    idp: group.idp.clone(),
-                })
-                .collect(),
-            grants: config.grants.iter().map(GrantSummary::from).collect(),
+            name: group.name.clone(),
+            description: group.description.clone(),
+            idp: group.idp.clone(),
+            source,
         }
     }
 
-    /// Groups of a login: [`AUTHENTICATED_GROUP`] plus every config group with an idp
-    /// mapping for this provider whose value is among the claim values. Sorted, deduplicated.
-    pub fn groups_for(&self, provider_id: &str, claim_values: &[String]) -> Vec<String> {
+    fn view(&self) -> GroupView {
+        GroupView {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            source: self.source,
+            idp: self.idp.clone(),
+        }
+    }
+}
+
+/// Compiled groups, memberships, grants and role bindings of config and database
+#[derive(Debug, Clone)]
+pub struct Policy {
+    /// Config groups first, then database groups
+    groups: Vec<GroupDef>,
+    /// Memberships in database groups that exist
+    memberships: Vec<(Uuid, String)>,
+    /// Config grants in config order, then database grants by id
+    grants: Vec<GrantView>,
+    /// Config bindings, then database bindings by id
+    role_bindings: Vec<RoleBinding>,
+}
+
+impl Policy {
+    /// Compile a (validated) config without database rows
+    pub fn from_config(config: &RbacConfig) -> Self {
+        Self::from_parts(config, &RbacSnapshot::default())
+    }
+
+    /// Merge a (validated) config with the database rows. A database group named like a
+    /// config group (or [`AUTHENTICATED_GROUP`]) is ignored: config wins. Memberships of
+    /// groups that do not exist are dropped. Grants and bindings for unknown groups stay
+    /// listed, so an admin can delete them, but never take effect.
+    pub fn from_parts(config: &RbacConfig, db: &RbacSnapshot) -> Self {
+        let mut groups: Vec<GroupDef> = config
+            .groups
+            .iter()
+            .map(|group| GroupDef::new(group, Source::Config))
+            .collect();
+        let mut names: HashSet<String> = groups.iter().map(|group| group.name.clone()).collect();
+        names.insert(AUTHENTICATED_GROUP.to_string());
+        for group in &db.groups {
+            if names.insert(group.name.clone()) {
+                groups.push(GroupDef::new(group, Source::Local));
+            } else {
+                tracing::warn!(
+                    group = %group.name,
+                    "ignoring database rbac group: the name is already taken by a config group"
+                );
+            }
+        }
+
+        let local: HashSet<&str> = groups
+            .iter()
+            .filter(|group| group.source == Source::Local)
+            .map(|group| group.name.as_str())
+            .collect();
+        let memberships = db
+            .memberships
+            .iter()
+            .filter(|(_, group)| local.contains(group.as_str()))
+            .cloned()
+            .collect();
+
+        let mut db_grants: Vec<&(i64, GrantConfig)> = db.grants.iter().collect();
+        db_grants.sort_by_key(|(id, _)| *id);
+        let grants = config
+            .grants
+            .iter()
+            .map(|grant| GrantView {
+                id: None,
+                source: Source::Config,
+                grant: GrantSummary::from(grant),
+            })
+            .chain(db_grants.into_iter().map(|(id, grant)| GrantView {
+                id: Some(*id),
+                source: Source::Local,
+                grant: GrantSummary::from(grant),
+            }))
+            .collect();
+
+        let mut db_bindings = db.role_bindings.clone();
+        db_bindings.sort_by_key(|binding| binding.id);
+        let role_bindings = config
+            .role_bindings
+            .iter()
+            .map(|binding| RoleBinding {
+                id: None,
+                role: binding.role,
+                subject: RoleSubject::Group(binding.group.clone()),
+            })
+            .chain(db_bindings)
+            .collect();
+
+        Self {
+            groups,
+            memberships,
+            grants,
+            role_bindings,
+        }
+    }
+
+    /// Groups of a login: [`AUTHENTICATED_GROUP`], every config or database group with an
+    /// idp mapping for this provider whose value is among the claim values, and every
+    /// database group the user is a member of. Sorted, deduplicated.
+    pub fn groups_for(
+        &self,
+        user_id: Uuid,
+        provider_id: &str,
+        claim_values: &[String],
+    ) -> Vec<String> {
         let mut groups = BTreeSet::new();
         groups.insert(AUTHENTICATED_GROUP.to_string());
         for group in &self.groups {
@@ -270,17 +653,45 @@ impl Policy {
                 groups.insert(group.name.clone());
             }
         }
+        for (member, group) in &self.memberships {
+            if *member == user_id {
+                groups.insert(group.clone());
+            }
+        }
         groups.into_iter().collect()
     }
 
-    /// The union of the grants of the given groups
+    /// Roles and permissions of a user. Everyone is a [`Role::Member`]; `is_admin` (the
+    /// provider's `admin_groups`) adds [`Role::Admin`]; bindings on the user or on one of
+    /// `groups` add theirs.
+    pub fn permissions_for(&self, user_id: Uuid, groups: &[String], is_admin: bool) -> Permissions {
+        let mut permissions = Permissions::default();
+        permissions.add(Role::Member);
+        if is_admin {
+            permissions.add(Role::Admin);
+        }
+        for binding in &self.role_bindings {
+            let applies = match &binding.subject {
+                RoleSubject::User(id) => *id == user_id,
+                RoleSubject::Group(group) => groups.contains(group) && self.has_group(group),
+            };
+            if applies {
+                permissions.add(binding.role);
+            }
+        }
+        permissions
+    }
+
+    /// The union of the grants of the given groups. Grants for unknown groups never apply.
     pub fn effective(&self, groups: &[String]) -> EffectivePolicy {
         EffectivePolicy {
             grants: self
                 .grants
                 .iter()
-                .filter(|grant| groups.contains(&grant.group))
-                .cloned()
+                .filter(|view| {
+                    groups.contains(&view.grant.group) && self.has_group(&view.grant.group)
+                })
+                .map(|view| view.grant.clone())
                 .collect(),
         }
     }
@@ -291,6 +702,50 @@ impl Policy {
             .iter()
             .find(|group| group.name == name)
             .and_then(|group| group.description.as_deref())
+    }
+
+    /// Config groups, then database groups, each sorted by name.
+    /// [`AUTHENTICATED_GROUP`] is not included.
+    pub fn groups(&self) -> Vec<GroupView> {
+        let mut views: Vec<GroupView> = self.groups.iter().map(GroupDef::view).collect();
+        views.sort_by(|a, b| {
+            (a.source == Source::Local, &a.name).cmp(&(b.source == Source::Local, &b.name))
+        });
+        views
+    }
+
+    /// One declared group
+    pub fn group(&self, name: &str) -> Option<GroupView> {
+        self.groups
+            .iter()
+            .find(|group| group.name == name)
+            .map(GroupDef::view)
+    }
+
+    /// Whether the name is a config group, a database group or [`AUTHENTICATED_GROUP`]
+    pub fn has_group(&self, name: &str) -> bool {
+        name == AUTHENTICATED_GROUP || self.groups.iter().any(|group| group.name == name)
+    }
+
+    /// Config grants in config order, then database grants by id
+    pub fn grants(&self) -> Vec<GrantView> {
+        self.grants.clone()
+    }
+
+    /// Config bindings (no id), then database bindings by id
+    pub fn role_bindings(&self) -> Vec<RoleBinding> {
+        self.role_bindings.clone()
+    }
+
+    /// Users that are members of a database group, sorted
+    pub fn members_of(&self, group: &str) -> Vec<Uuid> {
+        self.memberships
+            .iter()
+            .filter(|(_, name)| name == group)
+            .map(|(user, _)| *user)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 }
 
@@ -430,6 +885,14 @@ mod tests {
         }
     }
 
+    fn user() -> Uuid {
+        Uuid::from_u128(1)
+    }
+
+    fn binding(id: Option<i64>, role: Role, subject: RoleSubject) -> RoleBinding {
+        RoleBinding { id, role, subject }
+    }
+
     fn tool<'a>(backend: &'a str, name: &'a str, read_only_hint: bool) -> ToolRef<'a> {
         ToolRef {
             backend,
@@ -450,6 +913,7 @@ mod tests {
                 grant("it", "prometheus", &["*"], &[]),
                 grant("dev", "forgejo", &["get_*"], &[]),
             ],
+            role_bindings: Vec::new(),
         };
         let both = effective(&config, &["it", "dev"]);
         assert!(both.allows(tool("prometheus", "query", false)));
@@ -468,6 +932,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[])],
             grants: vec![grant("it", "prometheus", &["*"], &[])],
+            role_bindings: Vec::new(),
         };
         let nobody = effective(&config, &[]);
         assert!(!nobody.allows(tool("prometheus", "query", true)));
@@ -488,6 +953,7 @@ mod tests {
                 grant("it", "prometheus", &["*"], &["delete_*"]),
                 grant("ops", "prometheus", &["delete_series"], &[]),
             ],
+            role_bindings: Vec::new(),
         };
         let it = effective(&config, &["it"]);
         assert!(it.allows(tool("prometheus", "query", false)));
@@ -505,6 +971,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[])],
             grants: vec![read_only],
+            role_bindings: Vec::new(),
         };
         let it = effective(&config, &["it"]);
         assert!(it.allows(tool("prometheus", "query", true)));
@@ -518,6 +985,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[])],
             grants: vec![read_only, grant("it", "prometheus", &["*"], &[])],
+            role_bindings: Vec::new(),
         };
         assert!(!effective(&config, &["authenticated"]).allows(tool(
             "prometheus",
@@ -538,6 +1006,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[])],
             grants: vec![mandatory, grant("it", "hindsight", &["forget"], &[])],
+            role_bindings: Vec::new(),
         };
         let it = effective(&config, &["authenticated", "it"]);
         assert!(it.is_mandatory(tool("hindsight", "recall", false)));
@@ -561,6 +1030,7 @@ mod tests {
                 read_only,
                 grant("it", "forgejo", &["*"], &[]),
             ],
+            role_bindings: Vec::new(),
         };
         let policy = effective(&config, &["it", "dev", "ops"]);
 
@@ -595,6 +1065,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[])],
             grants: vec![grant("it", "prometheus", &["*"], &[])],
+            role_bindings: Vec::new(),
         };
         let explanation = effective(&config, &["it"]).explain(tool("forgejo", "get_repo", true));
         assert_eq!(explanation.allowed_by, Vec::<GrantSummary>::new());
@@ -608,6 +1079,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[])],
             grants: vec![read_only],
+            role_bindings: Vec::new(),
         };
         let it = effective(&config, &["it"]);
         for name in ["get_a", "list_b", "list_secret", "other"] {
@@ -626,19 +1098,27 @@ mod tests {
                 group("manual", &[]),
             ],
             grants: Vec::new(),
+            role_bindings: Vec::new(),
         }
     }
 
     #[test]
     fn groups_for_always_contains_authenticated() {
         let policy = Policy::from_config(&login_config());
-        assert_eq!(policy.groups_for("entra", &[]), strings(&["authenticated"]));
         assert_eq!(
-            policy.groups_for("entra", &strings(&["unknown"])),
+            policy.groups_for(user(), "entra", &[]),
             strings(&["authenticated"])
         );
         assert_eq!(
-            Policy::from_config(&RbacConfig::default()).groups_for("entra", &strings(&["x"])),
+            policy.groups_for(user(), "entra", &strings(&["unknown"])),
+            strings(&["authenticated"])
+        );
+        assert_eq!(
+            Policy::from_config(&RbacConfig::default()).groups_for(
+                user(),
+                "entra",
+                &strings(&["x"])
+            ),
             strings(&["authenticated"])
         );
     }
@@ -648,15 +1128,15 @@ mod tests {
         let policy = Policy::from_config(&login_config());
         // "id-it" is mapped for entra to "it" and for github to "dev"
         assert_eq!(
-            policy.groups_for("entra", &strings(&["id-it"])),
+            policy.groups_for(user(), "entra", &strings(&["id-it"])),
             strings(&["authenticated", "it"])
         );
         assert_eq!(
-            policy.groups_for("github", &strings(&["id-it"])),
+            policy.groups_for(user(), "github", &strings(&["id-it"])),
             strings(&["authenticated", "dev"])
         );
         assert_eq!(
-            policy.groups_for("other", &strings(&["id-it", "id-dev"])),
+            policy.groups_for(user(), "other", &strings(&["id-it", "id-dev"])),
             strings(&["authenticated"])
         );
     }
@@ -667,6 +1147,7 @@ mod tests {
         // two claim values map to "it": one entry only
         assert_eq!(
             policy.groups_for(
+                user(),
                 "entra",
                 &strings(&["id-it", "id-admins", "id-dev", "id-dev"])
             ),
@@ -681,6 +1162,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![it, group("dev", &[])],
             grants: Vec::new(),
+            role_bindings: Vec::new(),
         };
         let policy = Policy::from_config(&config);
         assert_eq!(policy.group_description("it"), Some("IT staff"));
@@ -696,6 +1178,7 @@ mod tests {
                 grant("it", "prometheus", &["*"], &[]),
                 grant("it", "forgejo", &["*"], &[]),
             ],
+            role_bindings: Vec::new(),
         };
         let it = effective(&config, &["it"]);
         let opt_outs = OptOuts::new([
@@ -719,6 +1202,7 @@ mod tests {
         let config = RbacConfig {
             groups: Vec::new(),
             grants: vec![mandatory, grant("authenticated", "hindsight", &["*"], &[])],
+            role_bindings: Vec::new(),
         };
         let policy = effective(&config, &["authenticated"]);
         let opt_outs = OptOuts::new([("hindsight".to_string(), None)]);
@@ -751,6 +1235,7 @@ mod tests {
                 grant("it", "prometheus", &["*"], &[]),
                 grant("authenticated", "forgejo", &["*"], &[]),
             ],
+            role_bindings: Vec::new(),
         }
     }
 
@@ -775,6 +1260,7 @@ mod tests {
             let config = RbacConfig {
                 groups: vec![group(name, &[])],
                 grants: Vec::new(),
+                role_bindings: Vec::new(),
             };
             assert!(validate_err(&config).contains("[a-z0-9_-]+"), "{name:?}");
         }
@@ -785,6 +1271,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[]), group("it", &[])],
             grants: Vec::new(),
+            role_bindings: Vec::new(),
         };
         assert!(validate_err(&config).contains("duplicate"));
     }
@@ -794,6 +1281,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group(AUTHENTICATED_GROUP, &[])],
             grants: Vec::new(),
+            role_bindings: Vec::new(),
         };
         assert!(validate_err(&config).contains("built in"));
     }
@@ -825,6 +1313,7 @@ mod tests {
         let config = RbacConfig {
             groups: vec![group("it", &[("okta", "x")])],
             grants: Vec::new(),
+            role_bindings: Vec::new(),
         };
         assert!(validate_err(&config).contains("no [[auth.oidc]] provider with id okta"));
         // an empty provider list is an error too
@@ -909,5 +1398,490 @@ mod tests {
         let rbac: RbacConfig = toml::from_str("").unwrap();
         assert!(rbac.groups.is_empty());
         assert!(rbac.grants.is_empty());
+    }
+
+    #[test]
+    fn role_permission_sets() {
+        assert_eq!(Role::Admin.permissions().len(), 12);
+        for permission in Permission::ALL {
+            assert!(Role::Admin.permissions().contains(&permission));
+        }
+        assert_eq!(
+            Role::BackendAdmin.permissions(),
+            [
+                Permission::BackendsView,
+                Permission::BackendsManage,
+                Permission::CatalogManage
+            ]
+        );
+        assert_eq!(
+            Role::Auditor.permissions(),
+            [Permission::AuditRead, Permission::BackendsView]
+        );
+        assert_eq!(
+            Role::Member.permissions(),
+            [Permission::PersonalBackendsCreate]
+        );
+        assert!(
+            !Role::Auditor
+                .permissions()
+                .contains(&Permission::AuditReadSensitive)
+        );
+    }
+
+    #[test]
+    fn role_and_permission_names_round_trip() {
+        for role in Role::ALL {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(Role::BackendAdmin.as_str(), "backend-admin");
+        assert_eq!(Role::parse("Admin"), None);
+        assert_eq!(Role::parse(""), None);
+        assert_eq!(
+            Permission::AuditReadSensitive.as_str(),
+            "audit.read_sensitive"
+        );
+        assert_eq!(
+            Permission::PersonalBackendsCreate.as_str(),
+            "personal_backends.create"
+        );
+        let names: HashSet<&str> = Permission::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names.len(), 12);
+    }
+
+    #[test]
+    fn role_deserializes_from_kebab_case() {
+        #[derive(Deserialize)]
+        struct Root {
+            role: Role,
+        }
+        let root: Root = toml::from_str(r#"role = "backend-admin""#).unwrap();
+        assert_eq!(root.role, Role::BackendAdmin);
+        for role in Role::ALL {
+            let root: Root = toml::from_str(&format!("role = {:?}", role.as_str())).unwrap();
+            assert_eq!(root.role, role);
+        }
+        assert!(toml::from_str::<Root>(r#"role = "root""#).is_err());
+        assert!(toml::from_str::<Root>(r#"role = "BackendAdmin""#).is_err());
+    }
+
+    fn roles_of(permissions: &Permissions) -> Vec<Role> {
+        permissions.roles().collect()
+    }
+
+    #[test]
+    fn a_plain_user_is_only_a_member() {
+        let policy = Policy::from_config(&RbacConfig::default());
+        let permissions = policy.permissions_for(user(), &strings(&["authenticated"]), false);
+        assert_eq!(roles_of(&permissions), vec![Role::Member]);
+        assert!(permissions.has(Permission::PersonalBackendsCreate));
+        assert!(!permissions.has(Permission::AuditRead));
+        assert!(!permissions.is_admin());
+    }
+
+    #[test]
+    fn admin_flag_adds_the_admin_role() {
+        let policy = Policy::from_config(&RbacConfig::default());
+        let permissions = policy.permissions_for(user(), &[], true);
+        assert_eq!(roles_of(&permissions), vec![Role::Admin, Role::Member]);
+        assert!(permissions.is_admin());
+        for permission in Permission::ALL {
+            assert!(permissions.has(permission));
+        }
+    }
+
+    #[test]
+    fn a_binding_on_a_group_applies_to_its_members_only() {
+        let config = RbacConfig {
+            groups: vec![group("it-sec", &[("entra", "id-sec")]), group("dev", &[])],
+            grants: Vec::new(),
+            role_bindings: vec![RoleBindingConfig {
+                role: Role::Auditor,
+                group: "it-sec".to_string(),
+            }],
+        };
+        let policy = Policy::from_config(&config);
+
+        let groups = policy.groups_for(user(), "entra", &strings(&["id-sec"]));
+        let permissions = policy.permissions_for(user(), &groups, false);
+        assert_eq!(roles_of(&permissions), vec![Role::Auditor, Role::Member]);
+        assert!(permissions.has(Permission::AuditRead));
+        assert!(permissions.has(Permission::BackendsView));
+        assert!(!permissions.has(Permission::AuditReadSensitive));
+
+        // a group the user is not in has no effect
+        let groups = policy.groups_for(user(), "entra", &[]);
+        let permissions = policy.permissions_for(user(), &groups, false);
+        assert_eq!(roles_of(&permissions), vec![Role::Member]);
+        let permissions = policy.permissions_for(user(), &strings(&["dev"]), false);
+        assert_eq!(roles_of(&permissions), vec![Role::Member]);
+    }
+
+    #[test]
+    fn a_binding_on_a_user_applies_to_that_user() {
+        let other = Uuid::from_u128(2);
+        let db = RbacSnapshot {
+            role_bindings: vec![binding(
+                Some(1),
+                Role::BackendAdmin,
+                RoleSubject::User(user()),
+            )],
+            ..RbacSnapshot::default()
+        };
+        let policy = Policy::from_parts(&RbacConfig::default(), &db);
+        let permissions = policy.permissions_for(user(), &[], false);
+        assert_eq!(
+            roles_of(&permissions),
+            vec![Role::BackendAdmin, Role::Member]
+        );
+        assert!(permissions.has(Permission::BackendsManage));
+        assert!(!permissions.has(Permission::GroupsManage));
+        let permissions = policy.permissions_for(other, &[], false);
+        assert_eq!(roles_of(&permissions), vec![Role::Member]);
+    }
+
+    #[test]
+    fn a_binding_on_authenticated_applies_to_everyone() {
+        let config = RbacConfig {
+            groups: Vec::new(),
+            grants: Vec::new(),
+            role_bindings: vec![RoleBindingConfig {
+                role: Role::Auditor,
+                group: AUTHENTICATED_GROUP.to_string(),
+            }],
+        };
+        let policy = Policy::from_config(&config);
+        let groups = policy.groups_for(user(), "entra", &[]);
+        assert!(
+            policy
+                .permissions_for(user(), &groups, false)
+                .has(Permission::AuditRead)
+        );
+    }
+
+    fn db_snapshot() -> RbacSnapshot {
+        RbacSnapshot {
+            groups: vec![
+                RbacGroupConfig {
+                    name: "ops".to_string(),
+                    description: Some("Operations".to_string()),
+                    idp: group("ops", &[("entra", "id-ops")]).idp,
+                },
+                group("it", &[("entra", "id-evil")]),
+                group("beta", &[]),
+            ],
+            memberships: vec![
+                (user(), "beta".to_string()),
+                (Uuid::from_u128(2), "beta".to_string()),
+                (user(), "ghost".to_string()),
+                (user(), "it".to_string()),
+            ],
+            grants: vec![
+                (7, grant("ops", "loki", &["*"], &[])),
+                (3, grant("beta", "forgejo", &["get_*"], &[])),
+                (9, grant("ghost", "prometheus", &["*"], &[])),
+            ],
+            role_bindings: vec![
+                binding(
+                    Some(5),
+                    Role::Auditor,
+                    RoleSubject::Group("ops".to_string()),
+                ),
+                binding(
+                    Some(2),
+                    Role::Admin,
+                    RoleSubject::Group("ghost".to_string()),
+                ),
+            ],
+        }
+    }
+
+    fn merged_config() -> RbacConfig {
+        RbacConfig {
+            groups: vec![group("it", &[("entra", "id-it")])],
+            grants: vec![grant("it", "prometheus", &["*"], &[])],
+            role_bindings: vec![RoleBindingConfig {
+                role: Role::BackendAdmin,
+                group: "it".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn from_config_equals_from_parts_without_database_rows() {
+        let config = merged_config();
+        let a = Policy::from_config(&config);
+        let b = Policy::from_parts(&config, &RbacSnapshot::default());
+        assert_eq!(a.groups(), b.groups());
+        assert_eq!(a.grants(), b.grants());
+        assert_eq!(a.role_bindings(), b.role_bindings());
+    }
+
+    #[test]
+    fn database_groups_match_by_membership_and_idp_mapping() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        // membership
+        assert_eq!(
+            policy.groups_for(user(), "entra", &[]),
+            strings(&["authenticated", "beta"])
+        );
+        // idp mapping, config and database
+        assert_eq!(
+            policy.groups_for(Uuid::from_u128(3), "entra", &strings(&["id-ops", "id-it"])),
+            strings(&["authenticated", "it", "ops"])
+        );
+        // the colliding database group's mapping does not count
+        assert_eq!(
+            policy.groups_for(Uuid::from_u128(3), "entra", &strings(&["id-evil"])),
+            strings(&["authenticated"])
+        );
+        // no membership in a group that does not exist, none in the ignored "it"
+        let groups = policy.groups_for(user(), "entra", &[]);
+        assert!(!groups.contains(&"ghost".to_string()));
+        assert!(!groups.contains(&"it".to_string()));
+        assert_eq!(policy.members_of("beta"), vec![user(), Uuid::from_u128(2)]);
+        assert_eq!(policy.members_of("it"), Vec::<Uuid>::new());
+        assert_eq!(policy.members_of("ghost"), Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn database_grants_take_effect_and_orphans_do_not() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        let beta = policy.effective(&strings(&["authenticated", "beta"]));
+        assert!(beta.allows(tool("forgejo", "get_repo", false)));
+        assert!(!beta.allows(tool("forgejo", "delete_repo", false)));
+        let ops = policy.effective(&strings(&["ops"]));
+        assert!(ops.allows(tool("loki", "query", false)));
+        // an orphan grant is listed but never evaluated, even for a caller naming the group
+        let ghost = policy.effective(&strings(&["ghost"]));
+        assert!(!ghost.allows(tool("prometheus", "query", false)));
+        assert_eq!(ghost.backends(), Vec::<String>::new());
+        assert!(policy.grants().iter().any(|view| view.id == Some(9)));
+    }
+
+    #[test]
+    fn a_database_group_named_like_a_config_group_is_ignored() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        let it = policy.group("it").unwrap();
+        assert_eq!(it.source, Source::Config);
+        assert_eq!(
+            it.idp,
+            vec![IdpMapping {
+                provider: "entra".to_string(),
+                value: "id-it".to_string(),
+            }]
+        );
+        assert_eq!(policy.groups().iter().filter(|g| g.name == "it").count(), 1);
+
+        let db = RbacSnapshot {
+            groups: vec![
+                group(AUTHENTICATED_GROUP, &[]),
+                group("x", &[]),
+                group("x", &[]),
+            ],
+            ..RbacSnapshot::default()
+        };
+        let policy = Policy::from_parts(&RbacConfig::default(), &db);
+        let names: Vec<String> = policy.groups().into_iter().map(|g| g.name).collect();
+        assert_eq!(names, strings(&["x"]));
+    }
+
+    #[test]
+    fn database_bindings_follow_their_group() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        let ops = policy.groups_for(Uuid::from_u128(3), "entra", &strings(&["id-ops"]));
+        let permissions = policy.permissions_for(Uuid::from_u128(3), &ops, false);
+        assert!(permissions.has(Permission::AuditRead));
+        // a binding on an unknown group is listed but does not apply
+        let permissions = policy.permissions_for(Uuid::from_u128(3), &strings(&["ghost"]), false);
+        assert!(!permissions.is_admin());
+    }
+
+    #[test]
+    fn groups_are_listed_config_first_then_local_each_sorted() {
+        let config = RbacConfig {
+            groups: vec![group("zeta", &[]), group("alpha", &[])],
+            grants: Vec::new(),
+            role_bindings: Vec::new(),
+        };
+        let db = RbacSnapshot {
+            groups: vec![group("mid", &[]), group("beta", &[])],
+            ..RbacSnapshot::default()
+        };
+        let policy = Policy::from_parts(&config, &db);
+        let listed: Vec<(String, Source)> = policy
+            .groups()
+            .into_iter()
+            .map(|g| (g.name, g.source))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("alpha".to_string(), Source::Config),
+                ("zeta".to_string(), Source::Config),
+                ("beta".to_string(), Source::Local),
+                ("mid".to_string(), Source::Local),
+            ]
+        );
+        assert!(policy.has_group("beta"));
+        assert!(policy.has_group(AUTHENTICATED_GROUP));
+        assert!(!policy.has_group("nope"));
+        assert_eq!(policy.group("nope"), None);
+    }
+
+    #[test]
+    fn grants_and_bindings_list_config_first_then_database_by_id() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        let grants: Vec<(Option<i64>, Source, String)> = policy
+            .grants()
+            .into_iter()
+            .map(|view| (view.id, view.source, view.grant.backend))
+            .collect();
+        assert_eq!(
+            grants,
+            vec![
+                (None, Source::Config, "prometheus".to_string()),
+                (Some(3), Source::Local, "forgejo".to_string()),
+                (Some(7), Source::Local, "loki".to_string()),
+                (Some(9), Source::Local, "prometheus".to_string()),
+            ]
+        );
+        assert_eq!(
+            policy.role_bindings(),
+            vec![
+                binding(
+                    None,
+                    Role::BackendAdmin,
+                    RoleSubject::Group("it".to_string())
+                ),
+                binding(
+                    Some(2),
+                    Role::Admin,
+                    RoleSubject::Group("ghost".to_string())
+                ),
+                binding(
+                    Some(5),
+                    Role::Auditor,
+                    RoleSubject::Group("ops".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_group_name_applies_the_shared_rule() {
+        assert_eq!(validate_group_name("it"), Ok(()));
+        assert_eq!(validate_group_name("dev-2_a"), Ok(()));
+        assert_eq!(validate_group_name(&"a".repeat(64)), Ok(()));
+        for name in ["", "IT", "it team", "it.team", "ü"] {
+            assert!(
+                validate_group_name(name)
+                    .unwrap_err()
+                    .contains("[a-z0-9_-]+"),
+                "{name:?}"
+            );
+        }
+        assert!(
+            validate_group_name(&"a".repeat(65))
+                .unwrap_err()
+                .contains("64")
+        );
+        assert!(
+            validate_group_name(AUTHENTICATED_GROUP)
+                .unwrap_err()
+                .contains("built in")
+        );
+    }
+
+    #[test]
+    fn validate_grant_checks_group_backend_and_patterns() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        let backends = ["prometheus", "forgejo"];
+        assert_eq!(
+            validate_grant(&grant("it", "prometheus", &["*"], &[]), &policy, &backends),
+            Ok(())
+        );
+        // database groups and the built-in group are known too
+        assert_eq!(
+            validate_grant(
+                &grant("beta", "forgejo", &["get_*"], &["x"]),
+                &policy,
+                &backends
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_grant(
+                &grant(AUTHENTICATED_GROUP, "forgejo", &["*"], &[]),
+                &policy,
+                &backends
+            ),
+            Ok(())
+        );
+
+        let err =
+            validate_grant(&grant("nope", "forgejo", &["*"], &[]), &policy, &backends).unwrap_err();
+        assert!(
+            err.contains("unknown group") && err.contains("nope"),
+            "{err}"
+        );
+        let err =
+            validate_grant(&grant("it", "nope", &["*"], &[]), &policy, &backends).unwrap_err();
+        assert!(
+            err.contains("unknown backend") && err.contains("nope"),
+            "{err}"
+        );
+        let err =
+            validate_grant(&grant("it", "forgejo", &[], &[]), &policy, &backends).unwrap_err();
+        assert!(err.contains("empty include"), "{err}");
+        let err = validate_grant(&grant("it", "forgejo", &["*", ""], &[]), &policy, &backends)
+            .unwrap_err();
+        assert!(err.contains("empty tool pattern"), "{err}");
+        let err = validate_grant(&grant("it", "forgejo", &["*"], &[" "]), &policy, &backends)
+            .unwrap_err();
+        assert!(err.contains("empty tool pattern"), "{err}");
+    }
+
+    #[test]
+    fn parses_and_validates_role_bindings() {
+        #[derive(Deserialize)]
+        struct Root {
+            rbac: RbacConfig,
+        }
+        let root: Root = toml::from_str(
+            r#"
+            [[rbac.groups]]
+            name = "it-sec"
+
+            [[rbac.role_bindings]]
+            role = "auditor"
+            group = "it-sec"
+
+            [[rbac.role_bindings]]
+            role = "backend-admin"
+            group = "authenticated"
+            "#,
+        )
+        .unwrap();
+        let rbac = root.rbac;
+        assert_eq!(rbac.role_bindings.len(), 2);
+        assert_eq!(rbac.role_bindings[0].role, Role::Auditor);
+        assert_eq!(rbac.role_bindings[0].group, "it-sec");
+        assert_eq!(rbac.role_bindings[1].role, Role::BackendAdmin);
+        assert_eq!(rbac.validate(&[], &[]), Ok(()));
+
+        let mut bad = rbac.clone();
+        bad.role_bindings.push(RoleBindingConfig {
+            role: Role::Admin,
+            group: "nope".to_string(),
+        });
+        let err = bad.validate(&[], &[]).unwrap_err();
+        assert!(
+            err.contains("unknown group") && err.contains("nope") && err.contains("admin"),
+            "{err}"
+        );
+
+        let none: RbacConfig = toml::from_str("").unwrap();
+        assert!(none.role_bindings.is_empty());
     }
 }

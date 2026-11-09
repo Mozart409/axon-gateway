@@ -27,6 +27,27 @@
 # admin_groups = ["admins"]
 # allowed_email_domains = ["example.com"]  # empty = any
 
+# RBAC for multi-user mode: groups, tool grants and role bindings. Groups,
+# grants and bindings can also be managed at runtime through the dashboard API;
+# the ones declared here are read-only there. Everyone logged in is in the
+# built-in group "authenticated".
+# [[rbac.groups]]
+# name = "it"  # [a-z0-9_-]+
+# description = "IT staff"
+# idp = [{ provider = "pocket-id", value = "it-staff" }]  # claim value -> member
+#
+# [[rbac.grants]]
+# group = "it"  # a declared group or "authenticated"
+# backend = "files"
+# include = ["*"]  # default; tool globs
+# exclude = ["delete_*"]
+# read_only = false  # only tools with readOnlyHint pass
+# mandatory = false  # users cannot hide these tools
+#
+# [[rbac.role_bindings]]
+# role = "auditor"  # admin | backend-admin | auditor | member
+# group = "it"
+
 [gateway]
 # Address to bind the gateway server
 bind = "0.0.0.0:8080"

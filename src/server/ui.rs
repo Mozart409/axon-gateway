@@ -130,10 +130,9 @@ pub(super) async fn handle_ui_tools(
         Err(response) => return *response,
     };
 
-    let groups = state
-        .policy
-        .groups_for(&session.provider_id, &session.user.groups);
-    let effective = state.policy.effective(&groups);
+    let policy = state.policy.current();
+    let groups = policy.groups_for(session.user.id, &session.provider_id, &session.user.groups);
+    let effective = policy.effective(&groups);
     let page = views::render_my_tools_page(
         &state,
         &session,
@@ -175,10 +174,9 @@ pub(super) async fn handle_ui_tool_opt_out(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let groups = state
-        .policy
-        .groups_for(&session.provider_id, &session.user.groups);
-    let effective = state.policy.effective(&groups);
+    let policy = state.policy.current();
+    let groups = policy.groups_for(session.user.id, &session.provider_id, &session.user.groups);
+    let effective = policy.effective(&groups);
 
     let Some(backend) = status
         .backends
@@ -900,12 +898,12 @@ mod tests {
 
     /// Group `it` (claim `it-claim` from `pocket`); `files` is granted in pieces,
     /// `wiki` read-only, `mail` not at all.
-    fn tools_policy() -> Policy {
+    fn tools_config() -> RbacConfig {
         let mut wiki = grant("authenticated", "wiki", &["*"], &[]);
         wiki.read_only = true;
         let mut audit = grant("authenticated", "files", &["audit_log"], &[]);
         audit.mandatory = true;
-        Policy::from_config(&RbacConfig {
+        RbacConfig {
             groups: vec![RbacGroupConfig {
                 name: String::from("it"),
                 description: Some(String::from("<b>IT</b> staff")),
@@ -920,7 +918,12 @@ mod tests {
                 grant("it", "files", &["*"], &["delete_*"]),
                 wiki,
             ],
-        })
+            role_bindings: Vec::new(),
+        }
+    }
+
+    fn tools_policy() -> Policy {
+        Policy::from_config(&tools_config())
     }
 
     fn files_backend() -> BackendInfo {
@@ -944,7 +947,7 @@ mod tests {
 
     fn render_section(backend: &BackendInfo, opt_outs: &OptOuts) -> String {
         let policy = tools_policy();
-        let groups = policy.groups_for("pocket", &[String::from("it-claim")]);
+        let groups = policy.groups_for(uuid::Uuid::nil(), "pocket", &[String::from("it-claim")]);
         views::render_tool_backend_section(backend, &policy.effective(&groups), opt_outs)
             .into_string()
     }
@@ -970,7 +973,7 @@ mod tests {
 
         // For a user outside `it`, the same tool is simply not covered.
         let policy = tools_policy();
-        let effective = policy.effective(&policy.groups_for("pocket", &[]));
+        let effective = policy.effective(&policy.groups_for(uuid::Uuid::nil(), "pocket", &[]));
         let html =
             views::render_tool_backend_section(&files_backend(), &effective, &OptOuts::default())
                 .into_string();
@@ -1036,10 +1039,10 @@ mod tests {
     #[tokio::test]
     async fn my_tools_page_lists_groups_and_escapes_descriptions() {
         let mut state = test_state();
-        state.policy = Arc::new(tools_policy());
+        state.policy = Arc::new(crate::rbac::PolicyHandle::new(tools_config()));
         let user = test_session_user(false);
-        let policy = &state.policy;
-        let groups = policy.groups_for("pocket", &[String::from("it-claim")]);
+        let policy = state.policy.current();
+        let groups = policy.groups_for(user.user.id, "pocket", &[String::from("it-claim")]);
         let backends = vec![
             wiki_backend(),
             files_backend(),

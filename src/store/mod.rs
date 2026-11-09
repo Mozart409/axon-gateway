@@ -11,11 +11,11 @@ use sqlx::postgres::PgPoolOptions;
 use thiserror::Error;
 
 mod auth;
+mod rbac;
 mod views;
 
-#[cfg(test)]
-pub use auth::User;
-pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser};
+pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
+pub use rbac::{Actor, AuditRecord};
 
 const MAX_CONNECTIONS: u32 = 10;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -71,7 +71,7 @@ impl Store {
         Self::connect_url(&url).await
     }
 
-    async fn connect_url(url: &str) -> Result<Self, StoreError> {
+    pub(crate) async fn connect_url(url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
             .acquire_timeout(ACQUIRE_TIMEOUT)
@@ -93,11 +93,11 @@ impl Store {
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     use sqlx::PgPool;
 
     /// Base URL of the test database; tests skip without it.
-    pub(super) fn database_url() -> Option<String> {
+    pub(crate) fn database_url() -> Option<String> {
         std::env::var("AXON_TEST_DATABASE_URL")
             .ok()
             .filter(|url| !url.is_empty())
@@ -105,7 +105,7 @@ mod test_support {
 
     /// Recreates a fresh schema and returns a URL whose `search_path` points
     /// at it, so parallel tests (and their migration tables) never collide.
-    pub(super) async fn isolated_url(base: &str, schema: &str) -> String {
+    pub(crate) async fn isolated_url(base: &str, schema: &str) -> String {
         let pool = PgPool::connect(base)
             .await
             .expect("the test database must be reachable");

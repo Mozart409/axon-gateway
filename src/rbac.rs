@@ -1,0 +1,928 @@
+//! Runtime RBAC management: the live policy handle and the admin service
+//!
+//! [`PolicyHandle`] holds the merged config and database [`Policy`] and swaps it
+//! atomically on [`PolicyHandle::refresh`]; a background task refreshes it so that
+//! replicas pick up each other's changes. [`Admin`] is the service layer behind the
+//! `/api/v1` admin API (and the admin pages to come): it checks the caller's
+//! permissions, validates input, writes through the store (which audits every
+//! change) and reloads the policy.
+
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
+
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::gateway::GetDetailedStatus;
+use crate::policy::{
+    GrantConfig, GrantView, GroupView, Permission, Permissions, Policy, RbacConfig, Role,
+    RoleBinding, RoleSubject, Source, validate_grant, validate_group_name,
+};
+use crate::server::AppState;
+use crate::store::{Actor, AuditRecord, SessionUser, Store, StoreError, User};
+
+/// How often the policy is re-read from the database, so that changes made
+/// through another replica show up here.
+pub const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Longest group description, in characters.
+const MAX_DESCRIPTION_CHARS: usize = 500;
+
+/// The live policy: `[rbac]` from config merged with the database rows.
+#[derive(Debug)]
+pub struct PolicyHandle {
+    config: RbacConfig,
+    current: RwLock<Arc<Policy>>,
+}
+
+impl PolicyHandle {
+    /// A handle on the config-only policy; [`PolicyHandle::refresh`] adds the
+    /// database rows.
+    pub fn new(config: RbacConfig) -> Self {
+        let policy = Arc::new(Policy::from_config(&config));
+        Self {
+            config,
+            current: RwLock::new(policy),
+        }
+    }
+
+    /// The policy as of the last refresh. Hold it for one request, not longer.
+    pub fn current(&self) -> Arc<Policy> {
+        Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Reloads the database rows and swaps the merged policy in.
+    ///
+    /// # Errors
+    /// Fails when the snapshot cannot be read; the previous policy stays.
+    pub async fn refresh(&self, store: &Store) -> Result<(), StoreError> {
+        let snapshot = store.rbac_snapshot().await?;
+        let policy = Arc::new(Policy::from_parts(&self.config, &snapshot));
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = policy;
+        Ok(())
+    }
+}
+
+/// Refreshes the policy every [`POLICY_REFRESH_INTERVAL`], so that changes made
+/// through other replicas are picked up.
+pub fn spawn_policy_refresh(handle: Arc<PolicyHandle>, store: Store) {
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now() + POLICY_REFRESH_INTERVAL;
+        let mut interval = tokio::time::interval_at(start, POLICY_REFRESH_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(error) = handle.refresh(&store).await {
+                tracing::warn!(%error, "Failed to refresh the RBAC policy");
+            }
+        }
+    });
+}
+
+/// The groups and permissions of a logged-in user under `policy`.
+pub fn resolve(policy: &Policy, session: &SessionUser) -> (Vec<String>, Permissions) {
+    let groups = policy.groups_for(session.user.id, &session.provider_id, &session.user.groups);
+    let permissions = policy.permissions_for(session.user.id, &groups, session.user.is_admin);
+    (groups, permissions)
+}
+
+/// Why an admin operation did not happen
+#[derive(Debug, Error)]
+pub enum AdminError {
+    #[error("you are not allowed to do that")]
+    Forbidden,
+
+    #[error("not found")]
+    NotFound,
+
+    #[error("{0}")]
+    Conflict(String),
+
+    #[error("{0}")]
+    Invalid(String),
+
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+fn read_only() -> AdminError {
+    AdminError::Conflict("defined in config.toml, read-only".to_owned())
+}
+
+fn already_exists() -> AdminError {
+    AdminError::Conflict("already exists".to_owned())
+}
+
+/// Email, else display name, else subject: how the audit log names the user.
+fn actor_label(user: &User) -> String {
+    [user.email.as_deref(), user.display_name.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|label| !label.trim().is_empty())
+        .unwrap_or(&user.subject)
+        .to_owned()
+}
+
+/// Trims a description; blank means none.
+fn clean_description(description: Option<&str>) -> Result<Option<String>, AdminError> {
+    let Some(description) = description.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    if description.chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err(AdminError::Invalid(format!(
+            "description must be at most {MAX_DESCRIPTION_CHARS} characters"
+        )));
+    }
+    Ok(Some(description.to_owned()))
+}
+
+/// The admin operations for one logged-in user.
+pub struct Admin<'a> {
+    store: &'a Store,
+    policy: &'a PolicyHandle,
+    actor: Actor,
+    permissions: Permissions,
+    /// Backends a grant may name
+    backends: Vec<String>,
+    /// `[[auth.oidc]]` ids an `IdP` mapping may name
+    providers: Vec<String>,
+}
+
+impl<'a> Admin<'a> {
+    pub fn new(
+        store: &'a Store,
+        policy: &'a PolicyHandle,
+        session: &SessionUser,
+        backends: Vec<String>,
+        providers: Vec<String>,
+    ) -> Self {
+        let (_, permissions) = resolve(&policy.current(), session);
+        Self {
+            store,
+            policy,
+            actor: Actor {
+                user_id: Some(session.user.id),
+                label: actor_label(&session.user),
+            },
+            permissions,
+            backends,
+            providers,
+        }
+    }
+
+    /// The admin service for a session; `None` outside multi-user mode. The
+    /// backends are the gateway's current ones.
+    pub async fn from_state(state: &'a AppState, session: &SessionUser) -> Option<Admin<'a>> {
+        let (store, oidc) = state.multi_user()?;
+        let backends = match state.gateway.ask(GetDetailedStatus).await {
+            Ok(status) => status
+                .backends
+                .into_iter()
+                .map(|backend| backend.name)
+                .collect(),
+            Err(error) => {
+                tracing::warn!(?error, "Failed to list backends for an admin request");
+                Vec::new()
+            }
+        };
+        let providers = oidc
+            .iter()
+            .map(|provider| provider.id().to_owned())
+            .collect();
+        Some(Self::new(
+            store,
+            &state.policy,
+            session,
+            backends,
+            providers,
+        ))
+    }
+
+    fn require(&self, permission: Permission) -> Result<(), AdminError> {
+        self.require_any(&[permission])
+    }
+
+    fn require_any(&self, permissions: &[Permission]) -> Result<(), AdminError> {
+        if permissions
+            .iter()
+            .any(|permission| self.permissions.has(*permission))
+        {
+            Ok(())
+        } else {
+            Err(AdminError::Forbidden)
+        }
+    }
+
+    /// A database group: missing is not found, from config is read-only.
+    fn local_group(&self, name: &str) -> Result<GroupView, AdminError> {
+        let group = self
+            .policy
+            .current()
+            .group(name)
+            .ok_or(AdminError::NotFound)?;
+        if group.source == Source::Config {
+            return Err(read_only());
+        }
+        Ok(group)
+    }
+
+    /// Re-reads the policy after a write. The write stands when this fails;
+    /// the periodic refresh catches up.
+    async fn reload(&self) {
+        if let Err(error) = self.policy.refresh(self.store).await {
+            tracing::warn!(%error, "Failed to reload the RBAC policy after a change");
+        }
+    }
+
+    /// Everything that lists groups, grants or bindings.
+    fn require_listing(&self) -> Result<(), AdminError> {
+        self.require_any(&[Permission::GroupsManage, Permission::AuditRead])
+    }
+
+    /// All groups, config first.
+    ///
+    /// # Errors
+    /// [`AdminError::Forbidden`] without `groups.manage` or `audit.read`.
+    pub fn groups(&self) -> Result<Vec<GroupView>, AdminError> {
+        self.require_listing()?;
+        Ok(self.policy.current().groups())
+    }
+
+    /// One group with the ids of its members (database groups only).
+    ///
+    /// # Errors
+    /// Forbidden like [`Admin::groups`], [`AdminError::NotFound`] for an
+    /// unknown group.
+    pub fn group(&self, name: &str) -> Result<(GroupView, Vec<Uuid>), AdminError> {
+        self.require_listing()?;
+        let policy = self.policy.current();
+        let group = policy.group(name).ok_or(AdminError::NotFound)?;
+        let members = policy.members_of(name);
+        Ok((group, members))
+    }
+
+    /// All grants, config first.
+    ///
+    /// # Errors
+    /// Forbidden like [`Admin::groups`].
+    pub fn grants(&self) -> Result<Vec<GrantView>, AdminError> {
+        self.require_listing()?;
+        Ok(self.policy.current().grants())
+    }
+
+    /// All role bindings, config first.
+    ///
+    /// # Errors
+    /// Forbidden like [`Admin::groups`].
+    pub fn role_bindings(&self) -> Result<Vec<RoleBinding>, AdminError> {
+        self.require_listing()?;
+        Ok(self.policy.current().role_bindings())
+    }
+
+    /// Up to `limit` users.
+    ///
+    /// # Errors
+    /// Forbidden without `users.manage` or `groups.manage`; a store error.
+    pub async fn users(&self, limit: i64) -> Result<Vec<User>, AdminError> {
+        self.require_any(&[Permission::UsersManage, Permission::GroupsManage])?;
+        Ok(self.store.list_users(limit).await?)
+    }
+
+    /// Up to `limit` audit entries, newest first, older than `before`.
+    ///
+    /// # Errors
+    /// Forbidden without `audit.read`; a store error.
+    pub async fn audit(
+        &self,
+        limit: i64,
+        before: Option<i64>,
+    ) -> Result<Vec<AuditRecord>, AdminError> {
+        self.require(Permission::AuditRead)?;
+        Ok(self.store.audit_log(limit, before).await?)
+    }
+
+    /// Creates a database group.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, invalid for a bad name or
+    /// description, conflict when the name is taken by config or the database.
+    pub async fn create_group(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        validate_group_name(name).map_err(AdminError::Invalid)?;
+        let description = clean_description(description)?;
+        if self.policy.current().has_group(name) {
+            return Err(already_exists());
+        }
+        if !self
+            .store
+            .create_group(&self.actor, name, description.as_deref())
+            .await?
+        {
+            return Err(already_exists());
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Sets (or with `None` clears) a database group's description.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, not found for an unknown group,
+    /// conflict for a config group.
+    pub async fn update_group(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        self.local_group(name)?;
+        let description = clean_description(description)?;
+        // `false` means the description is already that: nothing to do.
+        if self
+            .store
+            .update_group(&self.actor, name, description.as_deref())
+            .await?
+        {
+            self.reload().await;
+        }
+        Ok(())
+    }
+
+    /// Deletes a database group with its mappings, memberships, grants and
+    /// bindings.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, not found for an unknown group,
+    /// conflict for a config group.
+    pub async fn delete_group(&self, name: &str) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        self.local_group(name)?;
+        if !self.store.delete_group(&self.actor, name).await? {
+            return Err(AdminError::NotFound);
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Maps an `IdP` claim value of a configured provider to a database group.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, invalid for an unknown provider or
+    /// an empty value, conflict for a config group or an existing mapping.
+    pub async fn add_idp_mapping(
+        &self,
+        group: &str,
+        provider: &str,
+        value: &str,
+    ) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        self.local_group(group)?;
+        if !self.providers.iter().any(|id| id == provider) {
+            return Err(AdminError::Invalid(format!(
+                "unknown OIDC provider {provider:?}"
+            )));
+        }
+        if value.trim().is_empty() {
+            return Err(AdminError::Invalid("value must not be empty".to_owned()));
+        }
+        if !self
+            .store
+            .add_idp_mapping(&self.actor, group, provider, value)
+            .await?
+        {
+            return Err(already_exists());
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Removes an `IdP` mapping from a database group.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, not found for an unknown group or
+    /// mapping, conflict for a config group.
+    pub async fn remove_idp_mapping(
+        &self,
+        group: &str,
+        provider: &str,
+        value: &str,
+    ) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        self.local_group(group)?;
+        if !self
+            .store
+            .remove_idp_mapping(&self.actor, group, provider, value)
+            .await?
+        {
+            return Err(AdminError::NotFound);
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Adds a user to a database group.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, not found for an unknown group or
+    /// user, conflict for a config group or an existing member.
+    pub async fn add_member(&self, group: &str, user_id: Uuid) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        self.local_group(group)?;
+        if !self.store.add_member(&self.actor, group, user_id).await? {
+            // The group exists, so either the user is already in or unknown.
+            if self.policy.current().members_of(group).contains(&user_id) {
+                return Err(already_exists());
+            }
+            return Err(AdminError::NotFound);
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Removes a user from a database group.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, not found for an unknown group or
+    /// non-member, conflict for a config group.
+    pub async fn remove_member(&self, group: &str, user_id: Uuid) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        self.local_group(group)?;
+        if !self
+            .store
+            .remove_member(&self.actor, group, user_id)
+            .await?
+        {
+            return Err(AdminError::NotFound);
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Stores a grant and returns its id.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`; invalid when the group or backend
+    /// is unknown or the tool patterns are bad.
+    pub async fn create_grant(&self, grant: GrantConfig) -> Result<i64, AdminError> {
+        self.require(Permission::GroupsManage)?;
+        let backends: Vec<&str> = self.backends.iter().map(String::as_str).collect();
+        validate_grant(&grant, &self.policy.current(), &backends).map_err(AdminError::Invalid)?;
+        let id = self.store.create_grant(&self.actor, &grant).await?;
+        self.reload().await;
+        Ok(id)
+    }
+
+    /// Deletes a database grant. Config grants have no id and cannot be
+    /// addressed.
+    ///
+    /// # Errors
+    /// Forbidden without `groups.manage`, not found for an unknown id.
+    pub async fn delete_grant(&self, id: i64) -> Result<(), AdminError> {
+        self.require(Permission::GroupsManage)?;
+        if self.store.delete_grant(&self.actor, id).await?.is_none() {
+            return Err(AdminError::NotFound);
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Binds a role to a group or a user and returns the binding's id.
+    ///
+    /// # Errors
+    /// Forbidden without `roles.manage`, invalid for an unknown group, not
+    /// found for an unknown user, conflict when the binding exists.
+    pub async fn create_role_binding(
+        &self,
+        role: Role,
+        subject: RoleSubject,
+    ) -> Result<i64, AdminError> {
+        self.require(Permission::RolesManage)?;
+        if let RoleSubject::Group(group) = &subject
+            && !self.policy.current().has_group(group)
+        {
+            return Err(AdminError::Invalid(format!("unknown group {group:?}")));
+        }
+        let id = match self
+            .store
+            .create_role_binding(&self.actor, role, &subject)
+            .await
+        {
+            Ok(id) => id,
+            // The user id has no row in `users`.
+            Err(StoreError::Query(sqlx::Error::Database(error)))
+                if error.is_foreign_key_violation() =>
+            {
+                return Err(AdminError::NotFound);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(id) = id else {
+            return Err(already_exists());
+        };
+        self.reload().await;
+        Ok(id)
+    }
+
+    /// Deletes a database role binding. Config bindings have no id and cannot
+    /// be addressed.
+    ///
+    /// # Errors
+    /// Forbidden without `roles.manage`, not found for an unknown id.
+    pub async fn delete_role_binding(&self, id: i64) -> Result<(), AdminError> {
+        self.require(Permission::RolesManage)?;
+        if !self.store.delete_role_binding(&self.actor, id).await? {
+            return Err(AdminError::NotFound);
+        }
+        self.reload().await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{IdpMapping, RbacGroupConfig};
+    use crate::store::LoginUser;
+    use crate::store::test_support::{database_url, isolated_url};
+
+    /// A connected store on its own schema, or `None` without a test database.
+    async fn test_store(schema: &str) -> Option<Store> {
+        let Some(base) = database_url() else {
+            eprintln!("skipping: AXON_TEST_DATABASE_URL is not set");
+            return None;
+        };
+        let url = isolated_url(&base, schema).await;
+        Some(Store::connect_url(&url).await.unwrap())
+    }
+
+    /// `ops` is declared in config; nothing else.
+    fn test_config() -> RbacConfig {
+        RbacConfig {
+            groups: vec![RbacGroupConfig {
+                name: "ops".to_owned(),
+                description: None,
+                idp: Vec::new(),
+            }],
+            grants: Vec::new(),
+            role_bindings: Vec::new(),
+        }
+    }
+
+    /// A user created through the login path, with a session on provider `mock`.
+    async fn test_session(store: &Store, subject: &str, is_admin: bool) -> SessionUser {
+        let email = format!("{subject}@example.com");
+        let login = LoginUser {
+            issuer: "https://idp.example",
+            subject,
+            email: Some(&email),
+            display_name: None,
+            groups: &[],
+            is_admin,
+        };
+        SessionUser {
+            user: store.upsert_user_on_login(&login).await.unwrap(),
+            provider_id: "mock".to_owned(),
+            csrf_token: "token".to_owned(),
+            id_token: None,
+        }
+    }
+
+    fn admin<'a>(store: &'a Store, handle: &'a PolicyHandle, session: &SessionUser) -> Admin<'a> {
+        Admin::new(
+            store,
+            handle,
+            session,
+            vec!["files".to_owned()],
+            vec!["mock".to_owned()],
+        )
+    }
+
+    fn grant(group: &str, backend: &str) -> GrantConfig {
+        GrantConfig {
+            group: group.to_owned(),
+            backend: backend.to_owned(),
+            include: vec!["*".to_owned()],
+            exclude: Vec::new(),
+            read_only: false,
+            mandatory: false,
+        }
+    }
+
+    #[test]
+    fn the_actor_is_named_by_email_then_name_then_subject() {
+        let mut user = User {
+            id: Uuid::nil(),
+            issuer: "https://idp.example".to_owned(),
+            subject: "sub-1".to_owned(),
+            email: Some("ada@example.com".to_owned()),
+            display_name: Some("Ada".to_owned()),
+            groups: Vec::new(),
+            is_admin: false,
+        };
+        assert_eq!(actor_label(&user), "ada@example.com");
+        user.email = None;
+        assert_eq!(actor_label(&user), "Ada");
+        user.display_name = None;
+        assert_eq!(actor_label(&user), "sub-1");
+    }
+
+    #[test]
+    fn descriptions_are_trimmed_and_bounded() {
+        assert_eq!(clean_description(None).unwrap(), None);
+        assert_eq!(clean_description(Some("  ")).unwrap(), None);
+        assert_eq!(
+            clean_description(Some(" IT staff ")).unwrap().as_deref(),
+            Some("IT staff")
+        );
+        let long = "x".repeat(MAX_DESCRIPTION_CHARS + 1);
+        assert!(matches!(
+            clean_description(Some(&long)),
+            Err(AdminError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_member_may_not_manage_or_read_anything() {
+        let Some(store) = test_store("axon_rbac_member").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let session = test_session(&store, "mia", false).await;
+        let admin = admin(&store, &handle, &session);
+
+        assert!(matches!(
+            admin.create_group("dev", None).await,
+            Err(AdminError::Forbidden)
+        ));
+        assert!(matches!(
+            admin.create_grant(grant("ops", "files")).await,
+            Err(AdminError::Forbidden)
+        ));
+        assert!(matches!(
+            admin
+                .create_role_binding(Role::Admin, RoleSubject::User(session.user.id))
+                .await,
+            Err(AdminError::Forbidden)
+        ));
+        assert!(matches!(admin.groups(), Err(AdminError::Forbidden)));
+        assert!(matches!(admin.grants(), Err(AdminError::Forbidden)));
+        assert!(matches!(admin.role_bindings(), Err(AdminError::Forbidden)));
+        assert!(matches!(admin.users(10).await, Err(AdminError::Forbidden)));
+        assert!(matches!(
+            admin.audit(10, None).await,
+            Err(AdminError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_admin_manages_a_group_and_it_is_audited() {
+        let Some(store) = test_store("axon_rbac_group").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let session = test_session(&store, "root", true).await;
+        let admin = admin(&store, &handle, &session);
+
+        admin
+            .create_group("dev", Some(" Developers "))
+            .await
+            .unwrap();
+        let (group, members) = admin.group("dev").unwrap();
+        assert_eq!(group.source, Source::Local);
+        assert_eq!(group.description.as_deref(), Some("Developers"));
+        assert_eq!(members, Vec::<Uuid>::new());
+
+        // Taken by the database, by config, or not a valid name.
+        assert!(matches!(
+            admin.create_group("dev", None).await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.create_group("ops", None).await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.create_group("Not Valid", None).await,
+            Err(AdminError::Invalid(_))
+        ));
+
+        admin.update_group("dev", None).await.unwrap();
+        assert_eq!(admin.group("dev").unwrap().0.description, None);
+
+        admin.add_idp_mapping("dev", "mock", "devs").await.unwrap();
+        assert_eq!(
+            admin.group("dev").unwrap().0.idp,
+            [IdpMapping {
+                provider: "mock".to_owned(),
+                value: "devs".to_owned()
+            }]
+        );
+        assert!(matches!(
+            admin.add_idp_mapping("dev", "mock", "devs").await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.add_idp_mapping("dev", "other", "devs").await,
+            Err(AdminError::Invalid(_))
+        ));
+        assert!(matches!(
+            admin.add_idp_mapping("dev", "mock", " ").await,
+            Err(AdminError::Invalid(_))
+        ));
+        admin
+            .remove_idp_mapping("dev", "mock", "devs")
+            .await
+            .unwrap();
+        assert!(matches!(
+            admin.remove_idp_mapping("dev", "mock", "devs").await,
+            Err(AdminError::NotFound)
+        ));
+
+        admin.delete_group("dev").await.unwrap();
+        assert!(matches!(
+            admin.delete_group("dev").await,
+            Err(AdminError::NotFound)
+        ));
+        assert!(!handle.current().has_group("dev"));
+
+        let log = admin.audit(50, None).await.unwrap();
+        let first = log.last().unwrap();
+        assert_eq!(first.action, "group.create");
+        assert_eq!(first.actor, "root@example.com");
+        assert_eq!(first.actor_user_id, Some(session.user.id));
+        assert_eq!(log.first().unwrap().action, "group.delete");
+    }
+
+    #[tokio::test]
+    async fn config_groups_are_read_only() {
+        let Some(store) = test_store("axon_rbac_config").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let session = test_session(&store, "root", true).await;
+        let admin = admin(&store, &handle, &session);
+
+        assert!(matches!(
+            admin.update_group("ops", Some("x")).await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.delete_group("ops").await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.add_idp_mapping("ops", "mock", "ops").await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.add_member("ops", session.user.id).await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.update_group("missing", None).await,
+            Err(AdminError::NotFound)
+        ));
+        assert_eq!(
+            admin.audit(10, None).await.unwrap(),
+            Vec::<AuditRecord>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn members_are_added_once_and_must_exist() {
+        let Some(store) = test_store("axon_rbac_members").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let session = test_session(&store, "root", true).await;
+        let bob = test_session(&store, "bob", false).await;
+        let admin = admin(&store, &handle, &session);
+        admin.create_group("dev", None).await.unwrap();
+
+        admin.add_member("dev", bob.user.id).await.unwrap();
+        assert_eq!(admin.group("dev").unwrap().1, [bob.user.id]);
+        assert!(matches!(
+            admin.add_member("dev", bob.user.id).await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            admin.add_member("dev", Uuid::new_v4()).await,
+            Err(AdminError::NotFound)
+        ));
+
+        admin.remove_member("dev", bob.user.id).await.unwrap();
+        assert!(matches!(
+            admin.remove_member("dev", bob.user.id).await,
+            Err(AdminError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn grants_are_validated_against_groups_and_backends() {
+        let Some(store) = test_store("axon_rbac_grants").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let session = test_session(&store, "root", true).await;
+        let admin = admin(&store, &handle, &session);
+
+        assert!(matches!(
+            admin.create_grant(grant("nobody", "files")).await,
+            Err(AdminError::Invalid(_))
+        ));
+        assert!(matches!(
+            admin.create_grant(grant("ops", "nowhere")).await,
+            Err(AdminError::Invalid(_))
+        ));
+
+        let id = admin.create_grant(grant("ops", "files")).await.unwrap();
+        let grants = admin.grants().unwrap();
+        let created = grants.iter().find(|view| view.id == Some(id)).unwrap();
+        assert_eq!(created.source, Source::Local);
+        assert_eq!(created.grant.group, "ops");
+
+        admin.delete_grant(id).await.unwrap();
+        assert!(matches!(
+            admin.delete_grant(id).await,
+            Err(AdminError::NotFound)
+        ));
+        assert_eq!(admin.grants().unwrap(), Vec::<GrantView>::new());
+    }
+
+    #[tokio::test]
+    async fn a_role_binding_changes_what_a_user_may_do() {
+        let Some(store) = test_store("axon_rbac_bindings").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let root = test_session(&store, "root", true).await;
+        let bob = test_session(&store, "bob", false).await;
+        let root_admin = admin(&store, &handle, &root);
+        assert!(matches!(
+            admin(&store, &handle, &bob).audit(10, None).await,
+            Err(AdminError::Forbidden)
+        ));
+
+        let subject = RoleSubject::User(bob.user.id);
+        let id = root_admin
+            .create_role_binding(Role::Auditor, subject.clone())
+            .await
+            .unwrap();
+        // The handle was reloaded, so bob's next request sees the role.
+        admin(&store, &handle, &bob).audit(10, None).await.unwrap();
+        assert!(matches!(
+            root_admin.create_role_binding(Role::Auditor, subject).await,
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(matches!(
+            root_admin
+                .create_role_binding(Role::Auditor, RoleSubject::User(Uuid::new_v4()))
+                .await,
+            Err(AdminError::NotFound)
+        ));
+        assert!(matches!(
+            root_admin
+                .create_role_binding(Role::Auditor, RoleSubject::Group("nobody".to_owned()))
+                .await,
+            Err(AdminError::Invalid(_))
+        ));
+        assert!(
+            root_admin
+                .role_bindings()
+                .unwrap()
+                .iter()
+                .any(|binding| binding.id == Some(id))
+        );
+
+        root_admin.delete_role_binding(id).await.unwrap();
+        assert!(matches!(
+            root_admin.delete_role_binding(id).await,
+            Err(AdminError::NotFound)
+        ));
+        assert!(matches!(
+            admin(&store, &handle, &bob).audit(10, None).await,
+            Err(AdminError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_picks_up_changes_made_elsewhere() {
+        let Some(store) = test_store("axon_rbac_refresh").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let session = test_session(&store, "root", true).await;
+        let actor = Actor {
+            user_id: Some(session.user.id),
+            label: "other replica".to_owned(),
+        };
+
+        store.create_group(&actor, "dev", None).await.unwrap();
+        assert!(!handle.current().has_group("dev"));
+        handle.refresh(&store).await.unwrap();
+        assert!(handle.current().has_group("dev"));
+    }
+}

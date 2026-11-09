@@ -16,12 +16,13 @@
 //! - GET /ui/tools - "My tools" page (multi-user mode only)
 //! - GET /auth/login, /auth/login/{id}, /auth/callback, POST /auth/logout - OIDC
 //!   dashboard login (only with `[auth.oidc]` and `[database]`)
+//! - /api/v1/... - JSON admin API for RBAC (session login; multi-user mode only)
 //! - GET /status/toolsets - List toolsets (`/status/groups` is a deprecated alias)
 //! - GET /metrics - Prometheus metrics
 //!
 //! HTML rendering lives in the [`views`] submodule. Handlers live in `ui`, `mcp`
-//! and `api`, token checks in `auth`, the dashboard login in `session`; this
-//! module owns the shared state, routing, middleware, and server lifecycle.
+//! and `api`, the admin JSON API in `admin_api`, token checks in `auth`, the
+//! dashboard login in `session`; this module owns the shared state, routing, middleware, and server lifecycle.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -47,6 +48,7 @@ use crate::auth::SharedAuth;
 use crate::error::ServerError;
 use crate::gateway::{DetailedGatewayStatus, GatewayActor};
 
+mod admin_api;
 mod api;
 mod auth;
 mod mcp;
@@ -71,8 +73,8 @@ pub struct AppState {
     pub store: Option<crate::store::Store>,
     /// OIDC providers for the dashboard login; `None` without `[auth.oidc]`
     pub oidc: Option<Arc<crate::oidc::OidcProviders>>,
-    /// RBAC groups and grants from `[rbac]`
-    pub policy: Arc<crate::policy::Policy>,
+    /// RBAC groups and grants from `[rbac]` and the database
+    pub policy: Arc<crate::rbac::PolicyHandle>,
 }
 
 impl AppState {
@@ -180,6 +182,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(ui_routes)
         // Dashboard login
         .merge(auth_routes)
+        // JSON admin API
+        .merge(admin_api::router(state.clone()))
         // Status endpoints
         .route("/health", get(api::health_check))
         .route("/livez", get(api::livez))
@@ -421,8 +425,8 @@ mod tests {
             metrics_handle: test_metrics_handle(),
             store: None,
             oidc: None,
-            policy: Arc::new(crate::policy::Policy::from_config(
-                &crate::policy::RbacConfig::default(),
+            policy: Arc::new(crate::rbac::PolicyHandle::new(
+                crate::policy::RbacConfig::default(),
             )),
         }
     }

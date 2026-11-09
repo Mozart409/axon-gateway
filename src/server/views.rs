@@ -740,13 +740,14 @@ pub(super) fn render_my_tools_page(
                         }
                         h2 class="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100" { "Your groups" }
                         ul class="mt-2 space-y-1 text-sm" {
+                            @let policy = state.policy.current();
                             @for group in groups {
                                 li {
                                     code class="text-slate-900 dark:text-slate-100" { (group) }
                                     @if group == AUTHENTICATED_GROUP {
                                         span class="ml-2 text-xs text-slate-500 dark:text-slate-400" { "built in" }
                                     }
-                                    @if let Some(description) = state.policy.group_description(group) {
+                                    @if let Some(description) = policy.group_description(group) {
                                         span class="ml-2 text-slate-600 dark:text-slate-300" { (description) }
                                     }
                                 }

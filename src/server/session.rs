@@ -16,6 +16,7 @@
 //! `[auth.oidc]` provider and a `[database]`): the guard lets requests
 //! through and the `/auth` routes answer 404.
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -25,6 +26,7 @@ use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use oauth2::url::form_urlencoded;
 use serde::Deserialize;
+use serde_json::json;
 use subtle::ConstantTimeEq;
 
 use super::views::{self, LoginOption};
@@ -141,10 +143,10 @@ async fn not_found(state: &AppState) -> Response {
         .into_response()
 }
 
-/// Middleware for every `/ui` route. Outside multi-user mode it lets
-/// everything through; otherwise it resolves the session cookie, puts the
+/// Middleware for every `/ui` and `/api/` route. Outside multi-user mode it
+/// lets everything through; otherwise it resolves the session cookie, puts the
 /// [`SessionUser`] into the request extensions, and sends everyone else to
-/// log in.
+/// log in (`/api/` gets a 401 instead).
 pub(super) async fn require_session(
     State(state): State<AppState>,
     mut request: Request,
@@ -178,8 +180,16 @@ pub(super) async fn require_session(
 
 /// What a request without a valid session gets: a page navigation goes to
 /// the login and back, an htmx request is told to navigate there, anything
-/// else (form posts, the event stream's reconnects) a bare 401.
+/// else (form posts, the event stream's reconnects) a bare 401. The JSON API
+/// always answers 401 with a JSON body.
 fn unauthenticated(method: &Method, headers: &HeaderMap, uri: &Uri) -> Response {
+    if uri.path().starts_with("/api/") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "not signed in" })),
+        )
+            .into_response();
+    }
     if method != Method::GET {
         return (StatusCode::UNAUTHORIZED, "log in at /auth/login\n").into_response();
     }

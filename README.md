@@ -123,6 +123,8 @@ argument (both example files already do this).
 | `/ui/actions/backends/{name}/disable`   | POST   | HTMX action: disable backend                        |
 | `/ui/actions/backends/{name}/enable`    | POST   | HTMX action: enable backend                         |
 | `/ui/actions/reload`                    | POST   | HTMX action: reload config                          |
+| `/ui/tools`                             | GET    | "My tools" page (multi-user mode)                   |
+| `/api/v1/...`                           | any    | JSON admin API for RBAC (multi-user mode, see RBAC) |
 | `/build`                                | GET    | Build/runtime metadata (version, pid, startup time) |
 | `/health`                               | GET    | Health check                                        |
 | `/livez`                                | GET    | Liveness probe (200 while the process is up)        |
@@ -339,6 +341,80 @@ to the tenant, so the list is usually not needed there.
 
 Without OIDC the dashboard stays open as before, so keep it on a trusted
 network.
+
+## RBAC
+
+In multi-user mode, access is described by groups, tool grants and roles. A
+user belongs to the built-in `authenticated` group (everyone logged in), to
+every group with an IdP mapping that matches one of their claim values at the
+login provider, and to every group they were added to by hand. A grant lets a
+group use a backend's tools (globs over the tool's original name); the union of
+a user's grants is what the "My tools" page shows as allowed. Grants are not yet
+enforced on `/mcp`.
+
+```toml
+[[rbac.groups]]
+name = "it"                        # [a-z0-9_-]+, 1 to 64 characters
+description = "IT staff"
+idp = [{ provider = "pocket", value = "it-staff" }]
+
+[[rbac.grants]]
+group = "it"                       # a declared group or "authenticated"
+backend = "files"
+include = ["*"]                    # default
+exclude = ["delete_*"]
+read_only = false                  # only tools with readOnlyHint pass
+mandatory = false                  # users cannot hide these tools
+
+[[rbac.role_bindings]]
+role = "auditor"
+group = "it"
+```
+
+Roles are built in. Everyone is a `member` (add personal backends); users the
+provider marks in `admin_groups` are `admin` (everything). Bindings add more:
+
+| Role            | Allows                                                    |
+| --------------- | --------------------------------------------------------- |
+| `admin`         | everything, including managing groups, grants and roles   |
+| `backend-admin` | view and manage backends, manage the catalog              |
+| `auditor`       | read the audit log, view backends                         |
+| `member`        | add personal backends                                     |
+
+Besides `config.toml`, admins manage the same things at runtime (the API below;
+a dashboard page follows). Those entries live in the database and are listed
+next to the config ones. Entries from `config.toml` are read-only: a write to
+them answers 409, and a config group wins over a database group of the same
+name. Every change is written to the audit log in the same transaction. A
+change applies at once on the replica that took it; other replicas reload the
+database rows every 30 s.
+
+All `/api/v1` routes need a dashboard session (the session cookie); without one
+they answer 401 `{"error": "not signed in"}`. Writes also need the session's
+CSRF token in `X-CSRF-Token`. Outside multi-user mode they answer 404. Errors
+are `{"error": "..."}` with 400 (invalid input, bad JSON), 403, 404, 409 or 503
+(database unavailable); creates answer 201, deletes 204.
+
+| Endpoint                                      | Method        | Needs                       |
+| --------------------------------------------- | ------------- | --------------------------- |
+| `/api/v1/me`                                  | GET           | a session                   |
+| `/api/v1/groups`                              | GET, POST     | reads `groups.manage` or `audit.read`; writes `groups.manage` |
+| `/api/v1/groups/{name}`                       | GET, PATCH, DELETE | reads as above; writes `groups.manage` |
+| `/api/v1/groups/{name}/idp-mappings`          | POST, DELETE  | `groups.manage`             |
+| `/api/v1/groups/{name}/members/{user_id}`     | PUT, DELETE   | `groups.manage`             |
+| `/api/v1/grants`                              | GET, POST     | reads `groups.manage` or `audit.read`; writes `groups.manage` |
+| `/api/v1/grants/{id}`                         | DELETE        | `groups.manage`             |
+| `/api/v1/role-bindings`                       | GET, POST     | reads `groups.manage` or `audit.read`; writes `roles.manage` |
+| `/api/v1/role-bindings/{id}`                  | DELETE        | `roles.manage`              |
+| `/api/v1/users?limit=`                        | GET           | `users.manage` or `groups.manage` (default 100, max 500) |
+| `/api/v1/audit?limit=&before=`                | GET           | `audit.read` (default 50, max 200; `before` is an entry id) |
+
+Bodies: group `{"name", "description"}` (PATCH: `{"description"}`, null clears),
+IdP mapping `{"provider", "value"}` (provider is a configured `[[auth.oidc]]`
+id), grant like `[[rbac.grants]]` (`group`, `backend`, optional `include`,
+`exclude`, `read_only`, `mandatory`), role binding `{"role", "group"}` or
+`{"role", "user_id"}`. Lists answer `{"groups": [...]}`, `{"grants": [...]}`,
+`{"role_bindings": [...]}`, `{"users": [...]}` and `{"entries": [...]}`.
 
 ## Tracing
 

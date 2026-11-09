@@ -15,6 +15,7 @@ mod gateway;
 mod metrics;
 mod oidc;
 mod policy;
+mod rbac;
 mod registry;
 mod server;
 mod store;
@@ -80,10 +81,18 @@ async fn main() -> Result<()> {
 
     // Dashboard login. Built before `config` moves into the gateway actor.
     let oidc = setup_oidc(&config, &base_url)?;
-    let policy = Arc::new(policy::Policy::from_config(&config.rbac));
+    let policy = Arc::new(rbac::PolicyHandle::new(config.rbac.clone()));
 
     if let Some(store) = store.clone() {
         spawn_session_purge(store);
+    }
+    if let (Some(store), Some(_)) = (&store, &oidc) {
+        // Config-only policy until the database answers; the refresh task
+        // retries, and picks up changes made through other replicas.
+        if let Err(error) = policy.refresh(store).await {
+            tracing::warn!(%error, "Could not load RBAC rows from the database, using [rbac] from the config only");
+        }
+        rbac::spawn_policy_refresh(Arc::clone(&policy), store.clone());
     }
 
     // Initialize Prometheus metrics exporter
