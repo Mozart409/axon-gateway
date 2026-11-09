@@ -579,7 +579,7 @@ The work deployment is Kubernetes with 3 replicas.
 - Hermetic mock OIDC issuer in `tests/support/`: axum app with a test RSA key
   serving discovery, JWKS and token endpoint.
 - Postgres test database via new monorepo recipes `axon-db-up`, `axon-db-down`
-  and `axon-with-db <recipes>` on host port 5437 (follows the "Test databases"
+  and `axon-with-db <recipes>` on a unix-socket tmpfs cluster, no host port (follows the "Test databases"
   convention in the root AGENTS.md; taken: lanternd 5433, internal-dashboard
   5434, hofvarpnir 5435, countdown 5436). `axon-ci` runs the DB tests through
   `axon-with-db`.
@@ -598,7 +598,7 @@ The work deployment is Kubernetes with 3 replicas.
 - [ ] Split `server.rs` into `server/mcp.rs`, `server/ui/`, `server/api.rs`,
       `server/auth.rs`.
 - [ ] Add sqlx, `migrations/`, `[database]` config, `store/` layer.
-- [ ] Add `axon-db-up`, `axon-db-down`, `axon-with-db` recipes (port 5437) and
+- [ ] Add `axon-db-up`, `axon-db-down`, `axon-with-db` recipes (tmpfs, unix socket) and
       wire `axon-ci`.
 - [ ] Extract `authz/` policy engine from `AuthManager` with current semantics
       and tests.
