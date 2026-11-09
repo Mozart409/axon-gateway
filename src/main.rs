@@ -15,6 +15,8 @@ mod gateway;
 mod metrics;
 mod registry;
 mod server;
+mod store;
+mod telemetry;
 mod types;
 mod watcher;
 
@@ -26,8 +28,6 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 
 use color_eyre::eyre::{Result, WrapErr};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 use kameo::actor::Spawn;
 use kameo::mailbox;
@@ -43,28 +43,8 @@ async fn main() -> Result<()> {
     // Install color_eyre for pretty error reporting
     color_eyre::install()?;
 
-    // Check if JSON logging is requested
-    let json_logging = env::var("AXON_LOG_JSON").is_ok();
-
-    // Initialize logging - respect RUST_LOG if set, otherwise use defaults
-    let env_filter = match env::var("RUST_LOG") {
-        Ok(_) => tracing_subscriber::EnvFilter::from_default_env(),
-        Err(_) => tracing_subscriber::EnvFilter::new("axon_gateway=debug,info"),
-    };
-
-    if json_logging {
-        // JSON logging for production/structured log aggregation
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
-    } else {
-        // Pretty logging for development
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            .init();
-    }
+    // Logging, plus OTLP trace export when OTEL_EXPORTER_OTLP_*ENDPOINT is set
+    let telemetry = telemetry::init(env::var("AXON_LOG_JSON").is_ok());
 
     tracing::info!("Starting Axon Gateway v{}", env!("CARGO_PKG_VERSION"));
 
@@ -77,6 +57,17 @@ async fn main() -> Result<()> {
     tracing::info!("Loading config from: {}", config_path);
     let config = Config::load(&config_path)
         .wrap_err_with(|| format!("failed to load config from '{config_path}'"))?;
+
+    let store = match &config.database {
+        Some(database) => {
+            let store = store::Store::connect(database)
+                .await
+                .wrap_err("failed to connect to the database")?;
+            tracing::info!("Database connected, migrations applied");
+            Some(store)
+        }
+        None => None,
+    };
 
     let bind_addr = config.gateway.bind.clone();
     let base_url = config.gateway.base_url.clone();
@@ -148,6 +139,7 @@ async fn main() -> Result<()> {
         started_at: SystemTime::now(),
         process_id: std::process::id(),
         metrics_handle,
+        store,
     };
 
     // Run server with graceful shutdown
@@ -162,6 +154,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("Shutdown complete");
+    telemetry.shutdown();
     Ok(())
 }
 

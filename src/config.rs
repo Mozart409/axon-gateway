@@ -41,6 +41,10 @@ pub struct Config {
     /// Tool groups: expose subsets of tools via different path prefixes
     #[serde(default)]
     pub groups: Vec<ToolGroupConfig>,
+    /// Optional Postgres store; without it the gateway runs standalone.
+    /// Not hot-reloadable: changes need a restart.
+    #[serde(default)]
+    pub database: Option<crate::store::DatabaseConfig>,
 }
 
 /// Tool group configuration
@@ -570,6 +574,7 @@ mod tests {
                 }],
                 tokens: vec![],
                 groups: vec![],
+                database: None,
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -599,6 +604,7 @@ mod tests {
                 }],
                 tokens: vec![],
                 groups: vec![],
+                database: None,
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -625,6 +631,7 @@ mod tests {
                 }],
                 tokens: vec![],
                 groups: vec![],
+                database: None,
             };
 
             let error = config.validate().expect_err("should require command");
@@ -651,6 +658,7 @@ mod tests {
                 }],
                 tokens: vec![],
                 groups: vec![],
+                database: None,
             };
 
             config.validate().expect("valid config should pass");
@@ -673,6 +681,7 @@ mod tests {
                 }],
                 tokens: vec![],
                 groups: vec![],
+                database: None,
             }
         }
 
@@ -732,6 +741,7 @@ mod tests {
                 }],
                 tokens: vec![],
                 groups: vec![],
+                database: None,
             };
 
             config.validate().expect("valid config should pass");

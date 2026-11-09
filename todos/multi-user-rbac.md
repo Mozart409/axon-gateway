@@ -498,7 +498,8 @@ The work deployment is Kubernetes with 3 replicas.
 - **OpenTelemetry** over OTLP: traces, plus metrics and logs as optional
   exports, via tracing-opentelemetry. hofvarpnir in this monorepo pins
   opentelemetry 0.33 and tracing-opentelemetry 0.34; keep versions aligned.
-  Config: standard `OTEL_*` env vars plus a `[telemetry]` table.
+  Config: the standard `OTEL_*` env vars only, no `[telemetry]` table (export
+  is on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
 - **Spans**: HTTP request -> MCP method -> authz decision -> backend call.
   Attributes: principal type, principal id (hashing optional), auth method
   (`pat`/`session`/`jwt`/`oauth`), backend, tool, outcome. Propagate W3C
@@ -595,20 +596,20 @@ The work deployment is Kubernetes with 3 replicas.
 
 ### Phase 0 - Groundwork (no behaviour change)
 
-- [ ] Split `server.rs` into `server/mcp.rs`, `server/ui/`, `server/api.rs`,
+- [x] Split `server.rs` into `server/mcp.rs`, `server/ui/`, `server/api.rs`,
       `server/auth.rs`.
-- [ ] Add sqlx, `migrations/`, `[database]` config, `store/` layer.
-- [ ] Add `axon-db-up`, `axon-db-down`, `axon-with-db` recipes (tmpfs, unix socket) and
+- [x] Add sqlx, `migrations/`, `[database]` config, `store/` layer.
+- [x] Add `axon-db-up`, `axon-db-down`, `axon-with-db` recipes (tmpfs, unix socket) and
       wire `axon-ci`.
-- [ ] Extract `authz/` policy engine from `AuthManager` with current semantics
+- [x] Extract `authz/` policy engine from `AuthManager` with current semantics
       and tests.
-- [ ] Fix `BackendActor` call serialization (`src/backend.rs` ~838): the actor
+- [x] Fix `BackendActor` call serialization (`src/backend.rs` ~838): the actor
       owns only the connection lifecycle; calls run concurrently on a cloned
       rmcp peer, capped by a per-backend semaphore (fixed, ~32 in flight);
       circuit-breaker accounting still updates from outcomes. Test: two slow
       calls to one backend run in parallel.
-- [ ] OTel tracing foundation (`[telemetry]`, OTLP exporter, request spans).
-- [ ] `/livez`, `/readyz`; keep `/health`.
+- [x] OTel tracing foundation (`OTEL_*` env, OTLP exporter, request spans).
+- [x] `/livez`, `/readyz`; keep `/health`.
 - Exit: all existing tests pass unchanged; no `[database]` means identical
   behaviour; traces visible in a local collector.
 

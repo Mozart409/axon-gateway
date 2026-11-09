@@ -1,0 +1,9 @@
+# Configuration for `cargo audit` (run by `just axon-audit` and CI).
+# cargo-deny needs no ignore: it walks the feature-resolved graph, which has no sqlite.
+
+# RUSTSEC-2026-0459 (libsqlite3-sys < 0.39): only in Cargo.lock through sqlx's
+# optional sqlite driver; axon enables postgres only, so it is never
+# compiled (`cargo tree -i libsqlite3-sys` is empty). sqlx-sqlite 0.9.0 pins
+# it below 0.38. Drop this once sqlx allows >= 0.39.
+[advisories]
+ignore = ["RUSTSEC-2026-0459"]

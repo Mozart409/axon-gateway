@@ -2,6 +2,11 @@
 #
 # This config defines which MCP servers to aggregate and how to connect to them.
 
+# Optional Postgres store. The URL is read from the named environment variable,
+# never from this file. Migrations run at startup; changes need a restart.
+# [database]
+# url_env = "AXON_DATABASE_URL"  # default
+
 [gateway]
 # Address to bind the gateway server
 bind = "0.0.0.0:8080"

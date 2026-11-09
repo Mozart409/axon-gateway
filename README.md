@@ -287,6 +287,30 @@ description = "Read-only operations"
 
 Access grouped tools at `/mcp/group/{group_name}` instead of `/mcp`.
 
+## Database
+
+An optional Postgres store; without a `[database]` section the gateway runs
+standalone. The connection URL is read from an environment variable, never from
+the config file, and migrations run at startup. The section is not
+hot-reloadable: changes need a restart.
+
+```toml
+[database]
+url_env = "AXON_DATABASE_URL" # default
+```
+
+When configured, `/readyz` also pings the database and returns 503
+(`database unreachable`) when it does not answer within 2 s.
+
+## Tracing
+
+Logs go to stdout (`AXON_LOG_JSON=1` for JSON, `RUST_LOG` to filter). Set
+`OTEL_EXPORTER_OTLP_ENDPOINT` to also export traces over OTLP; the standard
+`OTEL_*` variables apply (`OTEL_EXPORTER_OTLP_PROTOCOL` = `grpc` or
+`http/protobuf`, `OTEL_SERVICE_NAME`, default `axon-gateway`,
+`OTEL_TRACES_SAMPLER`). Every HTTP request gets a server span, and an incoming
+W3C `traceparent` header becomes its parent.
+
 ## Metrics
 
 Prometheus metrics are exposed at `/metrics`:

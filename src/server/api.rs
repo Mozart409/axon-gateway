@@ -1,6 +1,7 @@
 //! Health, readiness, build, status and metrics endpoints.
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use axum::{
     extract::State,
@@ -23,11 +24,8 @@ pub(super) async fn livez() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// A named readiness check: `Ok(())` when ready, `Err(reason)` otherwise.
-type ReadinessCheck = (&'static str, fn(&AppState) -> Result<(), &'static str>);
-
-/// Checks `/readyz` runs in order; the first failure makes the gateway not ready.
-const READINESS_CHECKS: &[ReadinessCheck] = &[("gateway", gateway_alive)];
+/// Upper bound for the database ping in `/readyz`.
+const DATABASE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn gateway_alive(state: &AppState) -> Result<(), &'static str> {
     if state.gateway.is_alive() {
@@ -37,16 +35,33 @@ fn gateway_alive(state: &AppState) -> Result<(), &'static str> {
     }
 }
 
+/// Pings the database when one is configured; standalone mode always passes.
+async fn database_reachable(state: &AppState) -> Result<(), &'static str> {
+    let Some(store) = &state.store else {
+        return Ok(());
+    };
+    match tokio::time::timeout(DATABASE_CHECK_TIMEOUT, store.ping()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err("database unreachable"),
+    }
+}
+
 /// Readiness probe: 200 when every readiness check passes, else 503 with the reason.
+///
+/// Checks run in order (gateway, then database); the first failure wins.
 pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    for (name, check) in READINESS_CHECKS {
-        if let Err(reason) = check(&state) {
-            tracing::warn!(check = %name, %reason, "Readiness check failed");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "not_ready", "reason": reason })),
-            );
-        }
+    let result = match gateway_alive(&state) {
+        Ok(()) => database_reachable(&state)
+            .await
+            .map_err(|reason| ("database", reason)),
+        Err(reason) => Err(("gateway", reason)),
+    };
+    if let Err((name, reason)) = result {
+        tracing::warn!(check = %name, %reason, "Readiness check failed");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "not_ready", "reason": reason })),
+        );
     }
     (StatusCode::OK, Json(json!({ "status": "ready" })))
 }
@@ -166,6 +181,16 @@ mod tests {
     #[tokio::test]
     async fn readyz_is_ready_while_gateway_runs() {
         let (status, payload) = get_json(test_state(), "/readyz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload, json!({ "status": "ready" }));
+    }
+
+    #[tokio::test]
+    async fn readyz_stays_ready_without_a_database() {
+        let state = test_state();
+        assert!(state.store.is_none());
+
+        let (status, payload) = get_json(state, "/readyz").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload, json!({ "status": "ready" }));
     }

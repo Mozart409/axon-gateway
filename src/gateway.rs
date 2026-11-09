@@ -1260,6 +1260,7 @@ mod tests {
                 backends: Vec::new(),
                 tokens: Vec::new(),
                 groups: Vec::new(),
+                database: None,
             };
             GatewayActor::spawn_with_mailbox(
                 GatewayActor::new(config, registry),

@@ -35,7 +35,7 @@ use kameo::actor::ActorRef;
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tower_http::services::ServeFile;
-use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnResponse, OnResponse, TraceLayer};
 use tracing::Level;
 use uuid::Uuid;
 
@@ -62,6 +62,8 @@ pub struct AppState {
     pub process_id: u32,
     /// Prometheus metrics handle for rendering
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    /// Postgres store; `None` in standalone mode
+    pub store: Option<crate::store::Store>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,25 +144,27 @@ pub fn create_router(state: AppState) -> Router {
         // Metrics endpoint
         .route("/metrics", get(api::prometheus_metrics))
         // Middleware
-        .layer(middleware::from_fn(request_id_middleware))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
                     let request_id = request
                         .extensions()
                         .get::<RequestId>()
-                        .map(|id| id.0.clone())
+                        .map(|id| id.0.as_str())
                         .unwrap_or_default();
-
-                    tracing::info_span!(
-                        "http_request",
-                        request_id = %request_id,
-                        method = %request.method(),
-                        uri = %request.uri(),
-                    )
+                    crate::telemetry::http_request_span(request, request_id)
                 })
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                .on_response(
+                    |response: &Response, latency: std::time::Duration, span: &tracing::Span| {
+                        crate::telemetry::record_response_status(span, response.status());
+                        DefaultOnResponse::new()
+                            .level(Level::INFO)
+                            .on_response(response, latency, span);
+                    },
+                ),
         )
+        // Outermost, so the request id exists before TraceLayer opens its span
+        .layer(middleware::from_fn(request_id_middleware))
         .fallback(ui::handle_not_found)
         .with_state(state)
 }
@@ -326,6 +330,7 @@ mod tests {
             backends: Vec::new(),
             tokens: Vec::new(),
             groups: Vec::new(),
+            database: None,
         };
 
         let registry =
@@ -353,6 +358,7 @@ mod tests {
             started_at: SystemTime::now(),
             process_id: std::process::id(),
             metrics_handle: test_metrics_handle(),
+            store: None,
         }
     }
 
