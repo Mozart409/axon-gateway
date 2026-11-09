@@ -92,11 +92,11 @@ Non-goals:
 | 22 | Work deployment is Kubernetes with 3 replicas: the 2026-07-28 path is stateless, ingress hashes on `Mcp-Session-Id` only for older clients, rate limits live in Postgres, singleton jobs run under an advisory lock | Pod-local sessions for old clients only, shared limits (see 7) |
 | 23 | The work IdP is Entra ID through the generic OIDC path; app roles carry the groups | No provider-specific code, no groups-overage (see 5) |
 | 24 | Good defaults over config options; a knob is added only when a real deployment needs it | Fewer settings to document, test and get wrong |
-| 25 | No stdio backends on Kubernetes: axon refuses to start with one when `KUBERNETES_SERVICE_HOST` is set; stdio-only servers run as their own Deployment behind a stdio-to-HTTP bridge and are added as HTTP backends | stdio is code execution in the pod and pod-local; no config switch needed |
+| 25 | stdio backends only when enabled in config: `[gateway] allow_stdio = true` (default `false`); axon detects nothing about its environment. On Kubernetes the Helm chart leaves it off; stdio-only servers run as their own Deployment behind a stdio-to-HTTP bridge and are added as HTTP backends | stdio is code execution on the host or pod; explicit config, no magic. Breaking for standalone users with stdio backends: document in the upgrade notes |
 | 26 | Prometheus gets one per-user counter, `axon_user_tool_calls_total{user, backend, outcome}`, with the internal user UUID and no option; no `tool` label on it, no user label on histograms; per-user latency comes from traces | Cardinality: 300 users x 200 tools x ~12 buckets is about 720k series |
 | 27 | MCP versions: clients 2025-06-18, 2025-11-25, 2026-07-28; backends every version rmcp knows; stateless-first around 2026-07-28 | See "Protocol versions" in 7 |
 | 28 | Rate limits stay in Postgres as shared counters for now | No extra infrastructure; revisit if they show up in database load (see 12) |
-| 29 | One shared instance per backend with a shared credential; per-user instances only for `per_user` and personal backends | Identity is enforced in axon before the call, so per-user connections would only multiply connections (see "Backend instances" in 7) |
+| 29 | One shared instance per backend with a shared credential; per-user instances only for `per_user` and personal backends. Every instance (shared, per-user, personal) disconnects after 5 minutes idle by default; `[gateway] idle_timeout_secs` changes the default and a backend's `idle_timeout_secs` overrides it (`0` = always connected) | Scale to zero when nobody uses a backend; per-user connections would only multiply connections (see "Backend instances" in 7) |
 
 ## 4. Domain model
 
@@ -433,13 +433,15 @@ src/crypto/       # envelope encryption, token hashing
   are enforced in axon before the call, so per-user connections would only
   multiply connections and health checks.
 - Per-user instances exist only for `per_user`-credential backends and personal
-  backends. They start on first use and stop after an idle timeout (default 10
-  minutes, fixed); caps on concurrent per-user instances apply.
-- Shared backends stay connected and health-checked by default, so backend-down
-  alerts keep working. An optional per-backend `idle_disconnect_secs` lets one
-  scale to zero. Its tool definitions stay cached, so `tools/list` needs no live
-  connection, the first call pays the connect cost, and the UI and metrics show
-  state `idle` (not down).
+  backends; caps on concurrent per-user instances apply.
+- Idle timeout: every instance (shared, per-user and personal) starts on first
+  use and disconnects after 5 minutes without calls. `[gateway]
+  idle_timeout_secs` (default 300) sets the default; a backend's own
+  `idle_timeout_secs` overrides it, and `0` keeps it always connected (use that
+  for backends whose down-alerts matter). Tool definitions stay cached, so
+  `tools/list` needs no live connection; the first call after idle pays the
+  connect cost. An idle backend is not health-checked; the UI and metrics show
+  state `idle`, not down.
 - **Existing bug (Phase 0):** `BackendActor`'s `CallTool` handler awaits
   `call_tool` inside the message handler (`src/backend.rs` around line 838).
   kameo processes one message at a time, so all calls to a backend are
@@ -458,11 +460,10 @@ The work deployment is Kubernetes with 3 replicas.
   request. Sessions for older clients are pod-local: the ingress hashes on the
   `Mcp-Session-Id` header (nginx-ingress `upstream-hash-by`) for them only.
 - **Backend connections.** Every pod holds its own backend connections and runs
-  its own health checks: 3x connections and pings to backends. Fine for HTTP;
-  there are no stdio backends on Kubernetes: axon refuses to start with one
-  when `KUBERNETES_SERVICE_HOST` is set (no config switch). A stdio-only MCP
-  server runs as its own Deployment behind a stdio-to-HTTP bridge and is added
-  as an HTTP backend.
+  its own health checks while connected: up to 3x connections and pings to
+  backends (idle timeout applies per pod). Fine for HTTP. The Helm chart leaves
+  `allow_stdio` off; a stdio-only MCP server runs as its own Deployment behind a
+  stdio-to-HTTP bridge and is added as an HTTP backend.
 - **Rate limits** must be shared: Postgres-backed counters, replacing the
   per-instance limiter.
 - **Singleton jobs** (audit and argument retention, token expiry,
@@ -648,8 +649,9 @@ The work deployment is Kubernetes with 3 replicas.
       clients; accept 2025-06-18, 2025-11-25, 2026-07-28 from clients.
 - [ ] Emit and consume SEP-2243 headers (`Mcp-Method`, `Mcp-Name`); rate limiter
       and metrics read them instead of parsing the body.
-- [ ] Refuse to start with a stdio backend when `KUBERNETES_SERVICE_HOST` is set;
-      document the stdio-to-HTTP bridge Deployment pattern.
+- [ ] `[gateway] allow_stdio` (default `false`): config load fails on a stdio
+      backend unless it is set; upgrade note for standalone users; document the
+      stdio-to-HTTP bridge Deployment pattern for Kubernetes.
 - [ ] `notifications/tools/list_changed` on grant/backend changes and on opt-out
       or toolset changes.
 - [ ] Progress and cancellation passthrough.
@@ -668,10 +670,10 @@ The work deployment is Kubernetes with 3 replicas.
 - [ ] Personal backends with namespacing rules.
 - [ ] Egress policy and SSRF guard; stdio admin-only.
 - [ ] `crypto/` envelope encryption, `AXON_KEK_FILE`, KEK rotation.
-- [ ] Per-user backend instances (`per_user` and personal only) with idle stop
-      (10 minutes, fixed) and caps.
-- [ ] Optional per-backend `idle_disconnect_secs` for shared backends: cached
-      tool definitions, connect on first call, state `idle` in UI and metrics.
+- [ ] Per-user backend instances (`per_user` and personal only) with caps.
+- [ ] Idle timeout for all instances: `[gateway] idle_timeout_secs` (default
+      300) with per-backend override (`0` = always connected); cached tool
+      definitions, connect on first call, state `idle` in UI and metrics.
 - [ ] Catalog and `per_user` credentials.
 - [ ] Per-user quotas.
 - Exit: a user adds a personal HTTP MCP and a catalog backend with their own
