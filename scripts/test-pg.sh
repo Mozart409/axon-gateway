@@ -10,7 +10,7 @@
 # find the same one. `start` on a cluster that is already up only prints the URL.
 #
 # The URL is a unix-socket URL for the `axon` role and database:
-#   postgres://axon@localhost/axon?host=$XDG_RUNTIME_DIR/axon-test-pg
+#   postgres://axon@localhost/axon?host=$XDG_RUNTIME_DIR/axon-test-pg-<uid>
 # The justfile builds the same path (axon_db_url), so keep the two in step.
 #
 # WHY IT IS FAST:
@@ -24,9 +24,12 @@
 #   developer's own Postgres, or with a parallel gate.
 #
 # The `axon` role is a superuser, so tests can create their own databases.
+# Auth is `trust`, so the socket directory is per-user and mode 0700: nobody
+# else on the machine can reach the cluster, even under the shared /tmp.
 set -euo pipefail
+umask 077
 
-dir="${XDG_RUNTIME_DIR:-/tmp}/axon-test-pg"
+dir="${XDG_RUNTIME_DIR:-/tmp}/axon-test-pg-$(id -u)"
 data="$dir/data"
 url="postgres://axon@localhost/axon?host=$dir"
 
@@ -58,7 +61,8 @@ start() {
         pg_ctl -D "$data" -m immediate stop >/dev/null 2>&1 || true
     fi
     rm -rf "$dir"
-    mkdir -p "$dir"
+    # No -p: fail rather than reuse a directory someone else created.
+    mkdir -m 700 "$dir"
 
     initdb -D "$data" -U axon -A trust --no-sync --no-instructions \
         --no-locale -E UTF8 >"$dir/initdb.log" 2>&1 || {
@@ -69,6 +73,7 @@ start() {
     cat >>"$data/postgresql.conf" <<EOF
 listen_addresses = ''
 unix_socket_directories = '$dir'
+unix_socket_permissions = 0700
 max_connections = 300
 shared_buffers = 128MB
 fsync = off
