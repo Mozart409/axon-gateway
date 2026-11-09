@@ -655,10 +655,15 @@ The work deployment is Kubernetes with 3 replicas.
 
 ### Phase 2b - Managed RBAC
 
-- [ ] Tables: groups, memberships, roles, role bindings, grants.
-- [ ] Config layer merged read-only (`source = config`); 409 on write.
-- [ ] Admin UI for groups and grants; `/api/v1` write path.
-- [ ] Audit log for admin actions.
+- [x] Tables: groups, IdP mappings, memberships, role bindings, grants,
+      audit log (built-in roles only; custom roles stay Phase 7, grants to a
+      single principal come with service accounts in Phase 3).
+- [x] Config layer merged read-only (`source = config`); 409 on write;
+      replicas reload the merged policy every 30 s.
+- [x] Admin UI for groups and grants (`/ui/admin`); `/api/v1` write path
+      (session + CSRF until PATs exist).
+- [x] Audit log for admin actions, written in the same transaction
+      (`/ui/admin/audit`, `GET /api/v1/audit`).
 
 ### Phase 3 - Agent tokens
 

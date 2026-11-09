@@ -252,10 +252,6 @@ impl Permissions {
     }
 
     /// Whether the user holds [`Role::Admin`]
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the admin dashboard uses it next")
-    )]
     pub fn is_admin(&self) -> bool {
         self.roles.contains(&Role::Admin)
     }

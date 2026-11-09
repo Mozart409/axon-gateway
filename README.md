@@ -381,8 +381,8 @@ provider marks in `admin_groups` are `admin` (everything). Bindings add more:
 | `auditor`       | read the audit log, view backends                         |
 | `member`        | add personal backends                                     |
 
-Besides `config.toml`, admins manage the same things at runtime (the API below;
-a dashboard page follows). Those entries live in the database and are listed
+Besides `config.toml`, admins manage the same things at runtime (the API below
+and the dashboard's admin pages). Those entries live in the database and are listed
 next to the config ones. Entries from `config.toml` are read-only: a write to
 them answers 409, and a config group wins over a database group of the same
 name. Every change is written to the audit log in the same transaction. A
@@ -415,6 +415,13 @@ id), grant like `[[rbac.grants]]` (`group`, `backend`, optional `include`,
 `exclude`, `read_only`, `mandatory`), role binding `{"role", "group"}` or
 `{"role", "user_id"}`. Lists answer `{"groups": [...]}`, `{"grants": [...]}`,
 `{"role_bindings": [...]}`, `{"users": [...]}` and `{"entries": [...]}`.
+
+The dashboard has the same under `/ui/admin` (an "Admin" link in the user bar,
+shown to users with `groups.manage` or `audit.read`): groups with their IdP
+mappings and members at `/ui/admin/groups/{name}`, grants, role bindings and
+the audit log at `/ui/admin/audit`. It goes through the same service as the
+API, so permissions, validation, audit entries and the read-only config rows
+behave the same; users without a write permission see the tables only.
 
 ## Tracing
 

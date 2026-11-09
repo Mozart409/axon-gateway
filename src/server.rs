@@ -14,14 +14,17 @@
 //! - GET /ui - Dashboard
 //! - GET /ui/backends/{name} - Backend detail page
 //! - GET /ui/tools - "My tools" page (multi-user mode only)
+//! - GET /ui/admin, /ui/admin/groups/{name}, /ui/admin/audit - RBAC admin pages
+//!   (multi-user mode only)
 //! - GET /auth/login, /auth/login/{id}, /auth/callback, POST /auth/logout - OIDC
 //!   dashboard login (only with `[auth.oidc]` and `[database]`)
 //! - /api/v1/... - JSON admin API for RBAC (session login; multi-user mode only)
 //! - GET /status/toolsets - List toolsets (`/status/groups` is a deprecated alias)
 //! - GET /metrics - Prometheus metrics
 //!
-//! HTML rendering lives in the [`views`] submodule. Handlers live in `ui`, `mcp`
-//! and `api`, the admin JSON API in `admin_api`, token checks in `auth`, the
+//! HTML rendering lives in the [`views`] submodule (`admin_views` for the admin
+//! pages). Handlers live in `ui`, `mcp` and `api`, the admin JSON API in
+//! `admin_api`, the admin pages in `admin_ui`, token checks in `auth`, the
 //! dashboard login in `session`; this module owns the shared state, routing, middleware, and server lifecycle.
 
 use std::sync::Arc;
@@ -49,6 +52,8 @@ use crate::error::ServerError;
 use crate::gateway::{DetailedGatewayStatus, GatewayActor};
 
 mod admin_api;
+mod admin_ui;
+mod admin_views;
 mod api;
 mod auth;
 mod mcp;
@@ -133,6 +138,7 @@ pub fn create_router(state: AppState) -> Router {
             "/ui/actions/tools/opt-out",
             post(ui::handle_ui_tool_opt_out),
         )
+        .merge(admin_ui::action_routes())
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -147,6 +153,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ui/tools", get(ui::handle_ui_tools))
         .route("/ui/events", get(ui::handle_ui_events))
         .route("/ui/partials/backends", get(ui::handle_ui_backends_partial))
+        .merge(admin_ui::page_routes())
         .merge(ui_actions)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

@@ -9,7 +9,10 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use super::{AppState, FlashLevel, FlashMessage};
 use crate::gateway::DetailedGatewayStatus;
-use crate::policy::{AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, ToolRef};
+use crate::policy::{
+    AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, Permission, ToolRef,
+};
+use crate::rbac::resolve;
 use crate::store::SessionUser;
 use crate::types::{
     BackendInfo, BackendState, NamespacedTool, PromptDefinition, ResourceDefinition,
@@ -267,7 +270,11 @@ pub(super) fn render_auth_error_page(state: &AppState, title: &str, message: &st
 }
 
 /// Header strip for signed-in users: name, admin badge and the logout form.
-fn render_user_bar(user: &SessionUser) -> Markup {
+/// The "Admin" link shows for users who may open the admin pages.
+pub(super) fn render_user_bar(state: &AppState, user: &SessionUser) -> Markup {
+    let (_, permissions) = resolve(&state.policy.current(), user);
+    let admin_pages =
+        permissions.has(Permission::GroupsManage) || permissions.has(Permission::AuditRead);
     let name = user
         .user
         .display_name
@@ -283,8 +290,16 @@ fn render_user_bar(user: &SessionUser) -> Markup {
             {
                 "My tools"
             }
+            @if admin_pages {
+                a
+                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
+                    href="/ui/admin"
+                {
+                    "Admin"
+                }
+            }
             span class="font-medium text-slate-900 dark:text-slate-100" { (name) }
-            @if user.user.is_admin {
+            @if permissions.is_admin() {
                 span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
                     "admin"
                 }
@@ -303,7 +318,7 @@ fn render_user_bar(user: &SessionUser) -> Markup {
 }
 
 /// `hx-headers` value that makes every htmx request carry the CSRF token.
-fn csrf_hx_headers(user: &SessionUser) -> String {
+pub(super) fn csrf_hx_headers(user: &SessionUser) -> String {
     serde_json::json!({ "X-CSRF-Token": user.csrf_token }).to_string()
 }
 
@@ -333,7 +348,7 @@ pub(super) fn render_ui_page(
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=[hx_headers.as_deref()] {
                 main class="mx-auto max-w-6xl p-6" {
                     @if let Some(user) = user {
-                        (render_user_bar(user))
+                        (render_user_bar(state, user))
                     }
                     section class="mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
                         h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
@@ -400,7 +415,7 @@ pub(super) fn render_ui_backend_detail_page(
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=[hx_headers.as_deref()] {
                 main class="mx-auto max-w-6xl p-6" {
                     @if let Some(user) = user {
-                        (render_user_bar(user))
+                        (render_user_bar(state, user))
                     }
                     section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
                         a
@@ -723,7 +738,7 @@ pub(super) fn render_my_tools_page(
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=(hx_headers) {
                 main class="mx-auto max-w-6xl p-6" {
-                    (render_user_bar(user))
+                    (render_user_bar(state, user))
                     section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
                         a
                             href="/ui"
@@ -770,7 +785,7 @@ pub(super) fn render_my_tools_page(
 }
 
 /// Build/runtime fingerprint shown in page footers.
-fn build_fingerprint(state: &AppState) -> String {
+pub(super) fn build_fingerprint(state: &AppState) -> String {
     let started_utc: DateTime<Utc> = state.started_at.into();
     let started = started_utc.format("%Y-%m-%d %H:%M:%S UTC");
     let git_sha = option_env!("AXON_GIT_SHA").unwrap_or("dev");
