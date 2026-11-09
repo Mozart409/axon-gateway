@@ -437,11 +437,24 @@ src/crypto/       # envelope encryption, token hashing
 - Idle timeout: every instance (shared, per-user and personal) starts on first
   use and disconnects after 5 minutes without calls. `[gateway]
   idle_timeout_secs` (default 300) sets the default; a backend's own
-  `idle_timeout_secs` overrides it, and `0` keeps it always connected (use that
-  for backends whose down-alerts matter). Tool definitions stay cached, so
-  `tools/list` needs no live connection; the first call after idle pays the
-  connect cost. An idle backend is not health-checked; the UI and metrics show
-  state `idle`, not down.
+  `idle_timeout_secs` overrides it, and `0` keeps it always connected. Tool
+  definitions stay cached, so `tools/list` needs no live connection; the first
+  call after idle pays the connect cost. The UI shows state `idle`, which is not
+  down.
+- Health is split by backend kind, decoupled from the idle session:
+  - **Shared backends: active probes, also while idle.** A short probe runs on
+    the existing `health_check_interval_secs` (default 30 s, `0` disables): a
+    stateless `ping` for 2026-07-28 backends, open-session/`ping`/close for
+    older ones. Each pod probes on its own (3 probes per interval on
+    Kubernetes; negligible, and it catches pod-local network faults).
+  - **Per-user and personal backends: passive health only.** No background
+    probes: with hundreds of users they would be constant traffic against each
+    user's own SaaS account and its rate limits. Health comes from real calls:
+    failures feed the circuit breaker, and the user's UI shows "last call
+    ok/failed at ...".
+  - New metric `axon_backend_up{backend}` (1/0) from probe results, shared
+    backends only. Alerts use it and the real-call error rate, never the
+    connection state, because `idle` is not down.
 - **Existing bug (Phase 0):** `BackendActor`'s `CallTool` handler awaits
   `call_tool` inside the message handler (`src/backend.rs` around line 838).
   kameo processes one message at a time, so all calls to a backend are
@@ -460,7 +473,7 @@ The work deployment is Kubernetes with 3 replicas.
   request. Sessions for older clients are pod-local: the ingress hashes on the
   `Mcp-Session-Id` header (nginx-ingress `upstream-hash-by`) for them only.
 - **Backend connections.** Every pod holds its own backend connections and runs
-  its own health checks while connected: up to 3x connections and pings to
+  its own health probes for shared backends: up to 3x connections and pings to
   backends (idle timeout applies per pod). Fine for HTTP. The Helm chart leaves
   `allow_stdio` off; a stdio-only MCP server runs as its own Deployment behind a
   stdio-to-HTTP bridge and is added as an HTTP backend.
@@ -495,7 +508,8 @@ The work deployment is Kubernetes with 3 replicas.
   `axon_authz_denied_total{reason}`, `axon_active_sessions`,
   `axon_user_backends{state}`, `axon_tokens_active`, principal-type labels,
   database pool metrics, OIDC provider latency/errors,
-  `axon_backend_inflight_calls{backend}`.
+  `axon_backend_inflight_calls{backend}`, `axon_backend_up{backend}` (probe
+  result, shared backends).
 - **Per-user metric:** one counter, `axon_user_tool_calls_total{user, backend,
   outcome}`, where `user` is the stable internal axon user id (UUID); there is no
   option for it. No `tool` label on it and no user label on histograms, for
@@ -510,8 +524,9 @@ The work deployment is Kubernetes with 3 replicas.
 - **Health**: `/livez`; `/readyz` (DB reachable, migrations applied, config
   backends evaluated); `/health` stays as alias.
 - **Ship in repo** under `example/observability/`: Grafana dashboard JSON and
-  Prometheus alert rules (backend down, error rate, auth failure spike, DB down,
-  OIDC provider unreachable).
+  Prometheus alert rules (shared backend down via `axon_backend_up`, tool-call
+  error rate per backend, auth failure spike, DB down, OIDC provider
+  unreachable).
 
 ### Audit arguments
 
@@ -674,6 +689,9 @@ The work deployment is Kubernetes with 3 replicas.
 - [ ] Idle timeout for all instances: `[gateway] idle_timeout_secs` (default
       300) with per-backend override (`0` = always connected); cached tool
       definitions, connect on first call, state `idle` in UI and metrics.
+- [ ] Health split: probes for shared backends keep running while idle
+      (stateless `ping` or open/`ping`/close); per-user and personal backends
+      get passive health from call outcomes, with no probes.
 - [ ] Catalog and `per_user` credentials.
 - [ ] Per-user quotas.
 - Exit: a user adds a personal HTTP MCP and a catalog backend with their own
@@ -682,7 +700,8 @@ The work deployment is Kubernetes with 3 replicas.
 ### Phase 6 - Observability completion
 
 - [ ] New metrics (section 8), including `axon_user_tool_calls_total{user,
-      backend, outcome}` and `axon_backend_inflight_calls{backend}`; pool and
+      backend, outcome}`, `axon_backend_inflight_calls{backend}` and
+      `axon_backend_up{backend}`; pool and
       OIDC metrics.
 - [ ] Audit UI, retention job (metadata 1 year, arguments 30 days, both
       configurable), per-user usage page.
