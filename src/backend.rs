@@ -7,17 +7,20 @@
 //! - Performs periodic health checks
 //! - Implements circuit breaker pattern for failing backends
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::BoxError;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::message::{Context, Message};
+use kameo::reply::DelegatedReply;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +33,20 @@ const MAX_BACKOFF_SECS: u64 = 300; // 5 minutes
 
 /// Base backoff duration for reconnection attempts
 const BASE_BACKOFF_SECS: u64 = 1;
+
+/// Maximum number of requests in flight to one backend at a time
+const MAX_INFLIGHT_CALLS_PER_BACKEND: usize = 32;
+
+/// Reply of the request handlers, sent from the task that runs the request
+type CallReply = DelegatedReply<Result<serde_json::Value, String>>;
+
+/// Error message prefixes of a request kind
+#[derive(Clone, Copy)]
+struct CallLabels {
+    failed: &'static str,
+    timed_out: &'static str,
+    serialize_failed: &'static str,
+}
 
 /// Wrapper enum for different MCP client types
 ///
@@ -135,6 +152,8 @@ pub struct BackendActor {
     self_ref: Option<WeakActorRef<Self>>,
     /// Cancellation token for spawned background tasks
     cancel_token: CancellationToken,
+    /// Limits the requests in flight to this backend
+    inflight: Arc<Semaphore>,
 }
 
 impl BackendActor {
@@ -152,6 +171,7 @@ impl BackendActor {
             circuit_breaker,
             self_ref: None,
             cancel_token: CancellationToken::new(),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CALLS_PER_BACKEND)),
         }
     }
 
@@ -411,13 +431,21 @@ impl BackendActor {
         Ok(prompt_defs)
     }
 
-    /// Forward a tool call to this backend with timeout and error handling
-    async fn call_tool(
-        &mut self,
-        tool_name: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        // Check circuit breaker
+    /// Check the state and circuit breaker for a new request and return the peer to send it on.
+    ///
+    /// A half-open circuit lets one request through as a probe, as before.
+    fn admit_call(&self) -> Result<Peer<RoleClient>, String> {
+        match self.state {
+            BackendState::Connected | BackendState::CircuitOpen => {}
+            BackendState::Reconnecting => {
+                return Err(format!(
+                    "Backend '{}' is reconnecting (attempt {})",
+                    self.config.name, self.reconnect_attempts
+                ));
+            }
+            _ => return Err(format!("Backend '{}' is not connected", self.config.name)),
+        }
+
         if self.circuit_breaker.is_open() {
             if self.circuit_breaker.should_attempt_close() {
                 tracing::info!(
@@ -430,162 +458,92 @@ impl BackendActor {
                     self.config.name
                 ));
             }
-        }
-
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "No client connection available".to_string())?;
-
-        tracing::info!(
-            "Backend '{}' executing tool '{}' with args: {}",
-            self.config.name,
-            tool_name,
-            arguments
-        );
-
-        // Convert arguments to JsonObject if it's an object, otherwise use empty
-        let arguments_obj = arguments.as_object().cloned();
-
-        let call_timeout = Duration::from_secs(self.config.timeout_secs);
-        let mut params = CallToolRequestParams::new(tool_name.to_string());
-        if let Some(args) = arguments_obj {
-            params = params.with_arguments(args);
-        }
-
-        let result = timeout(call_timeout, client.peer().call_tool(params)).await;
-
-        match result {
-            Ok(Ok(call_result)) => {
-                // Success - reset circuit breaker
-                self.circuit_breaker.record_success();
-
-                // Convert CallToolResult to JSON
-                let response = serde_json::to_value(&call_result)
-                    .map_err(|e| format!("Failed to serialize tool result: {e}"))?;
-                Ok(response)
-            }
-            Ok(Err(e)) => {
-                // Tool call error
-                let error_msg = format!("Tool call failed: {e}");
-                self.handle_call_failure(&error_msg).await;
-                Err(error_msg)
-            }
-            Err(_) => {
-                // Timeout
-                let error_msg = format!("Tool call timeout after {}s", self.config.timeout_secs);
-                self.handle_call_failure(&error_msg).await;
-                Err(error_msg)
-            }
-        }
-    }
-
-    /// Read a resource from this backend
-    async fn read_resource(&mut self, uri: &str) -> Result<serde_json::Value, String> {
-        // Check circuit breaker
-        if self.circuit_breaker.is_open() && !self.circuit_breaker.should_attempt_close() {
+        } else if self.state == BackendState::CircuitOpen {
             return Err(format!(
                 "Backend '{}' circuit breaker is open",
                 self.config.name
             ));
         }
 
-        let client = self
-            .client
+        self.client
             .as_ref()
-            .ok_or_else(|| "No client connection available".to_string())?;
-
-        tracing::info!("Backend '{}' reading resource '{}'", self.config.name, uri);
-
-        let call_timeout = Duration::from_secs(self.config.timeout_secs);
-        let result = timeout(
-            call_timeout,
-            client
-                .peer()
-                .read_resource(ReadResourceRequestParams::new(uri)),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(read_result)) => {
-                self.circuit_breaker.record_success();
-                let response = serde_json::to_value(&read_result)
-                    .map_err(|e| format!("Failed to serialize resource result: {e}"))?;
-                Ok(response)
-            }
-            Ok(Err(e)) => {
-                let error_msg = format!("Resource read failed: {e}");
-                self.handle_call_failure(&error_msg).await;
-                Err(error_msg)
-            }
-            Err(_) => {
-                let error_msg =
-                    format!("Resource read timeout after {}s", self.config.timeout_secs);
-                self.handle_call_failure(&error_msg).await;
-                Err(error_msg)
-            }
-        }
+            .map(|client| client.peer().clone())
+            .ok_or_else(|| "No client connection available".to_string())
     }
 
-    /// Get a prompt from this backend
-    async fn get_prompt(
-        &mut self,
-        name: &str,
-        arguments: Option<std::collections::HashMap<String, String>>,
-    ) -> Result<serde_json::Value, String> {
-        // Check circuit breaker
-        if self.circuit_breaker.is_open() && !self.circuit_breaker.should_attempt_close() {
-            return Err(format!(
-                "Backend '{}' circuit breaker is open",
-                self.config.name
-            ));
-        }
+    /// Run a request against the backend in a spawned task, so the actor stays free to handle
+    /// other messages (including more requests) while it is in flight.
+    ///
+    /// The state and circuit breaker checks happen here, synchronously. The task waits for a
+    /// permit, runs `request` under the backend timeout, sends the reply and then reports the
+    /// outcome back to the actor, which owns the circuit breaker.
+    fn spawn_call<T, E, Fut>(
+        &self,
+        ctx: &mut Context<Self, CallReply>,
+        labels: CallLabels,
+        request: impl FnOnce(Peer<RoleClient>) -> Fut + Send + 'static,
+    ) -> CallReply
+    where
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        T: serde::Serialize + Send,
+        E: std::fmt::Display + Send,
+    {
+        let (delegated, reply_tx) = ctx.reply_sender();
 
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "No client connection available".to_string())?;
+        let peer = match self.admit_call() {
+            Ok(peer) => peer,
+            Err(e) => {
+                if let Some(reply_tx) = reply_tx {
+                    reply_tx.send(Err(e));
+                }
+                return delegated;
+            }
+        };
 
-        tracing::info!(
-            "Backend '{}' getting prompt '{}' with args: {:?}",
-            self.config.name,
-            name,
-            arguments
-        );
+        let backend = self.config.name.clone();
+        let timeout_secs = self.config.timeout_secs;
+        let semaphore = Arc::clone(&self.inflight);
+        let self_ref = self.self_ref.clone();
 
-        // Convert HashMap<String, String> to serde_json::Map<String, Value>
-        let args_map = arguments.map(|args| {
-            args.into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect()
+        tokio::spawn(async move {
+            let Ok(_permit) = semaphore.acquire().await else {
+                if let Some(reply_tx) = reply_tx {
+                    reply_tx.send(Err(format!("Backend '{backend}' call limiter is closed")));
+                }
+                return;
+            };
+            let _inflight = crate::metrics::InflightCallGuard::new(&backend);
+
+            let result = timeout(Duration::from_secs(timeout_secs), request(peer)).await;
+
+            // The error is what the actor counts against the circuit breaker; a result that
+            // cannot be serialized still reached the backend, so it counts as a success.
+            let (reply, error) = match result {
+                Ok(Ok(value)) => (
+                    serde_json::to_value(&value)
+                        .map_err(|e| format!("{}: {e}", labels.serialize_failed)),
+                    None,
+                ),
+                Ok(Err(e)) => {
+                    let error_msg = format!("{}: {e}", labels.failed);
+                    (Err(error_msg.clone()), Some(error_msg))
+                }
+                Err(_) => {
+                    let error_msg = format!("{} after {timeout_secs}s", labels.timed_out);
+                    (Err(error_msg.clone()), Some(error_msg))
+                }
+            };
+
+            if let Some(reply_tx) = reply_tx {
+                reply_tx.send(reply);
+            }
+
+            if let Some(actor_ref) = self_ref.and_then(|weak| weak.upgrade()) {
+                let _ = actor_ref.tell(CallOutcome { error }).await;
+            }
         });
 
-        let mut params = GetPromptRequestParams::new(name);
-        if let Some(args) = args_map {
-            params = params.with_arguments(args);
-        }
-
-        let call_timeout = Duration::from_secs(self.config.timeout_secs);
-        let result = timeout(call_timeout, client.peer().get_prompt(params)).await;
-
-        match result {
-            Ok(Ok(prompt_result)) => {
-                self.circuit_breaker.record_success();
-                let response = serde_json::to_value(&prompt_result)
-                    .map_err(|e| format!("Failed to serialize prompt result: {e}"))?;
-                Ok(response)
-            }
-            Ok(Err(e)) => {
-                let error_msg = format!("Prompt get failed: {e}");
-                self.handle_call_failure(&error_msg).await;
-                Err(error_msg)
-            }
-            Err(_) => {
-                let error_msg = format!("Prompt get timeout after {}s", self.config.timeout_secs);
-                self.handle_call_failure(&error_msg).await;
-                Err(error_msg)
-            }
-        }
+        delegated
     }
 
     /// Handle a call failure, potentially triggering reconnect or circuit breaker
@@ -827,32 +785,31 @@ pub struct CallTool {
 }
 
 impl Message<CallTool> for BackendActor {
-    type Reply = Result<serde_json::Value, String>;
+    type Reply = CallReply;
 
-    async fn handle(
-        &mut self,
-        msg: CallTool,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        match self.state {
-            BackendState::Connected => self.call_tool(&msg.tool_name, &msg.arguments).await,
-            BackendState::CircuitOpen => {
-                if self.circuit_breaker.should_attempt_close() {
-                    // Allow a test request in half-open state
-                    self.call_tool(&msg.tool_name, &msg.arguments).await
-                } else {
-                    Err(format!(
-                        "Backend '{}' circuit breaker is open",
-                        self.config.name
-                    ))
-                }
+    async fn handle(&mut self, msg: CallTool, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        let backend = self.config.name.clone();
+        let labels = CallLabels {
+            failed: "Tool call failed",
+            timed_out: "Tool call timeout",
+            serialize_failed: "Failed to serialize tool result",
+        };
+        self.spawn_call(ctx, labels, move |peer| {
+            tracing::info!(
+                "Backend '{}' executing tool '{}' with args: {}",
+                backend,
+                msg.tool_name,
+                msg.arguments
+            );
+
+            // Convert arguments to JsonObject if it's an object, otherwise use empty
+            let mut params = CallToolRequestParams::new(msg.tool_name);
+            if let Some(args) = msg.arguments.as_object().cloned() {
+                params = params.with_arguments(args);
             }
-            BackendState::Reconnecting => Err(format!(
-                "Backend '{}' is reconnecting (attempt {})",
-                self.config.name, self.reconnect_attempts
-            )),
-            _ => Err(format!("Backend '{}' is not connected", self.config.name)),
-        }
+
+            async move { peer.call_tool(params).await }
+        })
     }
 }
 
@@ -863,31 +820,27 @@ pub struct ReadResource {
 }
 
 impl Message<ReadResource> for BackendActor {
-    type Reply = Result<serde_json::Value, String>;
+    type Reply = CallReply;
 
     async fn handle(
         &mut self,
         msg: ReadResource,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.state {
-            BackendState::Connected => self.read_resource(&msg.uri).await,
-            BackendState::CircuitOpen => {
-                if self.circuit_breaker.should_attempt_close() {
-                    self.read_resource(&msg.uri).await
-                } else {
-                    Err(format!(
-                        "Backend '{}' circuit breaker is open",
-                        self.config.name
-                    ))
-                }
+        let backend = self.config.name.clone();
+        let labels = CallLabels {
+            failed: "Resource read failed",
+            timed_out: "Resource read timeout",
+            serialize_failed: "Failed to serialize resource result",
+        };
+        self.spawn_call(ctx, labels, move |peer| {
+            tracing::info!("Backend '{}' reading resource '{}'", backend, msg.uri);
+
+            async move {
+                peer.read_resource(ReadResourceRequestParams::new(msg.uri))
+                    .await
             }
-            BackendState::Reconnecting => Err(format!(
-                "Backend '{}' is reconnecting (attempt {})",
-                self.config.name, self.reconnect_attempts
-            )),
-            _ => Err(format!("Backend '{}' is not connected", self.config.name)),
-        }
+        })
     }
 }
 
@@ -899,30 +852,57 @@ pub struct GetPrompt {
 }
 
 impl Message<GetPrompt> for BackendActor {
-    type Reply = Result<serde_json::Value, String>;
+    type Reply = CallReply;
 
     async fn handle(
         &mut self,
         msg: GetPrompt,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        match self.state {
-            BackendState::Connected => self.get_prompt(&msg.name, msg.arguments).await,
-            BackendState::CircuitOpen => {
-                if self.circuit_breaker.should_attempt_close() {
-                    self.get_prompt(&msg.name, msg.arguments).await
-                } else {
-                    Err(format!(
-                        "Backend '{}' circuit breaker is open",
-                        self.config.name
-                    ))
-                }
+        let backend = self.config.name.clone();
+        let labels = CallLabels {
+            failed: "Prompt get failed",
+            timed_out: "Prompt get timeout",
+            serialize_failed: "Failed to serialize prompt result",
+        };
+        self.spawn_call(ctx, labels, move |peer| {
+            tracing::info!(
+                "Backend '{}' getting prompt '{}' with args: {:?}",
+                backend,
+                msg.name,
+                msg.arguments
+            );
+
+            // Convert HashMap<String, String> to serde_json::Map<String, Value>
+            let args_map = msg.arguments.map(|args| {
+                args.into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect()
+            });
+
+            let mut params = GetPromptRequestParams::new(msg.name);
+            if let Some(args) = args_map {
+                params = params.with_arguments(args);
             }
-            BackendState::Reconnecting => Err(format!(
-                "Backend '{}' is reconnecting (attempt {})",
-                self.config.name, self.reconnect_attempts
-            )),
-            _ => Err(format!("Backend '{}' is not connected", self.config.name)),
+
+            async move { peer.get_prompt(params).await }
+        })
+    }
+}
+
+/// Outcome of a spawned request, reported back so the actor can update its circuit breaker
+pub struct CallOutcome {
+    /// `None` when the request reached the backend, otherwise the error that failed it
+    pub error: Option<String>,
+}
+
+impl Message<CallOutcome> for BackendActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: CallOutcome, _ctx: &mut Context<Self, Self::Reply>) {
+        match msg.error {
+            None => self.circuit_breaker.record_success(),
+            Some(error_msg) => self.handle_call_failure(&error_msg).await,
         }
     }
 }

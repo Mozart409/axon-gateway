@@ -5,6 +5,7 @@
 //! - `axon_tool_call_duration_seconds` — Histogram of tool call latencies
 //! - `axon_tool_call_errors_total` — Counter of failed tool calls
 //! - `axon_backend_connections` — Gauge of backend connection states
+//! - `axon_backend_inflight_calls` — Gauge of requests in flight per backend
 //! - `axon_requests_total` — Counter of HTTP requests by method/path
 //! - `axon_health_checks_total` — Counter of health check results
 
@@ -60,6 +61,26 @@ pub fn record_backend_state(backend: &str, state: &str) {
         "state" => state.to_string()
     )
     .set(1.0);
+}
+
+/// Counts a request as in flight for its backend until dropped.
+pub struct InflightCallGuard {
+    backend: String,
+}
+
+impl InflightCallGuard {
+    pub fn new(backend: &str) -> Self {
+        gauge!("axon_backend_inflight_calls", "backend" => backend.to_string()).increment(1.0);
+        Self {
+            backend: backend.to_string(),
+        }
+    }
+}
+
+impl Drop for InflightCallGuard {
+    fn drop(&mut self) {
+        gauge!("axon_backend_inflight_calls", "backend" => self.backend.clone()).decrement(1.0);
+    }
 }
 
 /// Record an HTTP request
