@@ -9,8 +9,11 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use super::{AppState, FlashLevel, FlashMessage};
 use crate::gateway::DetailedGatewayStatus;
+use crate::policy::{AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, ToolRef};
 use crate::store::SessionUser;
-use crate::types::{BackendInfo, BackendState, PromptDefinition, ResourceDefinition};
+use crate::types::{
+    BackendInfo, BackendState, NamespacedTool, PromptDefinition, ResourceDefinition,
+};
 
 /// One "Sign in with ..." choice on the login page.
 pub(super) struct LoginOption {
@@ -274,6 +277,12 @@ fn render_user_bar(user: &SessionUser) -> Markup {
 
     html! {
         div class="mb-4 flex flex-wrap items-center justify-end gap-3 text-sm text-slate-600 dark:text-slate-300" {
+            a
+                class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
+                href="/ui/tools"
+            {
+                "My tools"
+            }
             span class="font-medium text-slate-900 dark:text-slate-100" { (name) }
             @if user.user.is_admin {
                 span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
@@ -474,6 +483,282 @@ pub(super) fn render_ui_backend_detail_page(
                         }
                     }
 
+                    footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
+                        (build_fingerprint(state))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How one tool stands for one user.
+enum ToolState {
+    /// Allowed by a mandatory grant: cannot be hidden
+    Mandatory,
+    /// Allowed and shown
+    On,
+    /// Allowed, hidden by the user (`via_backend`: by hiding the whole backend)
+    Hidden { via_backend: bool },
+    /// No grant of the user's groups allows it; the text says why
+    NotGranted(String),
+}
+
+fn tool_ref(tool: &NamespacedTool) -> ToolRef<'_> {
+    ToolRef {
+        backend: &tool.backend_name,
+        name: &tool.original_name,
+        read_only_hint: tool.definition.read_only_hint(),
+    }
+}
+
+fn tool_state(tool: &NamespacedTool, effective: &EffectivePolicy, opt_outs: &OptOuts) -> ToolState {
+    let tool_ref = tool_ref(tool);
+    if !effective.allows(tool_ref) {
+        return ToolState::NotGranted(not_granted_reason(&effective.explain(tool_ref)));
+    }
+    if effective.is_mandatory(tool_ref) {
+        ToolState::Mandatory
+    } else if opt_outs.hides_backend(&tool.backend_name) {
+        ToolState::Hidden { via_backend: true }
+    } else if opt_outs.hides(&tool.backend_name, &tool.original_name) {
+        ToolState::Hidden { via_backend: false }
+    } else {
+        ToolState::On
+    }
+}
+
+/// Why no grant allows a tool, in words.
+fn not_granted_reason(explanation: &Explanation) -> String {
+    if explanation.missed.is_empty() {
+        return String::from("no grant for this backend");
+    }
+    explanation
+        .missed
+        .iter()
+        .map(|(grant, miss)| match miss {
+            Miss::NotIncluded => format!("not included by the grant of group {}", grant.group),
+            Miss::Excluded => format!("excluded by the grant of group {}", grant.group),
+            Miss::NotReadOnly => format!(
+                "the grant of group {} is read-only and this tool is not marked read-only",
+                grant.group
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Hide/show form for one tool (`tool` is `Some`) or a whole backend. `hide` is
+/// the value the form posts: true while the thing is currently shown.
+fn render_opt_out_form(backend: &str, tool: Option<&str>, hide: bool, label: &str) -> Markup {
+    html! {
+        form
+            hx-post="/ui/actions/tools/opt-out"
+            hx-target="closest section"
+            hx-swap="outerHTML"
+        {
+            input type="hidden" name="backend" value=(backend);
+            @if let Some(tool) = tool {
+                input type="hidden" name="tool" value=(tool);
+            }
+            input type="hidden" name="hidden" value=(hide.to_string());
+            button
+                class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                type="submit"
+            {
+                (label)
+            }
+        }
+    }
+}
+
+/// One tool row in a backend's table.
+fn render_tool_row(
+    tool: &NamespacedTool,
+    effective: &EffectivePolicy,
+    opt_outs: &OptOuts,
+) -> Markup {
+    let state = tool_state(tool, effective, opt_outs);
+
+    html! {
+        tr class="align-top" {
+            td class="px-4 py-3" {
+                code class="text-slate-900 dark:text-slate-100" { (tool.namespaced_name) }
+                @if tool.definition.read_only_hint() {
+                    span class="ml-2 rounded-full bg-sky-100 px-2 py-0.5 text-xs font-semibold text-sky-800 dark:bg-sky-900/40 dark:text-sky-300" {
+                        "read-only"
+                    }
+                }
+            }
+            td class="px-4 py-3 text-slate-600 dark:text-slate-300" {
+                @if let Some(description) = &tool.definition.description {
+                    (description)
+                }
+            }
+            td class="px-4 py-3" {
+                @match &state {
+                    ToolState::Mandatory => {
+                        span class="font-medium text-amber-700 dark:text-amber-400" { "mandatory" }
+                        p class="mt-1 text-xs text-slate-500 dark:text-slate-400" { "required by your admin" }
+                    }
+                    ToolState::On => {
+                        span class="font-medium text-emerald-700 dark:text-emerald-400" { "on" }
+                    }
+                    ToolState::Hidden { via_backend } => {
+                        span class="font-medium text-slate-500 dark:text-slate-400" { "hidden by you" }
+                        @if *via_backend {
+                            p class="mt-1 text-xs text-slate-500 dark:text-slate-400" { "with the whole backend" }
+                        }
+                    }
+                    ToolState::NotGranted(reason) => {
+                        span class="font-medium text-red-700 dark:text-red-400" { "not granted" }
+                        p class="mt-1 text-xs text-slate-500 dark:text-slate-400" { (reason) }
+                    }
+                }
+            }
+            td class="px-4 py-3" {
+                @match &state {
+                    ToolState::On => {
+                        (render_opt_out_form(&tool.backend_name, Some(&tool.original_name), true, "Hide"))
+                    }
+                    ToolState::Hidden { via_backend: false } => {
+                        (render_opt_out_form(&tool.backend_name, Some(&tool.original_name), false, "Show"))
+                    }
+                    ToolState::Mandatory
+                    | ToolState::Hidden { via_backend: true }
+                    | ToolState::NotGranted(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// One backend's section of the "My tools" page, also the htmx swap target of
+/// the hide/show forms (`hx-target="closest section"`).
+pub(super) fn render_tool_backend_section(
+    backend: &BackendInfo,
+    effective: &EffectivePolicy,
+    opt_outs: &OptOuts,
+) -> Markup {
+    let granted = effective.backends().contains(&backend.name);
+    let backend_hidden = opt_outs.hides_backend(&backend.name);
+    let mut tools: Vec<&NamespacedTool> = backend.tools.iter().collect();
+    tools.sort_by(|a, b| a.namespaced_name.cmp(&b.namespaced_name));
+
+    html! {
+        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            div class="flex flex-wrap items-center justify-between gap-3" {
+                h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" {
+                    code { (backend.name) }
+                }
+                @if granted {
+                    (render_opt_out_form(
+                        &backend.name,
+                        None,
+                        !backend_hidden,
+                        if backend_hidden { "Show backend" } else { "Hide backend" },
+                    ))
+                }
+            }
+            @if !granted {
+                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" {
+                    "No access \u{2014} ask an admin"
+                }
+            } @else {
+                @if backend_hidden {
+                    p class="mt-3 text-sm text-slate-600 dark:text-slate-300" {
+                        "You hid this backend. Its mandatory tools stay visible."
+                    }
+                }
+                div class="mt-4 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800" {
+                    table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800" {
+                        thead class="bg-slate-50 dark:bg-slate-800/80" {
+                            tr {
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Tool" }
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Description" }
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "State" }
+                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Actions" }
+                            }
+                        }
+                        tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-900" {
+                            @for tool in tools {
+                                (render_tool_row(tool, effective, opt_outs))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// "My tools" page (`GET /ui/tools`, multi-user mode only): the user's RBAC
+/// groups and every tool with its state.
+pub(super) fn render_my_tools_page(
+    state: &AppState,
+    user: &SessionUser,
+    groups: &[String],
+    backends: &[BackendInfo],
+    effective: &EffectivePolicy,
+    opt_outs: &OptOuts,
+) -> Markup {
+    let hx_headers = csrf_hx_headers(user);
+    let mut sections: Vec<&BackendInfo> = backends
+        .iter()
+        .filter(|backend| !backend.tools.is_empty())
+        .collect();
+    sections.sort_by(|a, b| a.name.cmp(&b.name));
+
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "My tools - Axon Gateway" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                meta name="csrf-token" content=(user.csrf_token);
+                script src="https://unpkg.com/htmx.org@2.0.4" defer {};
+                link rel="stylesheet" href="/styles/output.css?v=1";
+            }
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=(hx_headers) {
+                main class="mx-auto max-w-6xl p-6" {
+                    (render_user_bar(user))
+                    section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        a
+                            href="/ui"
+                            class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
+                        {
+                            (PreEscaped("&larr;")) " Back to dashboard"
+                        }
+                        h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                            "My tools"
+                        }
+                        p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
+                            "Hiding a tool or a backend only removes it from your own tool list. "
+                            "Tools your admin marked mandatory stay visible, even when you hide their backend."
+                        }
+                        h2 class="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100" { "Your groups" }
+                        ul class="mt-2 space-y-1 text-sm" {
+                            @for group in groups {
+                                li {
+                                    code class="text-slate-900 dark:text-slate-100" { (group) }
+                                    @if group == AUTHENTICATED_GROUP {
+                                        span class="ml-2 text-xs text-slate-500 dark:text-slate-400" { "built in" }
+                                    }
+                                    @if let Some(description) = state.policy.group_description(group) {
+                                        span class="ml-2 text-slate-600 dark:text-slate-300" { (description) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    @if sections.is_empty() {
+                        p class="mt-6 text-sm text-slate-500 dark:text-slate-400" { "No tools are available yet." }
+                    }
+                    @for backend in sections {
+                        (render_tool_backend_section(backend, effective, opt_outs))
+                    }
                     footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
                         (build_fingerprint(state))
                     }

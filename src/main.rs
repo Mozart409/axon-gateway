@@ -14,6 +14,7 @@ mod error;
 mod gateway;
 mod metrics;
 mod oidc;
+mod policy;
 mod registry;
 mod server;
 mod store;
@@ -79,6 +80,7 @@ async fn main() -> Result<()> {
 
     // Dashboard login. Built before `config` moves into the gateway actor.
     let oidc = setup_oidc(&config, &base_url)?;
+    let policy = Arc::new(policy::Policy::from_config(&config.rbac));
 
     if let Some(store) = store.clone() {
         spawn_session_purge(store);
@@ -99,16 +101,16 @@ async fn main() -> Result<()> {
         tracing::warn!("No authentication configured - gateway is open");
     }
 
-    // Spawn registry actor (with tool groups if configured)
-    let registry = if config.groups.is_empty() {
+    // Spawn registry actor (with toolsets if configured)
+    let registry = if config.toolsets.is_empty() {
         RegistryActor::spawn_with_mailbox(RegistryActor::new(), mailbox::unbounded())
     } else {
         tracing::info!(
-            "Tool groups configured: {:?}",
-            config.groups.iter().map(|g| &g.name).collect::<Vec<_>>()
+            "Toolsets configured: {:?}",
+            config.toolsets.iter().map(|g| &g.name).collect::<Vec<_>>()
         );
         RegistryActor::spawn_with_mailbox(
-            RegistryActor::with_groups(config.groups.clone()),
+            RegistryActor::with_toolsets(config.toolsets.clone()),
             mailbox::unbounded(),
         )
     };
@@ -153,6 +155,7 @@ async fn main() -> Result<()> {
         metrics_handle,
         store,
         oidc,
+        policy,
     };
 
     // Run server with graceful shutdown

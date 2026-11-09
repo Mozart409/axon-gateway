@@ -85,7 +85,7 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
 
 ### Phase 6: Advanced ✅
 
-- [x] **Tool groups** — Expose subsets of tools via `/mcp/group/{name}` endpoints
+- [x] **Toolsets** — Expose subsets of tools via `/mcp/toolset/{name}` endpoints. Deprecated aliases: `/mcp/group/{name}` and `/status/groups`.
 - [x] **Caching** — Cache tool lists with TTL, auto-invalidate on backend reconnect
 - [ ] **Streaming responses** — Properly proxy streaming tool results
 - [ ] **Multi-tenant** — Different configs/permissions per API key
@@ -157,8 +157,8 @@ allowed_tools = ["backend_*"]  # Optional: tool patterns (empty = all)
 allowed_backends = ["name"] # Optional: backend names (empty = all)
 rate_limit_per_minute = 60  # Optional: per-token rate limit
 
-[[groups]]
-name = "home"               # Required: group name (used in /mcp/group/{name})
+[[toolsets]]
+name = "home"               # Required: toolset name (used in /mcp/toolset/{name})
 description = "Home tools"  # Optional: description
 backends = ["homeassistant"]  # Optional: filter by backend (empty = all)
 tools = ["homeassistant_*"] # Optional: tool patterns (empty = all)

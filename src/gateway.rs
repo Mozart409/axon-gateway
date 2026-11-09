@@ -22,7 +22,7 @@ use crate::backend::{
 };
 use crate::config::{BackendConfig, Config};
 use crate::registry::{
-    GetBackendStatus, ListToolGroup, ListToolGroups, ListTools, RegisterBackend, RegistryActor,
+    GetBackendStatus, ListTools, ListToolset, ListToolsets, RegisterBackend, RegistryActor,
     RemoveBackend, ResolveToolBackend, ToolRoute,
 };
 use crate::types::{
@@ -552,30 +552,30 @@ impl Message<GetStatus> for GatewayActor {
     }
 }
 
-/// Handle a JSON-RPC request scoped to a tool group
+/// Handle a JSON-RPC request scoped to a toolset
 ///
-/// For `tools/list`, returns only tools in the specified group.
+/// For `tools/list`, returns only tools in the specified toolset.
 /// Other methods are handled the same as regular requests.
 #[derive(Clone)]
-pub struct HandleGroupRequest {
+pub struct HandleToolsetRequest {
     pub request: JsonRpcRequest,
     pub identity: Option<Arc<TokenIdentity>>,
-    pub group_name: String,
+    pub toolset_name: String,
 }
 
-impl Message<HandleGroupRequest> for GatewayActor {
+impl Message<HandleToolsetRequest> for GatewayActor {
     type Reply = DelegatedReply<JsonRpcResponse>;
 
     async fn handle(
         &mut self,
-        msg: HandleGroupRequest,
+        msg: HandleToolsetRequest,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let router = self.router();
         let (delegated, sender) = ctx.reply_sender();
         tokio::spawn(async move {
             let response = router
-                .handle_group_request(msg.request, msg.identity.as_deref(), &msg.group_name)
+                .handle_toolset_request(msg.request, msg.identity.as_deref(), &msg.toolset_name)
                 .await;
             if let Some(sender) = sender {
                 sender.send(response);
@@ -586,18 +586,18 @@ impl Message<HandleGroupRequest> for GatewayActor {
 }
 
 impl RequestRouter {
-    async fn handle_group_request(
+    async fn handle_toolset_request(
         &self,
         request: JsonRpcRequest,
         identity: Option<&TokenIdentity>,
-        group_name: &str,
+        toolset_name: &str,
     ) -> JsonRpcResponse {
-        // For tools/list, return group-filtered tools
+        // For tools/list, return toolset-filtered tools
         if request.method == "tools/list" {
             return match self
                 .registry
-                .ask(ListToolGroup {
-                    group_name: group_name.to_string(),
+                .ask(ListToolset {
+                    toolset_name: toolset_name.to_string(),
                 })
                 .await
             {
@@ -608,7 +608,7 @@ impl RequestRouter {
                 Err(e) => JsonRpcResponse::error(
                     request.id.clone(),
                     -32000,
-                    format!("Failed to list tools for group '{group_name}': {e}"),
+                    format!("Failed to list tools for toolset '{toolset_name}': {e}"),
                 ),
             };
         }
@@ -618,18 +618,18 @@ impl RequestRouter {
     }
 }
 
-/// Get available tool groups
-pub struct GetToolGroups;
+/// Get available toolsets
+pub struct GetToolsets;
 
-impl Message<GetToolGroups> for GatewayActor {
-    type Reply = Vec<crate::registry::ToolGroupInfo>;
+impl Message<GetToolsets> for GatewayActor {
+    type Reply = Vec<crate::registry::ToolsetInfo>;
 
     async fn handle(
         &mut self,
-        _msg: GetToolGroups,
+        _msg: GetToolsets,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.registry.ask(ListToolGroups).await.unwrap_or_default()
+        self.registry.ask(ListToolsets).await.unwrap_or_default()
     }
 }
 
@@ -1218,6 +1218,7 @@ mod tests {
                 name: name.to_string(),
                 description: None,
                 input_schema: serde_json::json!({"type": "object"}),
+                annotations: None,
             }
         }
 
@@ -1259,9 +1260,11 @@ mod tests {
                 },
                 backends: Vec::new(),
                 tokens: Vec::new(),
+                toolsets: Vec::new(),
                 groups: Vec::new(),
                 database: None,
                 auth: crate::config::AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
             };
             GatewayActor::spawn_with_mailbox(
                 GatewayActor::new(config, registry),

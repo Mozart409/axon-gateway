@@ -5,7 +5,7 @@
 //! - Maintain aggregated tool list with namespacing
 //! - Route tool calls to correct backend
 //! - Cache tool lists with automatic invalidation
-//! - Support tool group filtering
+//! - Support toolset filtering
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use kameo::actor::{Actor, ActorRef};
 use kameo::message::{Context, Message};
 
-use crate::config::ToolGroupConfig;
+use crate::config::ToolsetConfig;
 use crate::types::{BackendInfo, BackendState, NamespacedTool, ToolDefinition};
 
 /// Default cache TTL for tool lists (5 minutes)
@@ -65,8 +65,8 @@ pub struct RegistryActor {
     tool_routing: Arc<DashMap<String, String>>,
     /// Cached tool list to avoid recomputing on every `tools/list`
     tool_cache: ToolCache,
-    /// Tool group definitions
-    tool_groups: Vec<ToolGroupConfig>,
+    /// Toolset definitions
+    toolsets: Vec<ToolsetConfig>,
 }
 
 impl RegistryActor {
@@ -75,17 +75,17 @@ impl RegistryActor {
             backends: Arc::new(DashMap::new()),
             tool_routing: Arc::new(DashMap::new()),
             tool_cache: ToolCache::new(DEFAULT_CACHE_TTL_SECS),
-            tool_groups: Vec::new(),
+            toolsets: Vec::new(),
         }
     }
 
-    /// Create with tool group definitions
-    pub fn with_groups(groups: Vec<ToolGroupConfig>) -> Self {
+    /// Create with toolset definitions
+    pub fn with_toolsets(toolsets: Vec<ToolsetConfig>) -> Self {
         Self {
             backends: Arc::new(DashMap::new()),
             tool_routing: Arc::new(DashMap::new()),
             tool_cache: ToolCache::new(DEFAULT_CACHE_TTL_SECS),
-            tool_groups: groups,
+            toolsets,
         }
     }
 
@@ -103,17 +103,17 @@ impl RegistryActor {
             .collect()
     }
 
-    /// Filter tools for a specific tool group
-    fn filter_tools_for_group(
+    /// Filter tools for a specific toolset
+    fn filter_tools_for_toolset(
         tools: &[ToolDefinition],
-        group: &ToolGroupConfig,
+        toolset: &ToolsetConfig,
     ) -> Vec<ToolDefinition> {
         tools
             .iter()
             .filter(|tool| {
                 // Check backend filter
-                if !group.backends.is_empty() {
-                    let matches_backend = group
+                if !toolset.backends.is_empty() {
+                    let matches_backend = toolset
                         .backends
                         .iter()
                         .any(|b| tool.name.starts_with(&format!("{b}_")));
@@ -123,11 +123,11 @@ impl RegistryActor {
                 }
 
                 // Check tool pattern filter
-                if group.tools.is_empty() {
+                if toolset.tools.is_empty() {
                     return true; // No tool filter = include all
                 }
 
-                group
+                toolset
                     .tools
                     .iter()
                     .any(|pattern| crate::authz::tool_matches_pattern(&tool.name, pattern))
@@ -143,14 +143,10 @@ impl Actor for RegistryActor {
 
     async fn on_start(state: Self, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!("Registry actor started");
-        if !state.tool_groups.is_empty() {
+        if !state.toolsets.is_empty() {
             tracing::info!(
-                "Tool groups configured: {:?}",
-                state
-                    .tool_groups
-                    .iter()
-                    .map(|g| &g.name)
-                    .collect::<Vec<_>>()
+                "Toolsets configured: {:?}",
+                state.toolsets.iter().map(|g| &g.name).collect::<Vec<_>>()
             );
         }
         Ok(state)
@@ -248,24 +244,24 @@ impl Message<ListTools> for RegistryActor {
     }
 }
 
-/// List tools for a specific tool group
-pub struct ListToolGroup {
-    pub group_name: String,
+/// List tools for a specific toolset
+pub struct ListToolset {
+    pub toolset_name: String,
 }
 
-impl Message<ListToolGroup> for RegistryActor {
+impl Message<ListToolset> for RegistryActor {
     type Reply = Result<Vec<ToolDefinition>, String>;
 
     async fn handle(
         &mut self,
-        msg: ListToolGroup,
+        msg: ListToolset,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let group = self
-            .tool_groups
+        let toolset = self
+            .toolsets
             .iter()
-            .find(|g| g.name == msg.group_name)
-            .ok_or_else(|| format!("Tool group '{}' not found", msg.group_name))?;
+            .find(|g| g.name == msg.toolset_name)
+            .ok_or_else(|| format!("Toolset '{}' not found", msg.toolset_name))?;
 
         // Get all tools (using cache)
         let all_tools = if self.tool_cache.is_valid() {
@@ -276,26 +272,26 @@ impl Message<ListToolGroup> for RegistryActor {
             tools
         };
 
-        Ok(Self::filter_tools_for_group(&all_tools, group))
+        Ok(Self::filter_tools_for_toolset(&all_tools, toolset))
     }
 }
 
-/// Get available tool groups
-pub struct ListToolGroups;
+/// Get available toolsets
+pub struct ListToolsets;
 
 #[derive(Debug, Clone, serde::Serialize, kameo::Reply)]
-pub struct ToolGroupInfo {
+pub struct ToolsetInfo {
     pub name: String,
     pub description: Option<String>,
     pub tool_count: usize,
 }
 
-impl Message<ListToolGroups> for RegistryActor {
-    type Reply = Vec<ToolGroupInfo>;
+impl Message<ListToolsets> for RegistryActor {
+    type Reply = Vec<ToolsetInfo>;
 
     async fn handle(
         &mut self,
-        _msg: ListToolGroups,
+        _msg: ListToolsets,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let all_tools = if self.tool_cache.is_valid() {
@@ -306,13 +302,13 @@ impl Message<ListToolGroups> for RegistryActor {
             tools
         };
 
-        self.tool_groups
+        self.toolsets
             .iter()
-            .map(|group| {
-                let filtered = Self::filter_tools_for_group(&all_tools, group);
-                ToolGroupInfo {
-                    name: group.name.clone(),
-                    description: group.description.clone(),
+            .map(|toolset| {
+                let filtered = Self::filter_tools_for_toolset(&all_tools, toolset);
+                ToolsetInfo {
+                    name: toolset.name.clone(),
+                    description: toolset.description.clone(),
                     tool_count: filtered.len(),
                 }
             })
@@ -404,6 +400,7 @@ mod tests {
             name: name.to_string(),
             description: Some(format!("{name} description")),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
         }
     }
 
@@ -449,20 +446,20 @@ mod tests {
         }
     }
 
-    mod filter_tools_for_group {
+    mod filter_tools_for_toolset {
         use super::*;
 
         #[test]
         fn empty_filters_returns_all_tools() {
             let tools = vec![make_tool("backend1_tool_a"), make_tool("backend2_tool_b")];
-            let group = ToolGroupConfig {
+            let toolset = ToolsetConfig {
                 name: "all".to_string(),
                 tools: vec![],
                 backends: vec![],
                 description: None,
             };
 
-            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            let filtered = RegistryActor::filter_tools_for_toolset(&tools, &toolset);
             assert_eq!(filtered.len(), 2);
         }
 
@@ -473,14 +470,14 @@ mod tests {
                 make_tool("backend1_tool_b"),
                 make_tool("backend2_tool_c"),
             ];
-            let group = ToolGroupConfig {
-                name: "group1".to_string(),
+            let toolset = ToolsetConfig {
+                name: "toolset1".to_string(),
                 tools: vec![],
                 backends: vec!["backend1".to_string()],
                 description: None,
             };
 
-            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            let filtered = RegistryActor::filter_tools_for_toolset(&tools, &toolset);
             assert_eq!(filtered.len(), 2);
             assert!(filtered.iter().all(|t| t.name.starts_with("backend1_")));
         }
@@ -492,14 +489,14 @@ mod tests {
                 make_tool("backend1_write"),
                 make_tool("backend2_delete"),
             ];
-            let group = ToolGroupConfig {
+            let toolset = ToolsetConfig {
                 name: "backend1_tools".to_string(),
                 tools: vec!["backend1_*".to_string()],
                 backends: vec![],
                 description: None,
             };
 
-            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            let filtered = RegistryActor::filter_tools_for_toolset(&tools, &toolset);
             assert_eq!(filtered.len(), 2);
             assert!(filtered.iter().all(|t| t.name.starts_with("backend1_")));
         }
@@ -511,14 +508,14 @@ mod tests {
                 make_tool("backend1_write"),
                 make_tool("backend1_delete"),
             ];
-            let group = ToolGroupConfig {
+            let toolset = ToolsetConfig {
                 name: "readonly".to_string(),
                 tools: vec!["backend1_read".to_string()],
                 backends: vec![],
                 description: None,
             };
 
-            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            let filtered = RegistryActor::filter_tools_for_toolset(&tools, &toolset);
             assert_eq!(filtered.len(), 1);
             assert_eq!(filtered[0].name, "backend1_read");
         }
@@ -530,14 +527,14 @@ mod tests {
                 make_tool("backend1_write"),
                 make_tool("backend2_read"),
             ];
-            let group = ToolGroupConfig {
+            let toolset = ToolsetConfig {
                 name: "b1_read".to_string(),
                 tools: vec!["backend1_read".to_string()],
                 backends: vec!["backend1".to_string()],
                 description: None,
             };
 
-            let filtered = RegistryActor::filter_tools_for_group(&tools, &group);
+            let filtered = RegistryActor::filter_tools_for_toolset(&tools, &toolset);
             assert_eq!(filtered.len(), 1);
             assert_eq!(filtered[0].name, "backend1_read");
         }
@@ -554,16 +551,16 @@ mod tests {
         }
 
         #[test]
-        fn with_groups_stores_groups() {
-            let groups = vec![ToolGroupConfig {
-                name: "group1".to_string(),
+        fn with_toolsets_stores_toolsets() {
+            let toolsets = vec![ToolsetConfig {
+                name: "toolset1".to_string(),
                 tools: vec![],
                 backends: vec![],
-                description: Some("Test group".to_string()),
+                description: Some("Test toolset".to_string()),
             }];
-            let registry = RegistryActor::with_groups(groups.clone());
-            assert_eq!(registry.tool_groups.len(), 1);
-            assert_eq!(registry.tool_groups[0].name, "group1");
+            let registry = RegistryActor::with_toolsets(toolsets.clone());
+            assert_eq!(registry.toolsets.len(), 1);
+            assert_eq!(registry.toolsets[0].name, "toolset1");
         }
 
         #[test]

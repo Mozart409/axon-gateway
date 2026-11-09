@@ -14,6 +14,20 @@ pub struct ToolDefinition {
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// MCP tool annotations (`readOnlyHint` etc.), passed through unchanged
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub annotations: Option<serde_json::Value>,
+}
+
+impl ToolDefinition {
+    /// True only when the backend marked the tool `readOnlyHint: true`
+    pub fn read_only_hint(&self) -> bool {
+        self.annotations
+            .as_ref()
+            .and_then(|a| a.get("readOnlyHint"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 impl From<Tool> for ToolDefinition {
@@ -22,6 +36,9 @@ impl From<Tool> for ToolDefinition {
             name: tool.name.into_owned(),
             description: tool.description.map(Cow::into_owned),
             input_schema: serde_json::to_value(&*tool.input_schema).unwrap_or_default(),
+            annotations: tool
+                .annotations
+                .and_then(|annotations| serde_json::to_value(annotations).ok()),
         }
     }
 }
@@ -386,6 +403,69 @@ mod tests {
             assert_eq!(def.name, "owned_name");
             assert_eq!(def.description, Some("owned desc".to_string()));
         }
+
+        #[test]
+        fn keeps_read_only_hint_annotation() {
+            let tool = Tool::new_with_raw("ro_tool", None, Arc::new(serde_json::Map::new()))
+                .annotate(rmcp::model::ToolAnnotations::new().read_only(true));
+
+            let def = ToolDefinition::from(tool);
+            assert_eq!(
+                def.annotations,
+                Some(serde_json::json!({"readOnlyHint": true}))
+            );
+            assert!(def.read_only_hint());
+        }
+
+        #[test]
+        fn tool_without_annotations_has_none() {
+            let tool = Tool::new_with_raw("plain", None, Arc::new(serde_json::Map::new()));
+
+            let def = ToolDefinition::from(tool);
+            assert!(def.annotations.is_none());
+            assert!(!def.read_only_hint());
+        }
+    }
+
+    mod read_only_hint {
+        use super::*;
+
+        fn with_annotations(annotations: Option<serde_json::Value>) -> ToolDefinition {
+            ToolDefinition {
+                name: "t".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                annotations,
+            }
+        }
+
+        fn hint(annotations: serde_json::Value) -> bool {
+            with_annotations(Some(annotations)).read_only_hint()
+        }
+
+        #[test]
+        fn true_only_for_json_true() {
+            assert!(hint(serde_json::json!({"readOnlyHint": true})));
+            assert!(!hint(serde_json::json!({"readOnlyHint": false})));
+            assert!(!hint(serde_json::json!({"readOnlyHint": "true"})));
+            assert!(!hint(serde_json::json!({"title": "x"})));
+            assert!(!with_annotations(None).read_only_hint());
+        }
+
+        #[test]
+        fn annotations_are_serialized_only_when_present() {
+            let none = serde_json::to_value(with_annotations(None)).unwrap();
+            assert!(none.get("annotations").is_none());
+
+            let some = serde_json::to_value(with_annotations(Some(
+                serde_json::json!({"readOnlyHint": true}),
+            )))
+            .unwrap();
+            assert_eq!(
+                some["annotations"],
+                serde_json::json!({"readOnlyHint": true})
+            );
+        }
     }
 
     mod prompt_definition_from {
@@ -437,6 +517,7 @@ mod tests {
                 name: name.to_string(),
                 description: Some(format!("{name} description")),
                 input_schema: serde_json::json!({}),
+                annotations: None,
             }
         }
 
@@ -471,6 +552,7 @@ mod tests {
                     "type": "object",
                     "required": ["input"]
                 }),
+                annotations: None,
             };
             let ns = NamespacedTool::new("be", tool);
 
@@ -561,6 +643,7 @@ mod tests {
                         name: "t1".to_string(),
                         description: None,
                         input_schema: serde_json::json!({}),
+                        annotations: None,
                     },
                 ),
                 NamespacedTool::new(
@@ -569,6 +652,7 @@ mod tests {
                         name: "t2".to_string(),
                         description: None,
                         input_schema: serde_json::json!({}),
+                        annotations: None,
                     },
                 ),
             ];

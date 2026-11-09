@@ -102,27 +102,27 @@ enabled = true
 # allowed_backends = ["homeassistant", "jellyfin"]
 # rate_limit_per_minute = 60
 
-# --- Tool Groups ---
+# --- Toolsets ---
 # Expose subsets of tools via different endpoints.
-# Access via POST /mcp/group/{name}
-# List groups via GET /status/groups
+# Access via POST /mcp/toolset/{name}
+# List toolsets via GET /status/toolsets
 
-# Example: home automation group
-# [[groups]]
+# Example: home automation toolset
+# [[toolsets]]
 # name = "home"
 # description = "Home automation tools"
 # backends = ["homeassistant"]
 # # tools = []  # empty = all tools from allowed backends
 
-# Example: media group with specific tools
-# [[groups]]
+# Example: media toolset with specific tools
+# [[toolsets]]
 # name = "media"
 # description = "Media management tools"
 # tools = ["jellyfin_*"]
 # backends = ["jellyfin"]
 
-# Example: all tools (useful for giving different auth to different groups)
-# [[groups]]
+# Example: all tools (useful for giving different auth to different toolsets)
+# [[toolsets]]
 # name = "all"
 # description = "All available tools"
 # # backends = []  # empty = all backends

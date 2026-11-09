@@ -38,9 +38,13 @@ pub struct Config {
     /// Named API tokens with permissions
     #[serde(default)]
     pub tokens: Vec<TokenConfig>,
-    /// Tool groups: expose subsets of tools via different path prefixes
+    /// Toolsets: expose subsets of tools via different path prefixes
     #[serde(default)]
-    pub groups: Vec<ToolGroupConfig>,
+    pub toolsets: Vec<ToolsetConfig>,
+    /// Deprecated name of `toolsets` (`[[groups]]`); [`Config::load`] moves the
+    /// entries into `toolsets`, so this is empty after loading.
+    #[serde(default)]
+    pub groups: Vec<ToolsetConfig>,
     /// Optional Postgres store; without it the gateway runs standalone.
     /// Not hot-reloadable: changes need a restart.
     #[serde(default)]
@@ -49,6 +53,9 @@ pub struct Config {
     /// Not hot-reloadable: changes need a restart.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// RBAC groups and tool grants (multi-user mode). Not hot-reloadable: changes need a restart.
+    #[serde(default)]
+    pub rbac: crate::policy::RbacConfig,
 }
 
 /// `[auth]` section: how people log in to the dashboard.
@@ -106,13 +113,13 @@ fn default_groups_claim() -> String {
     String::from("groups")
 }
 
-/// Tool group configuration
+/// Toolset configuration
 ///
-/// Expose subsets of tools via different endpoints, e.g. `/mcp/coding`
+/// Expose subsets of tools via different endpoints, e.g. `/mcp/toolset/coding`
 /// only exposes tools matching the configured patterns.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ToolGroupConfig {
-    /// Group name used as path suffix: `/mcp/{name}`
+pub struct ToolsetConfig {
+    /// Toolset name used as path suffix: `/mcp/toolset/{name}`
     pub name: String,
     /// Tool name patterns to include (supports `"backend_*"` globs)
     #[serde(default)]
@@ -120,7 +127,7 @@ pub struct ToolGroupConfig {
     /// Backends to include (empty = all)
     #[serde(default)]
     pub backends: Vec<String>,
-    /// Optional description for this group
+    /// Optional description for this toolset
     pub description: Option<String>,
 }
 
@@ -273,6 +280,7 @@ impl Config {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&content)?;
+        config.migrate_deprecated_groups();
 
         let env_vars = load_env_vars(path)?;
         config.resolve_env_vars(&env_vars)?;
@@ -288,6 +296,15 @@ impl Config {
         tokio::task::spawn_blocking(move || Self::load(path))
             .await
             .map_err(|e| ConfigError::ReadError(std::io::Error::other(e)))?
+    }
+
+    /// Move the deprecated `[[groups]]` entries into `toolsets`.
+    fn migrate_deprecated_groups(&mut self) {
+        if self.groups.is_empty() {
+            return;
+        }
+        tracing::warn!("[[groups]] is deprecated, rename it to [[toolsets]]");
+        self.toolsets.append(&mut self.groups);
     }
 
     fn resolve_env_vars(&mut self, env_vars: &HashMap<String, String>) -> Result<(), ConfigError> {
@@ -360,22 +377,22 @@ impl Config {
             )?;
         }
 
-        for (index, group) in self.groups.iter_mut().enumerate() {
-            group.name =
-                resolve_placeholders(&group.name, &format!("groups[{index}].name"), env_vars)?;
+        for (index, toolset) in self.toolsets.iter_mut().enumerate() {
+            toolset.name =
+                resolve_placeholders(&toolset.name, &format!("toolsets[{index}].name"), env_vars)?;
             resolve_vec_placeholders(
-                &mut group.tools,
-                &format!("groups[{index}].tools"),
+                &mut toolset.tools,
+                &format!("toolsets[{index}].tools"),
                 env_vars,
             )?;
             resolve_vec_placeholders(
-                &mut group.backends,
-                &format!("groups[{index}].backends"),
+                &mut toolset.backends,
+                &format!("toolsets[{index}].backends"),
                 env_vars,
             )?;
-            group.description = resolve_option_placeholder(
-                group.description.take(),
-                &format!("groups[{index}].description"),
+            toolset.description = resolve_option_placeholder(
+                toolset.description.take(),
+                &format!("toolsets[{index}].description"),
                 env_vars,
             )?;
         }
@@ -420,7 +437,25 @@ impl Config {
             }
         }
 
-        self.validate_auth()
+        let mut toolset_names = std::collections::HashSet::new();
+        for toolset in &self.toolsets {
+            if !toolset_names.insert(toolset.name.as_str()) {
+                return Err(ConfigError::DuplicateToolset {
+                    name: toolset.name.clone(),
+                });
+            }
+        }
+
+        self.validate_auth()?;
+        self.validate_rbac()
+    }
+
+    fn validate_rbac(&self) -> Result<(), ConfigError> {
+        let backend_names: Vec<&str> = self.backends.iter().map(|b| b.name.as_str()).collect();
+        let provider_ids: Vec<&str> = self.auth.oidc.iter().map(|p| p.id.as_str()).collect();
+        self.rbac
+            .validate(&backend_names, &provider_ids)
+            .map_err(ConfigError::InvalidRbac)
     }
 
     fn validate_auth(&self) -> Result<(), ConfigError> {
@@ -678,9 +713,11 @@ mod tests {
                     ..Default::default()
                 }],
                 tokens: vec![],
+                toolsets: vec![],
                 groups: vec![],
                 database: None,
                 auth: AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -709,9 +746,11 @@ mod tests {
                     ..Default::default()
                 }],
                 tokens: vec![],
+                toolsets: vec![],
                 groups: vec![],
                 database: None,
                 auth: AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -737,9 +776,11 @@ mod tests {
                     ..Default::default()
                 }],
                 tokens: vec![],
+                toolsets: vec![],
                 groups: vec![],
                 database: None,
                 auth: AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
             };
 
             let error = config.validate().expect_err("should require command");
@@ -765,9 +806,11 @@ mod tests {
                     ..Default::default()
                 }],
                 tokens: vec![],
+                toolsets: vec![],
                 groups: vec![],
                 database: None,
                 auth: AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
             };
 
             config.validate().expect("valid config should pass");
@@ -789,9 +832,11 @@ mod tests {
                     ..Default::default()
                 }],
                 tokens: vec![],
+                toolsets: vec![],
                 groups: vec![],
                 database: None,
                 auth: AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
             }
         }
 
@@ -850,9 +895,11 @@ mod tests {
                     ..Default::default()
                 }],
                 tokens: vec![],
+                toolsets: vec![],
                 groups: vec![],
                 database: None,
                 auth: AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
             };
 
             config.validate().expect("valid config should pass");
@@ -995,9 +1042,7 @@ allowed_tools = ["*_read", "*_list"]
             assert_eq!(config.tokens[1].allowed_tools, vec!["*_read", "*_list"]);
         }
 
-        #[test]
-        fn parses_tool_groups() {
-            let toml = r#"
+        const TOOLSETS_BASE: &str = r#"
 [gateway]
 bind = "0.0.0.0:8080"
 
@@ -1005,30 +1050,77 @@ bind = "0.0.0.0:8080"
 name = "dummy"
 url = "http://localhost"
 transport = "http"
+"#;
 
-[[groups]]
+        #[test]
+        fn parses_toolsets() {
+            let toml = format!(
+                r#"{TOOLSETS_BASE}
+[[toolsets]]
 name = "coding"
 tools = ["*_read", "*_write"]
 backends = ["vscode", "git"]
 description = "Coding tools only"
 
-[[groups]]
+[[toolsets]]
 name = "readonly"
 tools = ["*_read", "*_list", "*_get"]
-            "#;
+"#
+            );
 
-            let config: Config = toml::from_str(toml).expect("should parse");
-            assert_eq!(config.groups.len(), 2);
+            let config: Config = toml::from_str(&toml).expect("should parse");
+            assert_eq!(config.toolsets.len(), 2);
 
-            assert_eq!(config.groups[0].name, "coding");
-            assert_eq!(config.groups[0].backends, vec!["vscode", "git"]);
+            assert_eq!(config.toolsets[0].name, "coding");
+            assert_eq!(config.toolsets[0].backends, vec!["vscode", "git"]);
             assert_eq!(
-                config.groups[0].description,
+                config.toolsets[0].description,
                 Some("Coding tools only".to_string())
             );
 
-            assert_eq!(config.groups[1].name, "readonly");
-            assert_eq!(config.groups[1].backends, Vec::<String>::new());
+            assert_eq!(config.toolsets[1].name, "readonly");
+            assert_eq!(config.toolsets[1].backends, Vec::<String>::new());
+        }
+
+        #[test]
+        fn deprecated_groups_move_into_toolsets_on_load() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let toml = format!(
+                r#"{TOOLSETS_BASE}
+[[toolsets]]
+name = "new"
+
+[[groups]]
+name = "old"
+"#
+            );
+            std::fs::write(&path, toml).unwrap();
+
+            let config = Config::load(&path).expect("should load");
+            assert!(config.groups.is_empty());
+            let names: Vec<_> = config.toolsets.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, ["new", "old"]);
+        }
+
+        #[test]
+        fn duplicate_toolset_names_are_rejected() {
+            let toml = format!(
+                r#"{TOOLSETS_BASE}
+[[toolsets]]
+name = "same"
+
+[[toolsets]]
+name = "same"
+"#
+            );
+            let config: Config = toml::from_str(&toml).expect("should parse");
+
+            let error = config.validate().expect_err("duplicate must fail");
+            assert!(
+                matches!(&error, ConfigError::DuplicateToolset { name } if name == "same"),
+                "{error:?}"
+            );
         }
     }
 

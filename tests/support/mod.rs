@@ -33,6 +33,7 @@ pub struct ConfigBuilder {
     backends: Vec<String>,
     database_url_env: Option<String>,
     oidc_providers: Vec<String>,
+    rbac: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -45,6 +46,7 @@ impl ConfigBuilder {
             backends: Vec::new(),
             database_url_env: None,
             oidc_providers: Vec::new(),
+            rbac: None,
         }
     }
 
@@ -102,6 +104,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Add `[rbac]` tables (`[[rbac.groups]]`, `[[rbac.grants]]`); `toml` is
+    /// appended as is, after the `[[auth.oidc]]` providers.
+    pub fn rbac(mut self, toml: &str) -> Self {
+        self.rbac = Some(toml.to_string());
+        self
+    }
+
     /// Render the TOML document.
     ///
     /// `backends` is a required root-level key. When there are no backend
@@ -133,6 +142,10 @@ impl ConfigBuilder {
         }
         for provider in &self.oidc_providers {
             out.push_str(provider);
+            out.push('\n');
+        }
+        if let Some(rbac) = &self.rbac {
+            out.push_str(rbac);
             out.push('\n');
         }
         out

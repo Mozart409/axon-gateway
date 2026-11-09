@@ -3,7 +3,8 @@
 //! Provides:
 //! - POST /mcp - JSON-RPC endpoint (Streamable HTTP)
 //! - GET /mcp/sse - SSE endpoint for streaming
-//! - POST /mcp/group/{name} - JSON-RPC scoped to a tool group
+//! - POST /mcp/toolset/{name} - JSON-RPC scoped to a toolset (`/mcp/group/{name}` is a
+//!   deprecated alias)
 //! - GET /health - Health check
 //! - GET /livez - Liveness probe
 //! - GET /readyz - Readiness probe
@@ -12,9 +13,10 @@
 //! - GET /status/detailed - Detailed backend status
 //! - GET /ui - Dashboard
 //! - GET /ui/backends/{name} - Backend detail page
+//! - GET /ui/tools - "My tools" page (multi-user mode only)
 //! - GET /auth/login, /auth/login/{id}, /auth/callback, POST /auth/logout - OIDC
 //!   dashboard login (only with `[auth.oidc]` and `[database]`)
-//! - GET /status/groups - List tool groups
+//! - GET /status/toolsets - List toolsets (`/status/groups` is a deprecated alias)
 //! - GET /metrics - Prometheus metrics
 //!
 //! HTML rendering lives in the [`views`] submodule. Handlers live in `ui`, `mcp`
@@ -69,6 +71,8 @@ pub struct AppState {
     pub store: Option<crate::store::Store>,
     /// OIDC providers for the dashboard login; `None` without `[auth.oidc]`
     pub oidc: Option<Arc<crate::oidc::OidcProviders>>,
+    /// RBAC groups and grants from `[rbac]`
+    pub policy: Arc<crate::policy::Policy>,
 }
 
 impl AppState {
@@ -123,6 +127,10 @@ pub fn create_router(state: AppState) -> Router {
             post(ui::handle_ui_enable_backend),
         )
         .route("/ui/actions/reload", post(ui::handle_ui_reload_config))
+        .route(
+            "/ui/actions/tools/opt-out",
+            post(ui::handle_ui_tool_opt_out),
+        )
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -134,6 +142,7 @@ pub fn create_router(state: AppState) -> Router {
     let ui_routes = Router::new()
         .route("/ui", get(ui::handle_ui))
         .route("/ui/backends/{name}", get(ui::handle_ui_backend_detail))
+        .route("/ui/tools", get(ui::handle_ui_tools))
         .route("/ui/events", get(ui::handle_ui_events))
         .route("/ui/partials/backends", get(ui::handle_ui_backends_partial))
         .merge(ui_actions)
@@ -178,9 +187,18 @@ pub fn create_router(state: AppState) -> Router {
         .route("/build", get(api::get_build_info))
         .route("/status", get(api::get_status))
         .route("/status/detailed", get(api::get_detailed_status))
-        // Tool group endpoints (subset of tools via named groups)
-        .route("/mcp/group/{group_name}", post(mcp::handle_group_request))
-        .route("/status/groups", get(mcp::list_tool_groups))
+        // Toolset endpoints (subset of tools via named toolsets)
+        .route(
+            "/mcp/toolset/{toolset_name}",
+            post(mcp::handle_toolset_request),
+        )
+        .route("/status/toolsets", get(mcp::list_toolsets))
+        // Deprecated aliases for the toolset endpoints, removed after one minor release
+        .route(
+            "/mcp/group/{toolset_name}",
+            post(mcp::handle_toolset_request),
+        )
+        .route("/status/groups", get(mcp::list_toolsets))
         // Metrics endpoint
         .route("/metrics", get(api::prometheus_metrics))
         // Middleware
@@ -369,9 +387,11 @@ mod tests {
             },
             backends: Vec::new(),
             tokens: Vec::new(),
+            toolsets: Vec::new(),
             groups: Vec::new(),
             database: None,
             auth: crate::config::AuthConfig::default(),
+            rbac: crate::policy::RbacConfig::default(),
         };
 
         let registry =
@@ -401,6 +421,9 @@ mod tests {
             metrics_handle: test_metrics_handle(),
             store: None,
             oidc: None,
+            policy: Arc::new(crate::policy::Policy::from_config(
+                &crate::policy::RbacConfig::default(),
+            )),
         }
     }
 

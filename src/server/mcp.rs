@@ -1,5 +1,5 @@
-//! MCP JSON-RPC endpoints (`/mcp`, `/mcp/sse`, `/mcp/group/{name}`) and the
-//! tool group listing.
+//! MCP JSON-RPC endpoints (`/mcp`, `/mcp/sse`, `/mcp/toolset/{name}`, plus the
+//! deprecated alias `/mcp/group/{name}`) and the toolset listing.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use serde_json::json;
 use super::AppState;
 use super::auth::verify_auth;
 use crate::auth::AuthManager;
-use crate::gateway::{HandleGroupRequest, HandleRequest};
+use crate::gateway::{HandleRequest, HandleToolsetRequest};
 use crate::types::JsonRpcRequest;
 
 /// Answer a JSON-RPC notification (a message without an `id`).
@@ -95,14 +95,14 @@ pub(super) async fn handle_mcp_sse(
     ))
 }
 
-/// Handle tool group endpoint - JSON-RPC scoped to a tool group
+/// Handle toolset endpoint - JSON-RPC scoped to a toolset
 ///
-/// Same as `/mcp` but only lists tools in the specified group.
-/// Tool calls are forwarded normally (no restriction to group tools at call time).
-pub(super) async fn handle_group_request(
+/// Same as `/mcp` but only lists tools in the specified toolset.
+/// Tool calls are forwarded normally (no restriction to toolset tools at call time).
+pub(super) async fn handle_toolset_request(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(group_name): Path<String>,
+    Path(toolset_name): Path<String>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Result<Response, StatusCode> {
     let identity = verify_auth(&headers, &state.auth_manager.load())?;
@@ -121,10 +121,10 @@ pub(super) async fn handle_group_request(
 
     let response = state
         .gateway
-        .ask(HandleGroupRequest {
+        .ask(HandleToolsetRequest {
             request,
             identity: identity.map(Arc::new),
-            group_name,
+            toolset_name,
         })
         .await
         .map_err(|e| {
@@ -135,20 +135,20 @@ pub(super) async fn handle_group_request(
     Ok(Json(response).into_response())
 }
 
-/// List available tool groups
-pub(super) async fn list_tool_groups(
+/// List available toolsets
+pub(super) async fn list_toolsets(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let groups = state
+    let toolsets = state
         .gateway
-        .ask(crate::gateway::GetToolGroups)
+        .ask(crate::gateway::GetToolsets)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to list tool groups: {:?}", e);
+            tracing::error!("Failed to list toolsets: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(json!({ "groups": groups })))
+    Ok(Json(json!({ "toolsets": toolsets })))
 }
 
 #[cfg(test)]
@@ -184,7 +184,7 @@ mod tests {
     #[rstest::rstest]
     #[case("/mcp", "notifications/initialized")]
     #[case("/mcp", "notifications/cancelled")]
-    #[case("/mcp/group/any", "notifications/initialized")]
+    #[case("/mcp/toolset/any", "notifications/initialized")]
     #[tokio::test]
     async fn notifications_get_202_with_empty_body(#[case] uri: &str, #[case] method: &str) {
         let (status, body) = post_mcp(

@@ -632,27 +632,40 @@ The work deployment is Kubernetes with 3 replicas.
 - Exit: login works against the mock issuer and one real IdP; UI inaccessible
   without a session; standalone mode unchanged.
 
-### Phase 2 - RBAC
+### Phase 2a - RBAC config layer, policy and "My tools"
+
+- [x] Rename `[[groups]]`/`ToolGroupConfig` to `[[toolsets]]`, route
+      `/mcp/toolset/{name}` and `/status/toolsets`; `[[groups]]`,
+      `/mcp/group/{name}` and `/status/groups` stay as deprecated aliases for
+      one minor release (the alias returns the list under `"toolsets"`).
+- [x] `[rbac]` config layer: `[[rbac.groups]]` with IdP mappings
+      (`provider` + claim `value`), `[[rbac.grants]]` with include/exclude
+      globs on original tool names, `read_only` and `mandatory`; validated at
+      load, not hot-reloadable. Built-in `authenticated` group.
+- [x] Pure policy engine (`src/policy.rs`): allow-only union, deny by default,
+      explain with reasons, view layer (`visible`).
+- [x] Tool annotations passed through; `readOnlyHint` feeds `read_only` grants.
+- [x] Per-user opt-outs (`tool_opt_outs`, whole backend or single tool);
+      mandatory tools cannot be hidden.
+- [x] "My tools" page (`/ui/tools`): the user's groups, every tool's state
+      (on / mandatory / hidden by you / not granted + why), htmx toggles
+      behind CSRF.
+- Groups are computed per request from the stored IdP claim values, so a
+  changed mapping applies on the next request after a restart.
+
+### Phase 2b - Managed RBAC
 
 - [ ] Tables: groups, memberships, roles, role bindings, grants.
 - [ ] Config layer merged read-only (`source = config`); 409 on write.
-- [ ] IdP group mapping with configurable claim path.
-- [ ] Per-principal `tools/list` and `tools/call` enforcement.
-- [ ] Grants `mandatory` flag; view layer (per-user opt-outs); hidden tools
-      rejected on `tools/call` with the standard unknown-tool error (hidden looks
-      like absent).
-- [ ] Rename `[[groups]]`/`ToolGroupConfig` to `[[toolsets]]`, route
-      `/mcp/toolset/{name}`; keep `[[groups]]` and `/mcp/group/{name}` as
-      deprecated aliases for one minor release.
-- [ ] Explain view ("why can/can't I use this tool"); opt-outs shown as "hidden
-      by you".
-- [ ] "My tools" page with the opt-out UI.
 - [ ] Admin UI for groups and grants; `/api/v1` write path.
 - [ ] Audit log for admin actions.
-- Exit: two users with different groups see and can call different tools.
 
 ### Phase 3 - Agent tokens
 
+- [ ] Per-principal `tools/list` and `tools/call` enforcement (moved from
+      Phase 2: it needs PATs to know the principal); hidden tools rejected on
+      `tools/call` with the standard unknown-tool error (hidden looks like
+      absent).
 - [ ] PATs (`axon_pat_...`), expiry, max lifetime, scope narrowing, revoke,
       last-used tracking.
 - [ ] Service accounts (admin-managed).
@@ -663,7 +676,8 @@ The work deployment is Kubernetes with 3 replicas.
 - [ ] Tool-call audit, with argument capture policy (annotation defaults,
       overrides), `audit_arguments` table and `audit.read_sensitive`.
 - [ ] Break-glass CLI `axon-gateway admin ...`.
-- Exit: an agent authenticates with a PAT and is limited to its owner's policy
+- Exit: two users with different groups see and can call different tools; an
+  agent authenticates with a PAT and is limited to its owner's policy
   intersected with its scope.
 
 ### Phase 4 - Spec-compliant MCP transport

@@ -11,6 +11,7 @@ use sqlx::postgres::PgPoolOptions;
 use thiserror::Error;
 
 mod auth;
+mod views;
 
 #[cfg(test)]
 pub use auth::User;

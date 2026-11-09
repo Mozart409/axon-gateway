@@ -8,7 +8,7 @@ A lightweight, self-hosted MCP (Model Context Protocol) gateway that aggregates 
 - **Namespacing**: Tools are automatically prefixed with backend name (e.g., `homeassistant_turn_on`)
 - **Multiple transports**: SSE, HTTP, and stdio backends supported
 - **Multi-token auth**: Named API tokens with fine-grained permissions (allowed tools/backends)
-- **Tool groups**: Expose subsets of tools via different path prefixes
+- **Toolsets**: Expose subsets of tools via different path prefixes
 - **Hot reload**: Config file watching with automatic backend updates
 - **Prometheus metrics**: Built-in metrics endpoint for monitoring
 - **Resource/Prompt proxying**: Forward MCP resources and prompts from backends
@@ -112,7 +112,8 @@ argument (both example files already do this).
 | --------------------------------------- | ------ | --------------------------------------------------- |
 | `/mcp`                                  | POST   | JSON-RPC endpoint (Streamable HTTP transport)       |
 | `/mcp/sse`                              | GET    | SSE endpoint for streaming transport                |
-| `/mcp/group/{group_name}`               | POST   | JSON-RPC endpoint filtered by tool group            |
+| `/mcp/toolset/{toolset_name}`           | POST   | JSON-RPC endpoint filtered by toolset               |
+| `/mcp/group/{toolset_name}`             | POST   | Deprecated alias of `/mcp/toolset/{toolset_name}`   |
 | `/`                                     | GET    | Landing page                                        |
 | `/ui`                                   | GET    | SSR dashboard page                                  |
 | `/ui/backends/{name}`                   | GET    | Backend detail page                                 |
@@ -128,7 +129,8 @@ argument (both example files already do this).
 | `/readyz`                               | GET    | Readiness probe (503 if the gateway actor stopped)  |
 | `/status`                               | GET    | Gateway status (backend list, counts)               |
 | `/status/detailed`                      | GET    | Detailed status with tool/resource/prompt lists     |
-| `/status/groups`                        | GET    | List configured tool groups                         |
+| `/status/toolsets`                      | GET    | List configured toolsets                            |
+| `/status/groups`                        | GET    | Deprecated alias of `/status/toolsets`              |
 | `/metrics`                              | GET    | Prometheus metrics endpoint                         |
 
 ## Frontend Architecture
@@ -269,23 +271,26 @@ Semantics:
   rate-limited. Use named tokens to enforce limits.
 - Exceeding the limit returns an auth error (HTTP 429).
 
-## Tool Groups
+## Toolsets
 
 Expose subsets of tools via different path prefixes:
 
 ```toml
-[[groups]]
+[[toolsets]]
 name = "coding"
 backends = ["vscode", "git"]
 description = "Development tools only"
 
-[[groups]]
+[[toolsets]]
 name = "readonly"
 tools = ["*_read", "*_list", "*_get"]
 description = "Read-only operations"
 ```
 
-Access grouped tools at `/mcp/group/{group_name}` instead of `/mcp`.
+Access a toolset at `/mcp/toolset/{toolset_name}` instead of `/mcp`.
+
+`[[groups]]`, `/mcp/group/{name}` and `/status/groups` are deprecated aliases
+(`groups` now means RBAC groups) and will be removed after one minor release.
 
 ## Database
 

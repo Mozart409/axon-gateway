@@ -54,6 +54,12 @@ pub enum ConfigError {
 
     #[error("OIDC provider '{id}': {reason}")]
     InvalidOidcProvider { id: String, reason: String },
+
+    #[error("duplicate toolset name '{name}'")]
+    DuplicateToolset { name: String },
+
+    #[error("invalid [rbac] section: {0}")]
+    InvalidRbac(String),
 }
 
 /// Server errors
