@@ -1261,6 +1261,7 @@ mod tests {
                 tokens: Vec::new(),
                 groups: Vec::new(),
                 database: None,
+                auth: crate::config::AuthConfig::default(),
             };
             GatewayActor::spawn_with_mailbox(
                 GatewayActor::new(config, registry),

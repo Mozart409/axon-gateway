@@ -45,6 +45,65 @@ pub struct Config {
     /// Not hot-reloadable: changes need a restart.
     #[serde(default)]
     pub database: Option<crate::store::DatabaseConfig>,
+    /// How people log in to the dashboard (OIDC providers).
+    /// Not hot-reloadable: changes need a restart.
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// `[auth]` section: how people log in to the dashboard.
+/// Not hot-reloadable: changes need a restart.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AuthConfig {
+    /// OIDC providers offered on the login page, in this order
+    #[serde(default)]
+    pub oidc: Vec<OidcProviderConfig>,
+}
+
+/// A generic OIDC provider (Entra, Pocket ID, Keycloak, ...)
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcProviderConfig {
+    /// Stable id used in URLs and stored with each session: `[a-z0-9-]+`
+    pub id: String,
+    /// Button label on the login page; defaults to the id
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Issuer URL; discovery is `{issuer}/.well-known/openid-configuration`
+    pub issuer: String,
+    pub client_id: String,
+    /// Env var holding the client secret; unset for a public (PKCE-only) client
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// ID-token claim with the user's groups; a dotted path reaches into
+    /// objects (`realm_access.roles`)
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+    /// When non-empty, only these email domains may log in (case-insensitive)
+    #[serde(default)]
+    pub allowed_email_domains: Vec<String>,
+    /// Members of any of these groups are gateway admins
+    #[serde(default)]
+    pub admin_groups: Vec<String>,
+}
+
+impl OidcProviderConfig {
+    /// Button label: `display_name`, or the id when unset
+    pub fn display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.id)
+    }
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    ["openid", "profile", "email"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+fn default_groups_claim() -> String {
+    String::from("groups")
 }
 
 /// Tool group configuration
@@ -360,6 +419,52 @@ impl Config {
                 }
             }
         }
+
+        self.validate_auth()
+    }
+
+    fn validate_auth(&self) -> Result<(), ConfigError> {
+        if self.auth.oidc.is_empty() {
+            return Ok(());
+        }
+        if self.database.is_none() {
+            return Err(ConfigError::OidcRequiresDatabase);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for provider in &self.auth.oidc {
+            let invalid = |reason: &str| ConfigError::InvalidOidcProvider {
+                id: provider.id.clone(),
+                reason: reason.to_string(),
+            };
+
+            if provider.id.is_empty()
+                || !provider
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(invalid("id must be non-empty and match [a-z0-9-]+"));
+            }
+            if !seen.insert(provider.id.as_str()) {
+                return Err(invalid("duplicate id"));
+            }
+            if !provider.scopes.iter().any(|scope| scope == "openid") {
+                return Err(invalid("scopes must include \"openid\""));
+            }
+            let Ok(issuer) = reqwest::Url::parse(&provider.issuer) else {
+                return Err(invalid("issuer is not a valid URL"));
+            };
+            let loopback = matches!(issuer.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+            if issuer.scheme() != "https" && !(issuer.scheme() == "http" && loopback) {
+                return Err(invalid(
+                    "issuer must use https (http is only allowed for localhost)",
+                ));
+            }
+            if provider.client_id.is_empty() {
+                return Err(invalid("client_id must not be empty"));
+            }
+        }
         Ok(())
     }
 }
@@ -575,6 +680,7 @@ mod tests {
                 tokens: vec![],
                 groups: vec![],
                 database: None,
+                auth: AuthConfig::default(),
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -605,6 +711,7 @@ mod tests {
                 tokens: vec![],
                 groups: vec![],
                 database: None,
+                auth: AuthConfig::default(),
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -632,6 +739,7 @@ mod tests {
                 tokens: vec![],
                 groups: vec![],
                 database: None,
+                auth: AuthConfig::default(),
             };
 
             let error = config.validate().expect_err("should require command");
@@ -659,6 +767,7 @@ mod tests {
                 tokens: vec![],
                 groups: vec![],
                 database: None,
+                auth: AuthConfig::default(),
             };
 
             config.validate().expect("valid config should pass");
@@ -682,6 +791,7 @@ mod tests {
                 tokens: vec![],
                 groups: vec![],
                 database: None,
+                auth: AuthConfig::default(),
             }
         }
 
@@ -742,6 +852,7 @@ mod tests {
                 tokens: vec![],
                 groups: vec![],
                 database: None,
+                auth: AuthConfig::default(),
             };
 
             config.validate().expect("valid config should pass");
@@ -941,6 +1052,153 @@ tools = ["*_read", "*_list", "*_get"]
                 .await
                 .expect_err("missing file must fail");
             assert!(matches!(error, ConfigError::ReadError(_)), "{error:?}");
+        }
+    }
+
+    mod auth_config {
+        use super::*;
+
+        const BASE: &str = r#"
+            [gateway]
+            bind = "0.0.0.0:8080"
+
+            [[backends]]
+            name = "b"
+            transport = "http"
+            url = "http://localhost:9000"
+        "#;
+
+        fn parse(extra: &str) -> Config {
+            toml::from_str(&format!("{BASE}\n{extra}")).expect("should parse")
+        }
+
+        fn with_db(extra: &str) -> Config {
+            parse(&format!("[database]\n{extra}"))
+        }
+
+        fn provider(id: &str, issuer: &str) -> String {
+            format!("[[auth.oidc]]\nid = \"{id}\"\nissuer = \"{issuer}\"\nclient_id = \"cid\"\n")
+        }
+
+        fn invalid_reason(config: &Config) -> String {
+            match config.validate().expect_err("should be invalid") {
+                ConfigError::InvalidOidcProvider { reason, .. } => reason,
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn absent_auth_is_empty() {
+            let config = parse("");
+            assert!(config.auth.oidc.is_empty());
+            config.validate().expect("no providers is valid");
+        }
+
+        #[test]
+        fn parses_two_providers_with_defaults() {
+            let config = parse(
+                r#"
+                [database]
+
+                [[auth.oidc]]
+                id = "entra"
+                display_name = "Microsoft"
+                issuer = "https://login.microsoftonline.com/t/v2.0"
+                client_id = "abc"
+                client_secret_env = "AXON_OIDC_ENTRA_SECRET"
+                admin_groups = ["g1"]
+
+                [[auth.oidc]]
+                id = "pocket-id"
+                issuer = "https://id.homelab.internal"
+                client_id = "def"
+                scopes = ["openid", "groups"]
+                groups_claim = "realm_access.roles"
+                allowed_email_domains = ["example.com"]
+                "#,
+            );
+            config.validate().expect("valid config should pass");
+
+            let [entra, pocket] = config.auth.oidc.as_slice() else {
+                panic!("expected two providers");
+            };
+            assert_eq!(entra.display_name(), "Microsoft");
+            assert_eq!(entra.scopes, ["openid", "profile", "email"]);
+            assert_eq!(entra.groups_claim, "groups");
+            assert_eq!(
+                entra.client_secret_env.as_deref(),
+                Some("AXON_OIDC_ENTRA_SECRET")
+            );
+            assert_eq!(entra.admin_groups, ["g1"]);
+            assert_eq!(pocket.display_name(), "pocket-id");
+            assert_eq!(pocket.scopes, ["openid", "groups"]);
+            assert_eq!(pocket.groups_claim, "realm_access.roles");
+            assert!(pocket.client_secret_env.is_none());
+            assert_eq!(pocket.allowed_email_domains, ["example.com"]);
+        }
+
+        #[test]
+        fn oidc_requires_database() {
+            let config = parse(&provider("a", "https://idp.example.com"));
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::OidcRequiresDatabase)
+            ));
+        }
+
+        #[test]
+        fn rejects_bad_ids() {
+            for id in ["", "Upper", "under_score", "sp ace"] {
+                let config = with_db(&provider(id, "https://idp.example.com"));
+                assert!(invalid_reason(&config).contains("id"), "{id:?}");
+            }
+        }
+
+        #[test]
+        fn rejects_duplicate_ids() {
+            let extra = format!(
+                "{}{}",
+                provider("a", "https://one.example.com"),
+                provider("a", "https://two.example.com")
+            );
+            assert!(invalid_reason(&with_db(&extra)).contains("duplicate"));
+        }
+
+        #[test]
+        fn rejects_scopes_without_openid() {
+            let extra = format!(
+                "{}scopes = [\"profile\"]\n",
+                provider("a", "https://idp.example.com")
+            );
+            assert!(invalid_reason(&with_db(&extra)).contains("openid"));
+        }
+
+        #[test]
+        fn rejects_bad_issuers() {
+            for issuer in ["not a url", "http://idp.example.com", "ftp://localhost"] {
+                let config = with_db(&provider("a", issuer));
+                assert!(invalid_reason(&config).contains("issuer"), "{issuer:?}");
+            }
+        }
+
+        #[test]
+        fn allows_http_for_loopback_and_trailing_slash() {
+            for issuer in [
+                "http://localhost:8081/realms/x",
+                "http://127.0.0.1:8081",
+                "http://[::1]:8081",
+                "https://idp.example.com/",
+            ] {
+                with_db(&provider("a", issuer))
+                    .validate()
+                    .unwrap_or_else(|e| panic!("{issuer}: {e}"));
+            }
+        }
+
+        #[test]
+        fn rejects_empty_client_id() {
+            let extra = "[[auth.oidc]]\nid = \"a\"\nissuer = \"https://idp.example.com\"\nclient_id = \"\"\n";
+            assert!(invalid_reason(&with_db(extra)).contains("client_id"));
         }
     }
 

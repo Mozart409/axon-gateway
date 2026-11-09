@@ -48,6 +48,12 @@ pub enum ConfigError {
         header: String,
         part: &'static str,
     },
+
+    #[error("[auth.oidc] needs a [database] section: logins and sessions are stored in Postgres")]
+    OidcRequiresDatabase,
+
+    #[error("OIDC provider '{id}': {reason}")]
+    InvalidOidcProvider { id: String, reason: String },
 }
 
 /// Server errors

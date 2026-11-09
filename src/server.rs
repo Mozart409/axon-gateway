@@ -12,12 +12,14 @@
 //! - GET /status/detailed - Detailed backend status
 //! - GET /ui - Dashboard
 //! - GET /ui/backends/{name} - Backend detail page
+//! - GET /auth/login, /auth/login/{id}, /auth/callback, POST /auth/logout - OIDC
+//!   dashboard login (only with `[auth.oidc]` and `[database]`)
 //! - GET /status/groups - List tool groups
 //! - GET /metrics - Prometheus metrics
 //!
 //! HTML rendering lives in the [`views`] submodule. Handlers live in `ui`, `mcp`
-//! and `api`, token checks in `auth`; this module owns the shared state,
-//! routing, middleware, and server lifecycle.
+//! and `api`, token checks in `auth`, the dashboard login in `session`; this
+//! module owns the shared state, routing, middleware, and server lifecycle.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -46,6 +48,7 @@ use crate::gateway::{DetailedGatewayStatus, GatewayActor};
 mod api;
 mod auth;
 mod mcp;
+mod session;
 mod ui;
 mod views;
 
@@ -64,6 +67,16 @@ pub struct AppState {
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     /// Postgres store; `None` in standalone mode
     pub store: Option<crate::store::Store>,
+    /// OIDC providers for the dashboard login; `None` without `[auth.oidc]`
+    pub oidc: Option<Arc<crate::oidc::OidcProviders>>,
+}
+
+impl AppState {
+    /// The store and providers when the dashboard has a login (an
+    /// `[auth.oidc]` provider and a `[database]`); `None` in standalone mode.
+    pub(crate) fn multi_user(&self) -> Option<(&crate::store::Store, &crate::oidc::OidcProviders)> {
+        Some((self.store.as_ref()?, self.oidc.as_deref()?))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -92,9 +105,10 @@ pub struct FlashMessage {
 
 /// Create the Axum router
 pub fn create_router(state: AppState) -> Router {
-    // State-changing dashboard actions. The UI has no login (it lives on the
-    // homelab network), so refuse requests a browser marks as cross-site:
-    // otherwise any web page could drive them with a plain form POST.
+    // State-changing dashboard actions. Refuse requests a browser marks as
+    // cross-site: otherwise any web page could drive them with a plain form
+    // POST. In multi-user mode they also need the session's CSRF token
+    // (`session::require_csrf`, behind the session guard below).
     let ui_actions = Router::new()
         .route(
             "/ui/actions/backends/{name}/reconnect",
@@ -109,10 +123,38 @@ pub fn create_router(state: AppState) -> Router {
             post(ui::handle_ui_enable_backend),
         )
         .route("/ui/actions/reload", post(ui::handle_ui_reload_config))
+        .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             reject_cross_site_middleware,
         ));
+
+    // Every dashboard route sits behind the session guard, which does nothing
+    // outside multi-user mode.
+    let ui_routes = Router::new()
+        .route("/ui", get(ui::handle_ui))
+        .route("/ui/backends/{name}", get(ui::handle_ui_backend_detail))
+        .route("/ui/events", get(ui::handle_ui_events))
+        .route("/ui/partials/backends", get(ui::handle_ui_backends_partial))
+        .merge(ui_actions)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            session::require_session,
+        ));
+
+    // The login routes answer 404 outside multi-user mode.
+    let auth_routes = Router::new()
+        .route("/auth/login", get(session::login_index))
+        .route("/auth/login/{id}", get(session::login_provider))
+        .route("/auth/callback", get(session::callback))
+        .merge(
+            Router::new()
+                .route("/auth/logout", post(session::logout))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    reject_cross_site_middleware,
+                )),
+        );
 
     // No CORS layer: nothing here is meant to be called from another origin's
     // page, and without `Access-Control-Allow-*` headers browsers keep other
@@ -126,11 +168,9 @@ pub fn create_router(state: AppState) -> Router {
         .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
         .route_service("/favicon.svg", ServeFile::new("static/favicon.svg"))
         // UI endpoints
-        .route("/ui", get(ui::handle_ui))
-        .route("/ui/backends/{name}", get(ui::handle_ui_backend_detail))
-        .route("/ui/events", get(ui::handle_ui_events))
-        .route("/ui/partials/backends", get(ui::handle_ui_backends_partial))
-        .merge(ui_actions)
+        .merge(ui_routes)
+        // Dashboard login
+        .merge(auth_routes)
         // Status endpoints
         .route("/health", get(api::health_check))
         .route("/livez", get(api::livez))
@@ -331,6 +371,7 @@ mod tests {
             tokens: Vec::new(),
             groups: Vec::new(),
             database: None,
+            auth: crate::config::AuthConfig::default(),
         };
 
         let registry =
@@ -359,6 +400,7 @@ mod tests {
             process_id: std::process::id(),
             metrics_handle: test_metrics_handle(),
             store: None,
+            oidc: None,
         }
     }
 

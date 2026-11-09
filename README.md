@@ -302,6 +302,39 @@ url_env = "AXON_DATABASE_URL" # default
 When configured, `/readyz` also pings the database and returns 503
 (`database unreachable`) when it does not answer within 2 s.
 
+## Dashboard login (OIDC)
+
+Multi-user mode turns on with a `[database]` section plus at least one
+`[[auth.oidc]]` provider; any OIDC provider works (Entra ID, Pocket ID,
+Keycloak, ...). Register `{base_url}/auth/callback` as the redirect URI and
+`{base_url}/` as the post-logout redirect.
+
+```toml
+[[auth.oidc]]
+id = "pocket"                      # used in URLs
+display_name = "Pocket ID"         # login button label
+issuer = "https://id.example.com"
+client_id = "axon"
+client_secret_env = "AXON_OIDC_POCKET_SECRET"
+scopes = ["openid", "profile", "email"] # default
+groups_claim = "groups"            # default, dotted paths allowed
+allowed_email_domains = ["example.com"]
+admin_groups = ["axon-admins"]
+```
+
+Sessions use the `__Host-axon_session` cookie, which needs HTTPS. They expire
+after 12 h idle or 7 days absolute. For Entra ID, add a "groups" claim in the
+token configuration and emit groups as object IDs; users in more than ~200
+groups get no groups (overage) for now.
+
+`allowed_email_domains` only trusts a verified address: the ID token must carry
+`email_verified: true`, or for Entra ID the optional `xms_edov` claim (add it
+in the token configuration). A single-tenant Entra issuer already limits logins
+to the tenant, so the list is usually not needed there.
+
+Without OIDC the dashboard stays open as before, so keep it on a trusted
+network.
+
 ## Tracing
 
 Logs go to stdout (`AXON_LOG_JSON=1` for JSON, `RUST_LOG` to filter). Set

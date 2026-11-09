@@ -9,7 +9,15 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use super::{AppState, FlashLevel, FlashMessage};
 use crate::gateway::DetailedGatewayStatus;
+use crate::store::SessionUser;
 use crate::types::{BackendInfo, BackendState, PromptDefinition, ResourceDefinition};
+
+/// One "Sign in with ..." choice on the login page.
+pub(super) struct LoginOption {
+    pub display_name: String,
+    /// Already URL-encoded by the caller.
+    pub href: String,
+}
 
 /// Landing page (`GET /`).
 #[allow(clippy::too_many_lines)]
@@ -164,8 +172,140 @@ pub(super) fn render_not_found_page(state: &AppState) -> Markup {
     }
 }
 
+/// Login page (`GET /auth/login`).
+pub(super) fn render_login_page(state: &AppState, options: &[LoginOption]) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Sign in - Axon Gateway" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                link rel="stylesheet" href="/styles/output.css?v=1";
+            }
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+                main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
+                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
+                            "Axon Gateway"
+                        }
+                        h1 class="mt-3 text-3xl font-semibold tracking-tight" {
+                            "Sign in to Axon Gateway"
+                        }
+                        @if options.is_empty() {
+                            p class="mt-3 text-slate-600 dark:text-slate-300" {
+                                "No login providers are configured."
+                            }
+                        } @else {
+                            div class="mt-6 flex flex-col items-center gap-3" {
+                                @for option in options {
+                                    a
+                                        class="w-full max-w-xs rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                                        href=(option.href)
+                                    {
+                                        "Sign in with " (option.display_name)
+                                    }
+                                }
+                            }
+                        }
+                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
+                            (build_fingerprint(state))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Login failure page; `message` must be generic, never provider details.
+pub(super) fn render_auth_error_page(state: &AppState, title: &str, message: &str) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { (title) " - Axon Gateway" }
+                link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                link rel="stylesheet" href="/styles/output.css?v=1";
+            }
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+                main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
+                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
+                            "Sign-in failed"
+                        }
+                        h1 class="mt-3 text-3xl font-semibold tracking-tight" { (title) }
+                        p class="mt-3 text-slate-600 dark:text-slate-300" { (message) }
+                        div class="mt-6 flex justify-center gap-3" {
+                            a
+                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                                href="/auth/login"
+                            {
+                                "Try again"
+                            }
+                            a
+                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                                href="/"
+                            {
+                                "Home"
+                            }
+                        }
+                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:text-slate-400 dark:border-slate-700" {
+                            (build_fingerprint(state))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Header strip for signed-in users: name, admin badge and the logout form.
+fn render_user_bar(user: &SessionUser) -> Markup {
+    let name = user
+        .user
+        .display_name
+        .as_deref()
+        .or(user.user.email.as_deref())
+        .unwrap_or(&user.user.subject);
+
+    html! {
+        div class="mb-4 flex flex-wrap items-center justify-end gap-3 text-sm text-slate-600 dark:text-slate-300" {
+            span class="font-medium text-slate-900 dark:text-slate-100" { (name) }
+            @if user.user.is_admin {
+                span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
+                    "admin"
+                }
+            }
+            form method="post" action="/auth/logout" {
+                input type="hidden" name="csrf_token" value=(user.csrf_token);
+                button
+                    class="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                    type="submit"
+                {
+                    "Log out"
+                }
+            }
+        }
+    }
+}
+
+/// `hx-headers` value that makes every htmx request carry the CSRF token.
+fn csrf_hx_headers(user: &SessionUser) -> String {
+    serde_json::json!({ "X-CSRF-Token": user.csrf_token }).to_string()
+}
+
 /// Full dashboard page (`GET /ui`).
-pub(super) fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -> Markup {
+pub(super) fn render_ui_page(
+    status: &DetailedGatewayStatus,
+    state: &AppState,
+    user: Option<&SessionUser>,
+) -> Markup {
+    let hx_headers = user.map(csrf_hx_headers);
+
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -174,12 +314,18 @@ pub(super) fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Axon Gateway Dashboard" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                @if let Some(user) = user {
+                    meta name="csrf-token" content=(user.csrf_token);
+                }
                 script src="https://unpkg.com/htmx.org@2.0.4" defer {};
                 script src="https://unpkg.com/htmx-ext-sse@2.2.2" defer {};
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=[hx_headers.as_deref()] {
                 main class="mx-auto max-w-6xl p-6" {
+                    @if let Some(user) = user {
+                        (render_user_bar(user))
+                    }
                     section class="mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
                         h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
                             "Axon Gateway"
@@ -217,12 +363,15 @@ pub(super) fn render_ui_page(status: &DetailedGatewayStatus, state: &AppState) -
 }
 
 /// Backend detail page (`GET /ui/backends/{name}`).
+#[allow(clippy::too_many_lines)]
 pub(super) fn render_ui_backend_detail_page(
     backend: &BackendInfo,
     prompts: &[PromptDefinition],
     resources: &[ResourceDefinition],
     state: &AppState,
+    user: Option<&SessionUser>,
 ) -> Markup {
+    let hx_headers = user.map(csrf_hx_headers);
     let state_text = backend_state_text(backend.state);
     let state_class = backend_state_class(backend.state);
 
@@ -234,10 +383,16 @@ pub(super) fn render_ui_backend_detail_page(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Axon Gateway Backend Detail" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
+                @if let Some(user) = user {
+                    meta name="csrf-token" content=(user.csrf_token);
+                }
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=[hx_headers.as_deref()] {
                 main class="mx-auto max-w-6xl p-6" {
+                    @if let Some(user) = user {
+                        (render_user_bar(user))
+                    }
                     section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
                         a
                             href="/ui"

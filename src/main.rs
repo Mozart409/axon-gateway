@@ -13,6 +13,7 @@ mod config;
 mod error;
 mod gateway;
 mod metrics;
+mod oidc;
 mod registry;
 mod server;
 mod store;
@@ -35,8 +36,12 @@ use kameo::mailbox;
 use crate::auth::{AuthManager, SharedAuth};
 use crate::config::Config;
 use crate::gateway::GatewayActor;
+use crate::oidc::OidcProviders;
 use crate::registry::RegistryActor;
 use crate::server::AppState;
+
+/// How often expired dashboard sessions and login flows are deleted.
+const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,6 +76,13 @@ async fn main() -> Result<()> {
 
     let bind_addr = config.gateway.bind.clone();
     let base_url = config.gateway.base_url.clone();
+
+    // Dashboard login. Built before `config` moves into the gateway actor.
+    let oidc = setup_oidc(&config, &base_url)?;
+
+    if let Some(store) = store.clone() {
+        spawn_session_purge(store);
+    }
 
     // Initialize Prometheus metrics exporter
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -140,6 +152,7 @@ async fn main() -> Result<()> {
         process_id: std::process::id(),
         metrics_handle,
         store,
+        oidc,
     };
 
     // Run server with graceful shutdown
@@ -156,6 +169,39 @@ async fn main() -> Result<()> {
     tracing::info!("Shutdown complete");
     telemetry.shutdown();
     Ok(())
+}
+
+/// The OIDC providers for the dashboard login, or `None` without any.
+fn setup_oidc(config: &Config, base_url: &str) -> Result<Option<Arc<OidcProviders>>> {
+    if config.auth.oidc.is_empty() {
+        tracing::warn!("No [auth.oidc] provider configured - the dashboard has no login");
+        return Ok(None);
+    }
+    let redirect_url = format!("{}/auth/callback", base_url.trim_end_matches('/'));
+    let providers = OidcProviders::new(&config.auth.oidc, &redirect_url)
+        .wrap_err("failed to set up OIDC login")?;
+    let ids = providers
+        .iter()
+        .map(oidc::Provider::id)
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!("Dashboard login via OIDC: {ids}");
+    Ok(Some(Arc::new(providers)))
+}
+
+/// Deletes expired sessions and unfinished logins every hour. They are
+/// rejected on lookup anyway; this only keeps the tables small.
+fn spawn_session_purge(store: store::Store) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PURGE_INTERVAL);
+        loop {
+            interval.tick().await;
+            match store.purge_expired().await {
+                Ok(purged) => tracing::debug!(purged, "Purged expired sessions and logins"),
+                Err(error) => tracing::warn!(%error, "Failed to purge expired sessions"),
+            }
+        }
+    });
 }
 
 #[expect(

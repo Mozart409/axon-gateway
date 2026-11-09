@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod mock_backend;
+pub mod mock_oidc;
 
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -30,6 +31,8 @@ pub struct ConfigBuilder {
     base_url: String,
     auth_token: Option<String>,
     backends: Vec<String>,
+    database_url_env: Option<String>,
+    oidc_providers: Vec<String>,
 }
 
 impl ConfigBuilder {
@@ -40,6 +43,8 @@ impl ConfigBuilder {
             base_url: format!("http://{bind}"),
             auth_token: None,
             backends: Vec::new(),
+            database_url_env: None,
+            oidc_providers: Vec::new(),
         }
     }
 
@@ -75,6 +80,28 @@ impl ConfigBuilder {
         self
     }
 
+    /// Add a `[database]` section whose URL is read from the `url_env`
+    /// variable (pass it to the gateway with [`Gateway::start_with_env`]).
+    pub fn database(mut self, url_env: &str) -> Self {
+        self.database_url_env = Some(url_env.to_string());
+        self
+    }
+
+    /// Add an `[[auth.oidc]]` provider. `extra_toml` is appended to the table
+    /// as is (e.g. `allowed_email_domains = ["corp.example"]`).
+    pub fn oidc_provider(
+        mut self,
+        id: &str,
+        issuer: &str,
+        client_id: &str,
+        extra_toml: &str,
+    ) -> Self {
+        self.oidc_providers.push(format!(
+            "[[auth.oidc]]\nid = \"{id}\"\nissuer = \"{issuer}\"\nclient_id = \"{client_id}\"\n{extra_toml}\n"
+        ));
+        self
+    }
+
     /// Render the TOML document.
     ///
     /// `backends` is a required root-level key. When there are no backend
@@ -101,6 +128,13 @@ impl ConfigBuilder {
             out.push_str(backend);
             out.push('\n');
         }
+        if let Some(url_env) = &self.database_url_env {
+            let _ = writeln!(out, "[database]\nurl_env = \"{url_env}\"\n");
+        }
+        for provider in &self.oidc_providers {
+            out.push_str(provider);
+            out.push('\n');
+        }
         out
     }
 }
@@ -123,6 +157,12 @@ impl Drop for Gateway {
 impl Gateway {
     /// Spawn the gateway binary with `config` TOML and wait until it is ready.
     pub async fn start(config: &str, base: &str) -> Self {
+        Self::start_with_env(config, base, &[]).await
+    }
+
+    /// Like [`Gateway::start`], with extra environment variables for the
+    /// gateway process.
+    pub async fn start_with_env(config: &str, base: &str, env: &[(&str, &str)]) -> Self {
         let mut file = NamedTempFile::new().expect("create temp config");
         std::io::Write::write_all(&mut file, config.as_bytes()).expect("write config");
 
@@ -131,6 +171,7 @@ impl Gateway {
             // ServeFile routes resolve assets relative to CWD.
             .current_dir(MANIFEST_DIR)
             .env("RUST_LOG", "warn")
+            .envs(env.iter().copied())
             .spawn()
             .expect("gateway binary should start");
 

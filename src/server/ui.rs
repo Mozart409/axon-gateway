@@ -39,13 +39,16 @@ pub(super) async fn handle_not_found(State(state): State<AppState>) -> impl Into
 }
 
 /// Handle GET /ui - SSR dashboard
-pub(super) async fn handle_ui(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+pub(super) async fn handle_ui(
+    State(state): State<AppState>,
+    user: Option<axum::Extension<crate::store::SessionUser>>,
+) -> Result<Html<String>, StatusCode> {
     let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
         tracing::error!("Failed to get UI backend status: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let page = views::render_ui_page(&status, &state);
+    let page = views::render_ui_page(&status, &state, user.as_ref().map(|axum::Extension(u)| u));
     Ok(Html(page.into_string()))
 }
 
@@ -53,6 +56,7 @@ pub(super) async fn handle_ui(State(state): State<AppState>) -> Result<Html<Stri
 pub(super) async fn handle_ui_backend_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    user: Option<axum::Extension<crate::store::SessionUser>>,
 ) -> Result<Html<String>, StatusCode> {
     let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
         tracing::error!(backend = %name, "Failed to get UI backend detail status: {:?}", e);
@@ -70,7 +74,13 @@ pub(super) async fn handle_ui_backend_detail(
     let prompts = fetch_backend_prompts(&state, &backend.name).await;
     let resources = fetch_backend_resources(&state, &backend.name).await;
 
-    let page = views::render_ui_backend_detail_page(&backend, &prompts, &resources, &state);
+    let page = views::render_ui_backend_detail_page(
+        &backend,
+        &prompts,
+        &resources,
+        &state,
+        user.as_ref().map(|axum::Extension(u)| u),
+    );
     Ok(Html(page.into_string()))
 }
 
@@ -519,6 +529,115 @@ mod tests {
 
         let markup = views::render_backend_row(&backend).into_string();
         assert!(markup.contains("href=\"/ui/backends/filesystem\""));
+    }
+
+    fn test_session_user(is_admin: bool) -> crate::store::SessionUser {
+        crate::store::SessionUser {
+            user: crate::store::User {
+                id: uuid::Uuid::nil(),
+                issuer: String::from("https://idp.example"),
+                subject: String::from("sub-1"),
+                email: Some(String::from("ada@example.com")),
+                display_name: Some(String::from("Ada Lovelace")),
+                groups: Vec::new(),
+                is_admin,
+            },
+            provider_id: String::from("pocket"),
+            csrf_token: String::from("tok-123"),
+            id_token: None,
+        }
+    }
+
+    fn detail_backend() -> BackendInfo {
+        BackendInfo::new(
+            String::from("filesystem"),
+            BackendState::Connected,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn login_page_lists_options_and_escapes_labels() {
+        let options = vec![
+            views::LoginOption {
+                display_name: String::from("Pocket ID"),
+                href: String::from("/auth/login/pocket?next=%2Fui"),
+            },
+            views::LoginOption {
+                display_name: String::from("<b>Evil</b>"),
+                href: String::from("/auth/login/evil"),
+            },
+        ];
+
+        let html = views::render_login_page(&test_state(), &options).into_string();
+        assert!(html.contains("Sign in to Axon Gateway"));
+        assert!(html.contains("Pocket ID"));
+        assert!(html.contains("href=\"/auth/login/pocket?next=%2Fui\""));
+        assert!(html.contains("href=\"/auth/login/evil\""));
+        assert!(html.contains("&lt;b&gt;Evil&lt;/b&gt;"));
+        assert!(!html.contains("<b>Evil</b>"));
+
+        let empty = views::render_login_page(&test_state(), &[]).into_string();
+        assert!(empty.contains("No login providers are configured"));
+    }
+
+    #[tokio::test]
+    async fn auth_error_page_links_back() {
+        let html = views::render_auth_error_page(&test_state(), "Login failed", "Please retry.")
+            .into_string();
+        assert!(html.contains("Login failed"));
+        assert!(html.contains("Please retry."));
+        assert!(html.contains("href=\"/auth/login\""));
+        assert!(html.contains("Try again"));
+        assert!(html.contains("href=\"/\""));
+    }
+
+    #[tokio::test]
+    async fn signed_in_header_shows_user_logout_and_csrf() {
+        let user = test_session_user(true);
+        let html = views::render_ui_backend_detail_page(
+            &detail_backend(),
+            &[],
+            &[],
+            &test_state(),
+            Some(&user),
+        )
+        .into_string();
+
+        assert!(html.contains("Ada Lovelace"));
+        assert!(html.contains(">admin<"));
+        assert!(html.contains("action=\"/auth/logout\""));
+        assert!(html.contains("name=\"csrf_token\" value=\"tok-123\""));
+        assert!(html.contains("name=\"csrf-token\" content=\"tok-123\""));
+        assert!(html.contains("hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;tok-123&quot;}\""));
+    }
+
+    #[tokio::test]
+    async fn admin_badge_only_for_admins() {
+        let user = test_session_user(false);
+        let html = views::render_ui_backend_detail_page(
+            &detail_backend(),
+            &[],
+            &[],
+            &test_state(),
+            Some(&user),
+        )
+        .into_string();
+
+        assert!(html.contains("Ada Lovelace"));
+        assert!(!html.contains(">admin<"));
+    }
+
+    #[tokio::test]
+    async fn pages_without_user_have_no_logout_or_hx_headers() {
+        let html =
+            views::render_ui_backend_detail_page(&detail_backend(), &[], &[], &test_state(), None)
+                .into_string();
+
+        assert!(!html.contains("/auth/logout"));
+        assert!(!html.contains("hx-headers"));
+        assert!(!html.contains("csrf-token"));
     }
 
     #[tokio::test]

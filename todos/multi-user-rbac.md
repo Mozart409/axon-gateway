@@ -75,7 +75,7 @@ Non-goals:
 | 5 | Production-grade at work: no homelab-only shortcuts | Same binary, same guarantees |
 | 6 | Without `[database]` axon behaves exactly as today | GOALS.md: no database required for basic usage |
 | 7 | Allow-only grants, union semantics, no deny rules in v1 | Easy to reason about and explain; revisit if needed |
-| 8 | `openidconnect` crate, not bare `oauth2` | Discovery, JWKS caching and ID-token validation included (see 5) |
+| 8 | `oauth2` + `jsonwebtoken` (aws-lc), the rust/lanternd stack, not `openidconnect` | `openidconnect` pulls the `rsa` crate (RUSTSEC-2023-0071); discovery, JWKS caching and ID-token checks are ported from lanternd (see 5) |
 | 9 | PATs stored as SHA-256 of a high-entropy secret | No slow hash needed for 256-bit random secrets |
 | 10 | stdio backends admin-only | stdio is code execution on the gateway host |
 | 11 | Envelope encryption for stored secrets | KEK rotation without re-encrypting everything |
@@ -221,10 +221,11 @@ Rules:
 
 ### Dashboard (OIDC)
 
-- Authorization Code + PKCE + `state` + `nonce` using the `openidconnect` crate
-  (discovery, JWKS caching, ID-token validation). Note: lanternd and countdown-rs
-  in this monorepo use bare `oauth2`; axon differs on purpose, because it needs
-  ID-token validation across arbitrary providers.
+- Authorization Code + PKCE + `state` + `nonce` with `oauth2` and
+  `jsonwebtoken` on aws-lc, ported from rust/lanternd: lazy discovery, JWKS
+  refetch at most once a minute on an unknown `kid`, asymmetric algorithms
+  only, `iss`/`aud`/`azp`/`nonce`/`exp`/`iat`/`nbf` checked with 60 s leeway.
+  Not `openidconnect`: it pulls the `rsa` crate (RUSTSEC-2023-0071).
 - Config, a list so several providers work together:
 
 ```toml
@@ -615,12 +616,19 @@ The work deployment is Kubernetes with 3 replicas.
 
 ### Phase 1 - OIDC login for the dashboard
 
-- [ ] `oidc/` with generic multi-provider discovery, PKCE, state, nonce.
-- [ ] `users` and `sessions` tables; cookie handling; timeouts; logout.
-- [ ] Protect `/ui` and `/ui/actions/*` in multi-user mode; login page with
+- [x] `oidc.rs` with generic multi-provider discovery, PKCE, state, nonce
+      (lanternd's `oauth2` + `jsonwebtoken` stack, see decision 8).
+- [x] `users` and `sessions` tables; cookie handling; timeouts; logout
+      (RP-initiated via `end_session_endpoint`).
+- [x] Protect `/ui` and `/ui/actions/*` in multi-user mode; login page with
       provider picker.
-- [ ] Bootstrap admin via `admin_groups` mapping in config.
-- [ ] CSRF tokens on forms.
+- [x] Bootstrap admin via `admin_groups` mapping in config.
+- [x] CSRF tokens on forms (`X-CSRF-Token` via `hx-headers`, form field on
+      logout).
+- [x] `allowed_email_domains` only trusts verified addresses (`email_verified`,
+      or Entra's optional `xms_edov` claim).
+- Open: `/status/detailed` and `/metrics` stay unauthenticated, as today;
+  RBAC (phase 2) decides who may read them. Not yet tried against a real IdP.
 - Exit: login works against the mock issuer and one real IdP; UI inaccessible
   without a session; standalone mode unchanged.
 

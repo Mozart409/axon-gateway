@@ -14,18 +14,27 @@ categories = ["network-programming", "web-programming"]
 [dependencies]
 # keep-sorted start
 axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.12", features = ["cookie"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 color-eyre = "0.6.5"
 dashmap = "6"
 dotenvy = "0.15"
 futures = "0.3"
+getrandom = "0.4"
+hex = "0.4"
 http = "1"
+# OIDC: oauth2 for the authorization URL, PKCE and code exchange, jsonwebtoken
+# for the ID token signature on aws-lc (already in the tree through rustls), so
+# without the `rsa` crate (RUSTSEC-2023-0071). Never enable its `rust_crypto`
+# feature. Same stack as rust/lanternd.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 kameo = "0.22.2"
 maud = "0.27"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 moka = { version = "0.12", features = ["future"] }
 notify = "8"
+oauth2 = { version = "5", default-features = false }
 # opentelemetry* must match the version tracing-opentelemetry links against
 # (0.34 -> opentelemetry 0.33). Bump them together, never independently.
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "internal-logs"] }
@@ -49,9 +58,12 @@ rmcp = { version = "3.4", features = [
  ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
 sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 subtle = "2"
 thiserror = "2"
+# Cookie `Max-Age` is a `time::Duration` in the cookie crate axum-extra uses.
+time = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "1.1"
@@ -61,10 +73,12 @@ tracing = "0.1"
 tracing-opentelemetry = { version = "0.34", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
-
 # keep-sorted end
 
 [dev-dependencies]
+# Tests only: the mock identity provider signs ID tokens with these.
+aws-lc-rs = "1"
+base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rstest = "0.27"
 tempfile = "3"

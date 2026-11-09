@@ -10,6 +10,12 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use thiserror::Error;
 
+mod auth;
+
+#[cfg(test)]
+pub use auth::User;
+pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser};
+
 const MAX_CONNECTIONS: u32 = 10;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -39,6 +45,9 @@ pub enum StoreError {
 
     #[error("database query failed: {0}")]
     Query(#[from] sqlx::Error),
+
+    #[error("failed to gather randomness for a secret: {0}")]
+    Random(String),
 }
 
 /// Handle to the Postgres store; cheap to clone
@@ -83,11 +92,11 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod test_support {
+    use sqlx::PgPool;
 
     /// Base URL of the test database; tests skip without it.
-    fn database_url() -> Option<String> {
+    pub(super) fn database_url() -> Option<String> {
         std::env::var("AXON_TEST_DATABASE_URL")
             .ok()
             .filter(|url| !url.is_empty())
@@ -95,7 +104,7 @@ mod tests {
 
     /// Recreates a fresh schema and returns a URL whose `search_path` points
     /// at it, so parallel tests (and their migration tables) never collide.
-    async fn isolated_url(base: &str, schema: &str) -> String {
+    pub(super) async fn isolated_url(base: &str, schema: &str) -> String {
         let pool = PgPool::connect(base)
             .await
             .expect("the test database must be reachable");
@@ -114,6 +123,12 @@ mod tests {
         let separator = if base.contains('?') { '&' } else { '?' };
         format!("{base}{separator}options=-csearch_path%3D{schema}")
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{database_url, isolated_url};
+    use super::*;
 
     #[tokio::test]
     async fn connect_names_the_missing_variable() {

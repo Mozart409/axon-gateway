@@ -7,6 +7,26 @@
 # [database]
 # url_env = "AXON_DATABASE_URL"  # default
 
+# Dashboard login through OIDC providers, listed on the login page in this
+# order. Needs [database]; changes need a restart. Register
+# `{gateway.base_url}/auth/callback` as the redirect URI at each provider.
+# [[auth.oidc]]
+# id = "entra"  # [a-z0-9-]+
+# display_name = "Microsoft"
+# issuer = "https://login.microsoftonline.com/<tenant-id>/v2.0"
+# client_id = "<application-client-id>"
+# client_secret_env = "AXON_OIDC_ENTRA_SECRET"  # unset for a public (PKCE) client
+# admin_groups = ["<group-object-id>"]
+#
+# [[auth.oidc]]
+# id = "pocket-id"
+# issuer = "https://id.homelab.internal"
+# client_id = "<client-id>"
+# scopes = ["openid", "profile", "email", "groups"]  # default without "groups"
+# groups_claim = "groups"  # default; a dotted path reaches into objects
+# admin_groups = ["admins"]
+# allowed_email_domains = ["example.com"]  # empty = any
+
 [gateway]
 # Address to bind the gateway server
 bind = "0.0.0.0:8080"
