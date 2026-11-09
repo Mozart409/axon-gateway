@@ -27,6 +27,7 @@
       (craneLib.fileset.commonCargoSources ../.)
       ../clippy.toml
       ../config.example.toml
+      ../migrations
       ../static
       ../styles
       ../tests

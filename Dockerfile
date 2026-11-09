@@ -10,6 +10,7 @@ ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY migrations ./migrations
 
 RUN cargo build --release --locked
 

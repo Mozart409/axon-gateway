@@ -13,7 +13,6 @@ categories = ["network-programming", "web-programming"]
 
 [dependencies]
 # keep-sorted start
-] }
 axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 color-eyre = "0.6.5"
@@ -50,15 +49,7 @@ rmcp = { version = "3.4", features = [
  ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.9", default-features = false, features = [
-  "runtime-tokio",
-  "tls-rustls-ring-webpki",
-  "postgres",
-  "chrono",
-  "json",
-  "macros",
-  "migrate",
-  "uuid",
+sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
