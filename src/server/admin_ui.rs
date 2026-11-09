@@ -1,5 +1,7 @@
 //! The admin pages under `/ui/admin` and their htmx actions under
 //! `/ui/actions/admin`: RBAC groups, grants, role bindings and the audit log.
+//! (The service account pages are in `tokens_ui`, which reuses the helpers
+//! here.)
 //!
 //! The routes sit behind the session guard (and, for actions, the CSRF and
 //! same-site checks); outside multi-user mode every one of them is a 404. What
@@ -25,7 +27,7 @@ use super::{AppState, FlashLevel, FlashMessage, views};
 use crate::gateway::GetDetailedStatus;
 use crate::policy::{AUTHENTICATED_GROUP, GrantConfig, Role, RoleSubject};
 use crate::rbac::{Admin, AdminError, resolve};
-use crate::store::{SessionUser, User};
+use crate::store::{ServiceAccount, SessionUser, User};
 
 /// Users the member and role binding selects offer
 const USERS_LIMIT: i64 = 500;
@@ -87,7 +89,7 @@ pub(super) fn action_routes() -> Router<AppState> {
 }
 
 /// A form-encoded body whose rejection is the flash fragment with a 400
-pub(super) struct AdminForm<T>(T);
+pub(super) struct AdminForm<T>(pub(super) T);
 
 impl<S, T> FromRequest<S> for AdminForm<T>
 where
@@ -107,7 +109,7 @@ where
     }
 }
 
-fn not_found(state: &AppState) -> Response {
+pub(super) fn not_found(state: &AppState) -> Response {
     (
         StatusCode::NOT_FOUND,
         Html(views::render_not_found_page(state).into_string()),
@@ -117,7 +119,7 @@ fn not_found(state: &AppState) -> Response {
 
 /// The session and the admin service, or the 404 outside multi-user mode
 /// (boxed: a `Response` is large for an error type).
-async fn admin_for(
+pub(super) async fn admin_for(
     state: &AppState,
     user: Option<Extension<SessionUser>>,
 ) -> Result<(SessionUser, Admin<'_>), Box<Response>> {
@@ -148,7 +150,7 @@ fn status_and_message(error: &AdminError) -> (StatusCode, String) {
 
 /// An action error: the flash fragment, shown in the flash area at the top of
 /// the page.
-fn flash_response(status: StatusCode, message: String) -> Response {
+pub(super) fn flash_response(status: StatusCode, message: String) -> Response {
     let flash = FlashMessage {
         level: FlashLevel::Error,
         message,
@@ -161,13 +163,13 @@ fn flash_response(status: StatusCode, message: String) -> Response {
         .into_response()
 }
 
-fn error_response(error: &AdminError) -> Response {
+pub(super) fn error_response(error: &AdminError) -> Response {
     let (status, message) = status_and_message(error);
     flash_response(status, message)
 }
 
 /// A page error: the 403 page, the 404 page or a plain status line.
-fn page_error(state: &AppState, session: &SessionUser, error: &AdminError) -> Response {
+pub(super) fn page_error(state: &AppState, session: &SessionUser, error: &AdminError) -> Response {
     match error {
         AdminError::Forbidden => (
             StatusCode::FORBIDDEN,
@@ -184,7 +186,7 @@ fn page_error(state: &AppState, session: &SessionUser, error: &AdminError) -> Re
 
 /// A successful action: the re-rendered fragment, plus an out-of-band swap
 /// that clears an error left in the flash area.
-fn fragment(markup: &Markup) -> Response {
+pub(super) fn fragment(markup: &Markup) -> Response {
     let body = html! {
         (markup)
         (render_flash_area(true))
@@ -192,7 +194,7 @@ fn fragment(markup: &Markup) -> Response {
     Html(body.into_string()).into_response()
 }
 
-async fn backend_names(state: &AppState) -> Vec<String> {
+pub(super) async fn backend_names(state: &AppState) -> Vec<String> {
     match state.gateway.ask(GetDetailedStatus).await {
         Ok(status) => {
             let mut names: Vec<String> = status
@@ -213,6 +215,14 @@ async fn backend_names(state: &AppState) -> Vec<String> {
 /// The users to pick from; none for a viewer who may not list them.
 async fn load_users(admin: &Admin<'_>) -> Result<Vec<User>, AdminError> {
     match admin.users(USERS_LIMIT).await {
+        Err(AdminError::Forbidden) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
+/// The service accounts to pick from; none for a viewer who may not list them.
+async fn load_accounts(admin: &Admin<'_>) -> Result<Vec<ServiceAccount>, AdminError> {
+    match admin.service_accounts().await {
         Err(AdminError::Forbidden) => Ok(Vec::new()),
         other => other,
     }
@@ -270,6 +280,7 @@ async fn load_group_detail(
         group,
         members,
         users: load_users(admin).await?,
+        accounts: load_accounts(admin).await?,
         providers,
     })
 }
@@ -580,7 +591,7 @@ pub(super) struct GrantForm {
 }
 
 /// The non-empty, trimmed entries of a comma separated list.
-fn split_globs(text: Option<&str>) -> Vec<String> {
+pub(super) fn split_globs(text: Option<&str>) -> Vec<String> {
     text.unwrap_or_default()
         .split(',')
         .map(str::trim)

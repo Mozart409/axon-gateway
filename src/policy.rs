@@ -657,6 +657,19 @@ impl Policy {
         groups.into_iter().collect()
     }
 
+    /// Groups of a service account: only its database memberships. No
+    /// [`AUTHENTICATED_GROUP`] and no `IdP` mappings, an account has no login. Sorted,
+    /// deduplicated.
+    pub fn groups_for_service_account(&self, account_id: Uuid) -> Vec<String> {
+        self.memberships
+            .iter()
+            .filter(|(member, _)| *member == account_id)
+            .map(|(_, group)| group.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Roles and permissions of a user. Everyone is a [`Role::Member`]; `is_admin` (the
     /// provider's `admin_groups`) adds [`Role::Admin`]; bindings on the user or on one of
     /// `groups` add theirs.
@@ -1879,5 +1892,33 @@ mod tests {
 
         let none: RbacConfig = toml::from_str("").unwrap();
         assert!(none.role_bindings.is_empty());
+    }
+
+    #[test]
+    fn service_account_groups_are_memberships_only() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        // `it` is a config group: the membership row for it is dropped, `ghost` does not exist
+        assert_eq!(policy.groups_for_service_account(user()), ["beta"]);
+        assert_eq!(
+            policy.groups_for_service_account(Uuid::from_u128(2)),
+            ["beta"]
+        );
+        // no memberships: nothing, not even `authenticated`
+        assert_eq!(
+            policy.groups_for_service_account(Uuid::from_u128(99)),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn service_account_groups_ignore_idp_mappings() {
+        let policy = Policy::from_parts(&merged_config(), &db_snapshot());
+        // `ops` and `it` map the claim value "id-ops"/"id-it" for a login, not for an account
+        let login = policy.groups_for(Uuid::from_u128(99), "entra", &strings(&["id-ops", "id-it"]));
+        assert!(login.contains(&"ops".to_string()));
+        assert_eq!(
+            policy.groups_for_service_account(Uuid::from_u128(99)),
+            Vec::<String>::new()
+        );
     }
 }

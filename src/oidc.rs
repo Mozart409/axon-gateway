@@ -267,6 +267,15 @@ impl OidcProviders {
         self.providers.iter().find(|provider| provider.id == id)
     }
 
+    /// The `id` of the provider with this issuer.
+    #[must_use]
+    pub fn id_for_issuer(&self, issuer: &str) -> Option<&str> {
+        self.providers
+            .iter()
+            .find(|provider| provider.issuer == issuer)
+            .map(|provider| provider.id.as_str())
+    }
+
     /// The providers in config order.
     pub fn iter(&self) -> impl Iterator<Item = &Provider> {
         self.providers.iter()

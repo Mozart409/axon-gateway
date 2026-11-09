@@ -21,13 +21,15 @@ use crate::backend::{
     ReadResource,
 };
 use crate::config::{BackendConfig, Config};
+use crate::policy::ToolRef;
+use crate::principal::PrincipalPolicy;
 use crate::registry::{
     GetBackendStatus, ListTools, ListToolset, ListToolsets, RegisterBackend, RegistryActor,
     RemoveBackend, ResolveToolBackend, ToolRoute,
 };
 use crate::types::{
     BackendInfo, JsonRpcRequest, JsonRpcResponse, NamespacedPrompt, NamespacedResource,
-    PromptDefinition, ResourceDefinition, ToolDefinition,
+    NamespacedTool, PromptDefinition, ResourceDefinition, ToolDefinition,
 };
 
 /// The main gateway actor
@@ -109,8 +111,8 @@ impl Actor for GatewayActor {
 #[derive(Clone)]
 pub struct HandleRequest {
     pub request: JsonRpcRequest,
-    /// Resolved token identity (None = shared token or no auth)
-    pub identity: Option<Arc<TokenIdentity>>,
+    /// Who is asking, and so what they may see and call
+    pub caller: Arc<Caller>,
 }
 
 impl Message<HandleRequest> for GatewayActor {
@@ -127,9 +129,7 @@ impl Message<HandleRequest> for GatewayActor {
         let router = self.router();
         let (delegated, sender) = ctx.reply_sender();
         tokio::spawn(async move {
-            let response = router
-                .handle_request(msg.request, msg.identity.as_deref())
-                .await;
+            let response = router.handle_request(msg.request, &msg.caller).await;
             if let Some(sender) = sender {
                 sender.send(response);
             }
@@ -146,27 +146,93 @@ struct RequestRouter {
     backends: Arc<HashMap<String, ActorRef<BackendActor>>>,
 }
 
-/// Whether a token may see and call the namespaced tool `tool_name` of
-/// `backend_name`: both the backend ACL and the tool patterns must allow it.
-fn tool_permitted(identity: Option<&TokenIdentity>, backend_name: &str, tool_name: &str) -> bool {
-    AuthManager::check_backend_permission(identity, backend_name).is_ok()
-        && AuthManager::check_tool_permission(identity, tool_name).is_ok()
+/// The authenticated caller of an MCP request.
+#[derive(Debug, Clone)]
+pub enum Caller {
+    /// No authentication configured (standalone): everything is allowed.
+    Open,
+    /// A legacy `[[tokens]]` identity, checked against its own ACL.
+    Token(TokenIdentity),
+    /// A personal access token or service account, checked against RBAC.
+    Principal(PrincipalPolicy),
 }
 
-/// Whether a token is restricted at all (`None` and empty lists = unrestricted).
-fn is_restricted(identity: Option<&TokenIdentity>) -> bool {
-    identity.is_some_and(|id| !id.allowed_backends.is_empty() || !id.allowed_tools.is_empty())
+impl Caller {
+    /// Whether the caller may use the backend at all.
+    fn backend_permitted(&self, backend_name: &str) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Token(identity) => {
+                AuthManager::check_backend_permission(Some(identity), backend_name).is_ok()
+            }
+            Self::Principal(policy) => policy.backend_permitted(backend_name),
+        }
+    }
+
+    /// The error message for a request that names a backend the caller may
+    /// not use, `None` if it may. A principal gets the answer for a backend
+    /// that does not exist, so a hidden backend looks absent.
+    fn backend_denial(&self, backend_name: &str) -> Option<String> {
+        match self {
+            Self::Open => None,
+            Self::Token(identity) => {
+                AuthManager::check_backend_permission(Some(identity), backend_name)
+                    .err()
+                    .map(|e| format!("Permission denied: {e}"))
+            }
+            Self::Principal(policy) => (!policy.backend_permitted(backend_name))
+                .then(|| format!("Backend '{backend_name}' not found")),
+        }
+    }
+
+    /// Whether the caller may see and call this tool: for a legacy token both
+    /// the backend ACL and the tool patterns must allow it, for a principal
+    /// its policy and token scope.
+    fn tool_permitted(&self, tool: &NamespacedTool) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Token(identity) => {
+                AuthManager::check_backend_permission(Some(identity), &tool.backend_name).is_ok()
+                    && AuthManager::check_tool_permission(Some(identity), &tool.namespaced_name)
+                        .is_ok()
+            }
+            Self::Principal(policy) => policy.permits(
+                ToolRef {
+                    backend: &tool.backend_name,
+                    name: &tool.original_name,
+                    read_only_hint: tool.definition.read_only_hint(),
+                },
+                &tool.namespaced_name,
+            ),
+        }
+    }
+
+    /// Whether the caller is restricted at all (`Open` and a legacy token with
+    /// empty lists are unrestricted).
+    fn is_restricted(&self) -> bool {
+        match self {
+            Self::Open => false,
+            Self::Token(id) => !id.allowed_backends.is_empty() || !id.allowed_tools.is_empty(),
+            Self::Principal(_) => true,
+        }
+    }
+}
+
+/// The response for a tool name that does not resolve. A tool the caller may
+/// not call gets this too, so hidden looks like absent.
+fn unknown_tool(id: Option<serde_json::Value>, tool_name: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error(id, -32601, format!("Unknown tool: {tool_name}"))
 }
 
 impl RequestRouter {
     /// Backends the caller may access.
     fn permitted_backends<'a>(
         &'a self,
-        identity: Option<&'a TokenIdentity>,
+        caller: &'a Caller,
     ) -> impl Iterator<Item = (&'a String, &'a ActorRef<BackendActor>)> + 'a {
         self.backends
             .iter()
-            .filter(move |(name, _)| AuthManager::check_backend_permission(identity, name).is_ok())
+            .filter(move |(name, _)| caller.backend_permitted(name))
     }
 
     /// Drop the tools the caller is not allowed to call.
@@ -176,9 +242,9 @@ impl RequestRouter {
     async fn filter_tools(
         &self,
         tools: Vec<ToolDefinition>,
-        identity: Option<&TokenIdentity>,
+        caller: &Caller,
     ) -> Vec<ToolDefinition> {
-        if !is_restricted(identity) {
+        if !caller.is_restricted() {
             return tools;
         }
 
@@ -190,7 +256,7 @@ impl RequestRouter {
         let permitted: HashSet<&str> = backends
             .iter()
             .flat_map(|backend| backend.tools.iter())
-            .filter(|tool| tool_permitted(identity, &tool.backend_name, &tool.namespaced_name))
+            .filter(|tool| caller.tool_permitted(tool))
             .map(|tool| tool.namespaced_name.as_str())
             .collect();
 
@@ -200,12 +266,29 @@ impl RequestRouter {
             .collect()
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn handle_request(
+    /// Whether the caller may call the tool `original_name` of `backend_name`,
+    /// by the definition the registry holds for it. A tool the registry does
+    /// not know is not callable.
+    async fn tool_callable(
         &self,
-        request: JsonRpcRequest,
-        identity: Option<&TokenIdentity>,
-    ) -> JsonRpcResponse {
+        caller: &Caller,
+        backend_name: &str,
+        original_name: &str,
+    ) -> bool {
+        let backends = self
+            .registry
+            .ask(GetBackendStatus)
+            .await
+            .unwrap_or_default();
+        backends
+            .iter()
+            .flat_map(|backend| backend.tools.iter())
+            .find(|tool| tool.backend_name == backend_name && tool.original_name == original_name)
+            .is_some_and(|tool| caller.tool_permitted(tool))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_request(&self, request: JsonRpcRequest, caller: &Caller) -> JsonRpcResponse {
         tracing::debug!("Handling MCP request: {}", request.method);
 
         match request.method.as_str() {
@@ -234,7 +317,7 @@ impl RequestRouter {
                 Ok(tools) => JsonRpcResponse::success(
                     request.id.clone(),
                     serde_json::json!({
-                        "tools": self.filter_tools(tools, identity).await
+                        "tools": self.filter_tools(tools, caller).await
                     }),
                 ),
                 Err(e) => JsonRpcResponse::error(
@@ -280,15 +363,19 @@ impl RequestRouter {
                         backend_name,
                         original_tool_name,
                     }) => {
-                        // Check backend permission
-                        if let Err(e) =
-                            AuthManager::check_backend_permission(identity, &backend_name)
+                        // A principal may only call a tool its policy shows
+                        // it: anything else is answered like an unknown tool
+                        if let Caller::Principal(_) = caller
+                            && !self
+                                .tool_callable(caller, &backend_name, &original_tool_name)
+                                .await
                         {
-                            return JsonRpcResponse::error(
-                                request.id.clone(),
-                                -32000,
-                                format!("Permission denied: {e}"),
-                            );
+                            return unknown_tool(request.id.clone(), &tool_name);
+                        }
+
+                        // Check backend permission
+                        if let Some(message) = caller.backend_denial(&backend_name) {
+                            return JsonRpcResponse::error(request.id.clone(), -32000, message);
                         }
 
                         // Get the backend actor
@@ -338,11 +425,7 @@ impl RequestRouter {
                             )
                         }
                     }
-                    None => JsonRpcResponse::error(
-                        request.id.clone(),
-                        -32601,
-                        format!("Unknown tool: {tool_name}"),
-                    ),
+                    None => unknown_tool(request.id.clone(), &tool_name),
                 }
             }
 
@@ -350,7 +433,7 @@ impl RequestRouter {
             "resources/list" => {
                 let mut all_resources: Vec<ResourceDefinition> = Vec::new();
 
-                for (backend_name, backend) in self.permitted_backends(identity) {
+                for (backend_name, backend) in self.permitted_backends(caller) {
                     // ask() returns Result<T, SendError<M, E>> when Reply = Result<T, E>
                     match backend.ask(ListResources).await {
                         Ok(resources) => {
@@ -390,12 +473,8 @@ impl RequestRouter {
                 // Parse the namespaced URI to find backend and original URI
                 // Format: "{backend}://{original_uri}"
                 if let Some((backend_name, original_uri)) = uri.split_once("://") {
-                    if let Err(e) = AuthManager::check_backend_permission(identity, backend_name) {
-                        JsonRpcResponse::error(
-                            request.id.clone(),
-                            -32000,
-                            format!("Permission denied: {e}"),
-                        )
+                    if let Some(message) = caller.backend_denial(backend_name) {
+                        JsonRpcResponse::error(request.id.clone(), -32000, message)
                     } else if let Some(backend) = self.backends.get(backend_name) {
                         crate::metrics::record_resource_read(backend_name);
                         match backend
@@ -431,7 +510,7 @@ impl RequestRouter {
             "prompts/list" => {
                 let mut all_prompts: Vec<PromptDefinition> = Vec::new();
 
-                for (backend_name, backend) in self.permitted_backends(identity) {
+                for (backend_name, backend) in self.permitted_backends(caller) {
                     match backend.ask(ListPrompts).await {
                         Ok(prompts) => {
                             // Namespace the prompts
@@ -473,12 +552,8 @@ impl RequestRouter {
                 // Parse the namespaced name to find backend and original name
                 // Format: "{backend}_{original_name}"
                 if let Some((backend_name, original_name)) = name.split_once('_') {
-                    if let Err(e) = AuthManager::check_backend_permission(identity, backend_name) {
-                        JsonRpcResponse::error(
-                            request.id.clone(),
-                            -32000,
-                            format!("Permission denied: {e}"),
-                        )
+                    if let Some(message) = caller.backend_denial(backend_name) {
+                        JsonRpcResponse::error(request.id.clone(), -32000, message)
                     } else if let Some(backend) = self.backends.get(backend_name) {
                         crate::metrics::record_prompt_get(backend_name);
                         match backend
@@ -559,7 +634,7 @@ impl Message<GetStatus> for GatewayActor {
 #[derive(Clone)]
 pub struct HandleToolsetRequest {
     pub request: JsonRpcRequest,
-    pub identity: Option<Arc<TokenIdentity>>,
+    pub caller: Arc<Caller>,
     pub toolset_name: String,
 }
 
@@ -575,7 +650,7 @@ impl Message<HandleToolsetRequest> for GatewayActor {
         let (delegated, sender) = ctx.reply_sender();
         tokio::spawn(async move {
             let response = router
-                .handle_toolset_request(msg.request, msg.identity.as_deref(), &msg.toolset_name)
+                .handle_toolset_request(msg.request, &msg.caller, &msg.toolset_name)
                 .await;
             if let Some(sender) = sender {
                 sender.send(response);
@@ -589,7 +664,7 @@ impl RequestRouter {
     async fn handle_toolset_request(
         &self,
         request: JsonRpcRequest,
-        identity: Option<&TokenIdentity>,
+        caller: &Caller,
         toolset_name: &str,
     ) -> JsonRpcResponse {
         // For tools/list, return toolset-filtered tools
@@ -603,7 +678,7 @@ impl RequestRouter {
             {
                 Ok(tools) => JsonRpcResponse::success(
                     request.id.clone(),
-                    serde_json::json!({ "tools": self.filter_tools(tools, identity).await }),
+                    serde_json::json!({ "tools": self.filter_tools(tools, caller).await }),
                 ),
                 Err(e) => JsonRpcResponse::error(
                     request.id.clone(),
@@ -614,7 +689,7 @@ impl RequestRouter {
         }
 
         // For all other methods, delegate to the normal handler
-        self.handle_request(request, identity).await
+        self.handle_request(request, caller).await
     }
 }
 
@@ -1210,6 +1285,7 @@ mod tests {
 
         use super::*;
         use crate::config::GatewayConfig;
+        use crate::principal::TokenScope;
         use crate::registry::UpdateBackend;
         use crate::types::BackendState;
 
@@ -1222,13 +1298,13 @@ mod tests {
             }
         }
 
-        fn identity(allowed_backends: &[&str], allowed_tools: &[&str]) -> Arc<TokenIdentity> {
-            Arc::new(TokenIdentity {
+        fn identity(allowed_backends: &[&str], allowed_tools: &[&str]) -> Arc<Caller> {
+            Arc::new(Caller::Token(TokenIdentity {
                 name: String::from("agent"),
                 allowed_tools: allowed_tools.iter().map(ToString::to_string).collect(),
                 allowed_backends: allowed_backends.iter().map(ToString::to_string).collect(),
                 rate_limit_per_minute: 0,
-            })
+            }))
         }
 
         /// A gateway with no backend actors, whose registry knows the tools of
@@ -1276,7 +1352,7 @@ mod tests {
             gateway: &ActorRef<GatewayActor>,
             method: &str,
             params: serde_json::Value,
-            identity: Option<Arc<TokenIdentity>>,
+            caller: Arc<Caller>,
         ) -> JsonRpcResponse {
             gateway
                 .ask(HandleRequest {
@@ -1286,7 +1362,7 @@ mod tests {
                         method: method.to_string(),
                         params,
                     },
-                    identity,
+                    caller,
                 })
                 .await
                 .unwrap()
@@ -1306,11 +1382,17 @@ mod tests {
         #[tokio::test]
         async fn tools_list_is_unfiltered_without_restrictions() {
             let gateway = gateway().await;
-            let all = call(&gateway, "tools/list", serde_json::json!({}), None).await;
+            let all = call(
+                &gateway,
+                "tools/list",
+                serde_json::json!({}),
+                Arc::new(Caller::Open),
+            )
+            .await;
             assert_eq!(tool_names(&all).len(), 4);
 
             let open = identity(&[], &[]);
-            let open = call(&gateway, "tools/list", serde_json::json!({}), Some(open)).await;
+            let open = call(&gateway, "tools/list", serde_json::json!({}), open).await;
             assert_eq!(tool_names(&open).len(), 4);
         }
 
@@ -1318,7 +1400,7 @@ mod tests {
         async fn tools_list_hides_backends_outside_the_token_acl() {
             let gateway = gateway().await;
             let id = identity(&["public"], &[]);
-            let response = call(&gateway, "tools/list", serde_json::json!({}), Some(id)).await;
+            let response = call(&gateway, "tools/list", serde_json::json!({}), id).await;
             // `public_extra_thing` starts with `public_` but belongs to another
             // backend, so it must stay hidden.
             assert_eq!(tool_names(&response), ["public_read", "public_write"]);
@@ -1328,7 +1410,7 @@ mod tests {
         async fn tools_list_applies_tool_patterns() {
             let gateway = gateway().await;
             let id = identity(&[], &["public_read", "secret_*"]);
-            let response = call(&gateway, "tools/list", serde_json::json!({}), Some(id)).await;
+            let response = call(&gateway, "tools/list", serde_json::json!({}), id).await;
             assert_eq!(tool_names(&response), ["public_read", "secret_dump"]);
         }
 
@@ -1337,7 +1419,7 @@ mod tests {
             let gateway = gateway().await;
             let id = identity(&["public"], &[]);
             let params = serde_json::json!({ "uri": "secret://file.txt" });
-            let response = call(&gateway, "resources/read", params, Some(id)).await;
+            let response = call(&gateway, "resources/read", params, id).await;
             let error = response.error.expect("must be denied");
             assert!(
                 error.message.contains("Permission denied"),
@@ -1351,7 +1433,7 @@ mod tests {
             let gateway = gateway().await;
             let id = identity(&["public"], &[]);
             let params = serde_json::json!({ "name": "secret_prompt" });
-            let response = call(&gateway, "prompts/get", params, Some(id)).await;
+            let response = call(&gateway, "prompts/get", params, id).await;
             let error = response.error.expect("must be denied");
             assert!(
                 error.message.contains("Permission denied"),
@@ -1365,11 +1447,170 @@ mod tests {
             let gateway = gateway().await;
             let id = identity(&["public"], &[]);
             let params = serde_json::json!({ "uri": "public://file.txt" });
-            let response = call(&gateway, "resources/read", params, Some(id)).await;
+            let response = call(&gateway, "resources/read", params, id).await;
             // No backend actor exists in this test, so it gets past the ACL and
             // fails on lookup instead.
             let error = response.error.expect("no backend actor");
             assert!(error.message.contains("not found"), "{}", error.message);
+        }
+
+        fn principal(
+            groups: &[&str],
+            opt_outs: &[(&str, Option<&str>)],
+            scope: TokenScope,
+        ) -> Arc<Caller> {
+            use crate::policy::{GrantConfig, OptOuts, Policy, RbacConfig, RbacGroupConfig};
+
+            let grant = |backend: &str, include: &[&str]| GrantConfig {
+                group: String::from("dev"),
+                backend: backend.to_string(),
+                include: include.iter().map(ToString::to_string).collect(),
+                exclude: Vec::new(),
+                read_only: false,
+                mandatory: false,
+            };
+            let config = RbacConfig {
+                groups: vec![RbacGroupConfig {
+                    name: String::from("dev"),
+                    description: None,
+                    idp: Vec::new(),
+                }],
+                grants: vec![grant("public", &["*"]), grant("secret", &["nothing"])],
+                role_bindings: Vec::new(),
+            };
+            let groups: Vec<String> = groups.iter().map(ToString::to_string).collect();
+            let effective = Policy::from_config(&config).effective(&groups);
+            let opt_outs = OptOuts::new(
+                opt_outs
+                    .iter()
+                    .map(|(backend, tool)| (backend.to_string(), tool.map(ToString::to_string))),
+            );
+            Arc::new(Caller::Principal(PrincipalPolicy::new(
+                String::from("alice"),
+                effective,
+                opt_outs,
+                scope,
+            )))
+        }
+
+        async fn call_tool(
+            gateway: &ActorRef<GatewayActor>,
+            name: &str,
+            caller: &Arc<Caller>,
+        ) -> JsonRpcResponse {
+            call(
+                gateway,
+                "tools/call",
+                serde_json::json!({ "name": name }),
+                Arc::clone(caller),
+            )
+            .await
+        }
+
+        /// The unknown-tool answer of a nonexistent name, with `name` swapped in.
+        fn assert_looks_unknown(response: &JsonRpcResponse, name: &str) {
+            let error = response.error.as_ref().expect("must be an error");
+            assert_eq!(error.code, -32601);
+            assert_eq!(error.message, format!("Unknown tool: {name}"));
+        }
+
+        #[tokio::test]
+        async fn principal_lists_only_granted_tools() {
+            let gateway = gateway().await;
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let response = call(&gateway, "tools/list", serde_json::json!({}), caller).await;
+            assert_eq!(tool_names(&response), ["public_read", "public_write"]);
+        }
+
+        #[tokio::test]
+        async fn principal_without_grants_sees_nothing() {
+            let gateway = gateway().await;
+            let caller = principal(&[], &[], TokenScope::default());
+            let response = call(&gateway, "tools/list", serde_json::json!({}), caller).await;
+            assert_eq!(tool_names(&response), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn principal_list_honours_opt_outs_and_scope() {
+            let gateway = gateway().await;
+            let opted_out = [("public", Some("write"))];
+            let caller = principal(&["dev"], &opted_out, TokenScope::default());
+            let response = call(&gateway, "tools/list", serde_json::json!({}), caller).await;
+            assert_eq!(tool_names(&response), ["public_read"]);
+
+            let scope = TokenScope {
+                backends: Vec::new(),
+                tools: vec![String::from("public_write")],
+            };
+            let caller = principal(&["dev"], &[], scope);
+            let response = call(&gateway, "tools/list", serde_json::json!({}), caller).await;
+            assert_eq!(tool_names(&response), ["public_write"]);
+        }
+
+        #[tokio::test]
+        async fn principal_call_of_hidden_tool_looks_like_unknown_tool() {
+            let gateway = gateway().await;
+            let missing = call_tool(
+                &gateway,
+                "public_missing",
+                &principal(&["dev"], &[], TokenScope::default()),
+            )
+            .await;
+            assert_looks_unknown(&missing, "public_missing");
+
+            // not granted: `secret` exists but only `nothing` is granted
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let denied = call_tool(&gateway, "secret_dump", &caller).await;
+            assert_looks_unknown(&denied, "secret_dump");
+            let (denied, missing) = (denied.error.unwrap(), missing.error.unwrap());
+            assert_eq!(denied.code, missing.code);
+            assert_eq!(denied.data, missing.data);
+
+            // opted out
+            let opted_out = [("public", Some("write"))];
+            let caller = principal(&["dev"], &opted_out, TokenScope::default());
+            let response = call_tool(&gateway, "public_write", &caller).await;
+            assert_looks_unknown(&response, "public_write");
+
+            // outside the token scope
+            let scope = TokenScope {
+                backends: vec![String::from("secret")],
+                tools: Vec::new(),
+            };
+            let caller = principal(&["dev"], &[], scope);
+            let response = call_tool(&gateway, "public_read", &caller).await;
+            assert_looks_unknown(&response, "public_read");
+        }
+
+        #[tokio::test]
+        async fn principal_call_of_visible_tool_reaches_the_backend() {
+            let gateway = gateway().await;
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let response = call_tool(&gateway, "public_read", &caller).await;
+            // No backend actor exists in this test, so it gets past RBAC and
+            // fails on lookup instead.
+            let error = response.error.expect("no backend actor");
+            assert!(error.message.contains("not available"), "{}", error.message);
+        }
+
+        #[tokio::test]
+        async fn principal_toolset_endpoint_only_narrows() {
+            let gateway = gateway().await;
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let response = gateway
+                .ask(HandleToolsetRequest {
+                    request: JsonRpcRequest {
+                        jsonrpc: String::from("2.0"),
+                        id: Some(serde_json::json!(1)),
+                        method: String::from("tools/call"),
+                        params: serde_json::json!({ "name": "secret_dump" }),
+                    },
+                    caller,
+                    toolset_name: String::from("any"),
+                })
+                .await
+                .unwrap();
+            assert_looks_unknown(&response, "secret_dump");
         }
     }
 }

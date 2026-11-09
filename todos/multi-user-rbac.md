@@ -279,14 +279,15 @@ The mechanism stays generic OIDC; recipes only say what to configure at the IdP.
 
 - Format `axon_pat_<public id>_<secret>`. The prefix enables secret scanning.
   Store SHA-256 of the secret; look up by public id, then constant-time compare.
-- Expiry is required; admin-configurable maximum lifetime. Track `last_used_at`
+- Expiry is required; fixed maximum lifetime (90 days for users, 365 for
+  service accounts; no config knob until a deployment needs one). Track `last_used_at`
   and last IP. Optional scope narrowing (backends, tool globs). Revoke anytime.
 - Service accounts are owned by admins and bound to groups/roles like users.
 
 Deprovisioning: a PAT outlives the IdP session, so:
 
 - maximum lifetime,
-- PATs are suspended when the owner has not logged in for N days (configurable)
+- PATs are suspended when the owner has not logged in for 90 days
   or was disabled by an admin,
 - SCIM 2.0 provisioning in a later phase (Phase 7).
 
@@ -665,25 +666,38 @@ The work deployment is Kubernetes with 3 replicas.
 - [x] Audit log for admin actions, written in the same transaction
       (`/ui/admin/audit`, `GET /api/v1/audit`).
 
-### Phase 3 - Agent tokens
+### Phase 3a - Agent tokens and enforcement
 
-- [ ] Per-principal `tools/list` and `tools/call` enforcement (moved from
-      Phase 2: it needs PATs to know the principal); hidden tools rejected on
-      `tools/call` with the standard unknown-tool error (hidden looks like
-      absent).
-- [ ] PATs (`axon_pat_...`), expiry, max lifetime, scope narrowing, revoke,
-      last-used tracking.
-- [ ] Service accounts (admin-managed).
-- [ ] Legacy `auth_token` / `[[tokens]]` mapped to config service accounts;
+- [x] Per-principal `tools/list` and `tools/call` enforcement (moved from
+      Phase 2: it needs PATs to know the principal); hidden tools answer
+      `tools/call` with the unknown-tool error (-32601, hidden looks like
+      absent); resources and prompts filtered by permitted backends.
+- [x] PATs (`axon_pat_...`), expiry, max lifetime, scope narrowing, revoke,
+      last-used tracking (`/ui/tokens`, `/api/v1/tokens`). Lifetimes are fixed
+      defaults, no config knob: 30 days default, 90 days max for users, 365
+      for service accounts.
+- [x] Service accounts (admin-managed, `/ui/admin/service-accounts`,
+      `/api/v1/service-accounts`), members of database groups.
+- [x] Multi-user mode is deny-by-default on `/mcp` (401 with
+      `WWW-Authenticate: Bearer`); legacy tokens still work and log a
       deprecation warning.
-- [ ] Deprovisioning rules (inactivity, disabled user).
+- [x] Deprovisioning: a user's tokens are suspended after 90 days without a
+      login; a disabled service account's tokens stop working.
+- Exit (met, `tests/tokens.rs`): two users with different groups see and can
+  call different tools; an agent authenticates with a PAT and is limited to
+  its owner's policy intersected with its scope.
+
+### Phase 3b - Agent tokens, rest
+
+- [ ] Legacy `auth_token` / `[[tokens]]` mapped to config service accounts.
+- [ ] Service accounts in config groups (today only database groups take
+      them as members).
+- [ ] Admin disable of a human user (suspends their tokens).
+- [ ] Record the client IP on token use (`last_used_ip` is written as null).
 - [ ] User-defined toolsets and PAT toolset pinning.
 - [ ] Tool-call audit, with argument capture policy (annotation defaults,
       overrides), `audit_arguments` table and `audit.read_sensitive`.
 - [ ] Break-glass CLI `axon-gateway admin ...`.
-- Exit: two users with different groups see and can call different tools; an
-  agent authenticates with a PAT and is limited to its owner's policy
-  intersected with its scope.
 
 ### Phase 4 - Spec-compliant MCP transport
 

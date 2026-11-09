@@ -22,8 +22,8 @@ use tokio::sync::broadcast;
 use super::{AppState, FlashLevel, FlashMessage, UiEvent, views};
 use crate::config::Config;
 use crate::gateway::{
-    DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect, GetDetailedStatus, HandleRequest,
-    ReloadConfig,
+    Caller, DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect, GetDetailedStatus,
+    HandleRequest, ReloadConfig,
 };
 use crate::policy::{OptOuts, ToolRef};
 use crate::store::{SessionUser, Store};
@@ -504,7 +504,7 @@ async fn fetch_backend_prompts(state: &AppState, backend_name: &str) -> Vec<Prom
                 method: String::from("prompts/list"),
                 params: json!({}),
             },
-            identity: None,
+            caller: Arc::new(Caller::Open),
         })
         .await
     {
@@ -548,7 +548,7 @@ async fn fetch_backend_resources(state: &AppState, backend_name: &str) -> Vec<Re
                 method: String::from("resources/list"),
                 params: json!({}),
             },
-            identity: None,
+            caller: Arc::new(Caller::Open),
         })
         .await
     {

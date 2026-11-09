@@ -124,6 +124,7 @@ argument (both example files already do this).
 | `/ui/actions/backends/{name}/enable`    | POST   | HTMX action: enable backend                         |
 | `/ui/actions/reload`                    | POST   | HTMX action: reload config                          |
 | `/ui/tools`                             | GET    | "My tools" page (multi-user mode)                   |
+| `/ui/tokens`                            | GET    | Personal access tokens page (multi-user mode)       |
 | `/api/v1/...`                           | any    | JSON admin API for RBAC (multi-user mode, see RBAC) |
 | `/build`                                | GET    | Build/runtime metadata (version, pid, startup time) |
 | `/health`                               | GET    | Health check                                        |
@@ -349,8 +350,20 @@ user belongs to the built-in `authenticated` group (everyone logged in), to
 every group with an IdP mapping that matches one of their claim values at the
 login provider, and to every group they were added to by hand. A grant lets a
 group use a backend's tools (globs over the tool's original name); the union of
-a user's grants is what the "My tools" page shows as allowed. Grants are not yet
-enforced on `/mcp`.
+a user's grants is what the "My tools" page shows as allowed.
+
+On `/mcp` (and `/mcp/sse` and the toolset endpoints) a personal access token
+(`axon_pat_...`, or a service account's) gets exactly what its owner's policy
+allows, narrowed by the token's scope (backends and tool globs) and minus the
+owner's opt-outs, in both `tools/list` and `tools/call`. A tool the token may
+not use is hidden like one that does not exist: `tools/call` answers it with
+the same `Unknown tool` error (-32601) as for a name no backend has, and a
+backend outside the policy is listed nowhere. Without a valid token in
+multi-user mode the endpoints answer 401 with `WWW-Authenticate: Bearer`. The
+legacy `gateway.auth_token` and `[[tokens]]` still work, but they bypass RBAC
+(they keep their own ACL) and are deprecated in favour of personal access
+tokens and service accounts; the gateway logs a warning at startup when they
+are set in multi-user mode.
 
 ```toml
 [[rbac.groups]]
@@ -422,6 +435,89 @@ mappings and members at `/ui/admin/groups/{name}`, grants, role bindings and
 the audit log at `/ui/admin/audit`. It goes through the same service as the
 API, so permissions, validation, audit entries and the read-only config rows
 behave the same; users without a write permission see the tables only.
+
+### Personal access tokens and service accounts
+
+A client that cannot log in through a browser, such as an agent, calls `/mcp`
+with a personal access token (PAT):
+
+```text
+Authorization: Bearer axon_pat_<public id>_<secret>
+```
+
+The public id is 16 hex characters and names the token in lists and the audit
+log; the secret is 64. Only a SHA-256 of the secret is stored, so the
+plaintext is shown once, in the response (or dashboard box) that creates the
+token, and cannot be recovered: revoke a lost token and make a new one.
+
+A PAT acts as its owner. It gets what the owner's groups grant, minus the
+tools the owner hid on "My tools", narrowed by the token's own scope:
+
+- `scope_backends` limits it to those backends (exact names),
+- `scope_tools` limits it to tools matching one of the globs, written over the
+  namespaced name (`files_read_*`),
+- an empty or missing list does not narrow, and when both are set a tool must
+  pass both.
+
+A scope can only narrow, never widen: a tool the owner may not use stays
+hidden whatever the scope says. A token also follows its owner's later
+changes (a group left, a grant removed) at once.
+
+Lifetimes: a token expires after `expires_in_days` (default 30). A user may ask
+for at most 90 days, a service account's token for at most 365. A token stops
+working when it expires, is revoked, or its owner is disabled. A user's tokens
+are also suspended while the user has not logged in to the dashboard for 90
+days, and work again after the next login. Each token shows its state
+(active, expired, revoked) and when it was last used (updated about once a
+minute).
+
+Every signed-in user manages their own tokens, on `/ui/tokens` (a "Tokens" link
+in the user bar) or through the API: create with a name, an expiry and an
+optional scope, then copy the plaintext from the box that shows it once, and
+revoke when done. Backends to narrow to are offered from the ones the user is
+granted. A token's secret is never shown again, to anyone, so an admin
+cannot read a user's token either.
+
+A service account is a principal owned by admins (`service_accounts.manage`,
+held by the `admin` role) for agents and scripts that belong to no person. It
+has a name (`[a-z0-9_-]+`, like a group), an optional description, and no
+login. Because it is a user row of its own kind, it joins groups like a user:
+add it on a group's page (the member list marks it as a service account) or
+with `PUT /api/v1/groups/{name}/members/{id}`, and give that group grants. It
+is a member of database groups only: a group declared in `config.toml` takes
+members from its IdP mappings alone, so a service account cannot join one
+(the write answers 409). Its groups are exactly its memberships, without the
+built-in `authenticated` group. Disabling the account stops all its tokens at
+once (enabling it restores them), and deleting it removes its tokens and
+memberships. Admins manage accounts on `/ui/admin/service-accounts` (linked
+from `/ui/admin`).
+
+| Endpoint                                                 | Method           | Needs                      |
+| -------------------------------------------------------- | ---------------- | -------------------------- |
+| `/api/v1/tokens`                                         | GET, POST        | a session                  |
+| `/api/v1/tokens/{id}`                                    | DELETE           | a session (own tokens)     |
+| `/api/v1/service-accounts`                               | GET, POST        | `service_accounts.manage`  |
+| `/api/v1/service-accounts/{id}`                          | PATCH, DELETE    | `service_accounts.manage`  |
+| `/api/v1/service-accounts/{id}/tokens`                   | GET, POST        | `service_accounts.manage`  |
+| `/api/v1/service-accounts/{id}/tokens/{token_id}`        | DELETE           | `service_accounts.manage`  |
+
+Bodies: a token `{"name", "expires_in_days", "scope_backends", "scope_tools"}`
+(only `name` is required), a service account `{"name", "description"}`, a PATCH
+`{"disabled": true}` or `{"disabled": false}`. `POST` of a token answers 201
+with its metadata (`id`, `public_id`, `name`, `prefix`, `scope_backends`,
+`scope_tools`, `created_at`, `expires_at`, `last_used_at`, `state`) and, only
+there, `plaintext`. Lists answer `{"tokens": [...]}` and
+`{"service_accounts": [...]}`. A bad name, expiry (0 or beyond the maximum) or
+scope answers 400. Revoking a token that is not yours, or not live, answers 404.
+Token and service account changes are written to the audit log
+(`token.create`, `token.revoke`, `service_account.*`) without any secret.
+
+```sh
+# a token for an agent, 30 days, only the Prometheus tools
+curl -X POST https://axon.homelab.internal/api/v1/tokens \
+  -H "Cookie: $SESSION" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
+  -d '{"name": "agent", "scope_tools": ["prom_*"]}'
+```
 
 ## Tracing
 

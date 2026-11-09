@@ -77,7 +77,7 @@ fn grant_json(grant: &GrantConfig) -> Value {
 }
 
 /// Appends the audit row of a change; runs inside the change's transaction
-async fn audit(
+pub(super) async fn audit(
     conn: &mut PgConnection,
     actor: &Actor,
     action: &str,
@@ -583,13 +583,14 @@ impl Store {
         Ok(true)
     }
 
-    /// Up to `limit` users, ordered by email, display name or subject.
+    /// Up to `limit` users (not service accounts), ordered by email, display name or subject.
     ///
     /// # Errors
     /// Fails when the query fails.
     pub async fn list_users(&self, limit: i64) -> Result<Vec<User>, StoreError> {
         Ok(sqlx::query_as(
             "select id, issuer, subject, email, display_name, groups, is_admin from users \
+             where kind = 'user' \
              order by lower(coalesce(email, display_name, subject)), id limit $1",
         )
         .bind(limit)

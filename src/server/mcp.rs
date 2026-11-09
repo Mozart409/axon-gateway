@@ -13,13 +13,13 @@ use axum::{
         sse::{Event, Sse},
     },
 };
-use futures::stream::{self, Stream};
+use futures::stream;
 use serde_json::json;
 
 use super::AppState;
-use super::auth::verify_auth;
+use super::auth::authenticate;
 use crate::auth::AuthManager;
-use crate::gateway::{HandleRequest, HandleToolsetRequest};
+use crate::gateway::{Caller, HandleRequest, HandleToolsetRequest};
 use crate::types::JsonRpcRequest;
 
 /// Answer a JSON-RPC notification (a message without an `id`).
@@ -36,39 +36,54 @@ fn accept_notification(request: &JsonRpcRequest) -> Option<Response> {
     Some(StatusCode::ACCEPTED.into_response())
 }
 
+/// Log which principal (user or service account and token) sent a request.
+fn log_principal(caller: &Caller, request: &JsonRpcRequest) {
+    if let Caller::Principal(principal) = caller {
+        tracing::debug!(principal = principal.label(), method = %request.method, "MCP request");
+    }
+}
+
 /// Handle POST /mcp - JSON-RPC over HTTP
 pub(super) async fn handle_mcp_request(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
-) -> Result<Response, StatusCode> {
-    let identity = verify_auth(&headers, &state.auth_manager.load())?;
+) -> Response {
+    let caller = match authenticate(&headers, &state).await {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
     if let Some(accepted) = accept_notification(&request) {
-        return Ok(accepted);
+        return accepted;
     }
+    log_principal(&caller, &request);
 
-    // For tool calls, check tool-level permissions
+    // For tool calls, check tool-level permissions of a legacy token. A
+    // principal's are checked in the gateway, which answers a tool it may not
+    // call like an unknown one.
     if request.method == "tools/call"
+        && let Caller::Token(identity) = &caller
         && let Some(tool_name) = request.params.get("name").and_then(|v| v.as_str())
-        && let Err(e) = AuthManager::check_tool_permission(identity.as_ref(), tool_name)
+        && let Err(e) = AuthManager::check_tool_permission(Some(identity), tool_name)
     {
         tracing::warn!("Tool permission denied: {e}");
-        return Err(StatusCode::FORBIDDEN);
+        return StatusCode::FORBIDDEN.into_response();
     }
 
-    let response = state
+    match state
         .gateway
         .ask(HandleRequest {
             request,
-            identity: identity.map(Arc::new),
+            caller: Arc::new(caller),
         })
         .await
-        .map_err(|e| {
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => {
             tracing::error!("Gateway error: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(Json(response).into_response())
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Handle GET /mcp/sse - Server-Sent Events endpoint
@@ -78,21 +93,24 @@ pub(super) async fn handle_mcp_request(
 /// 2. Server sends `endpoint` event with POST URL
 /// 3. Client sends JSON-RPC requests to that POST URL
 /// 4. Server streams responses via SSE
-pub(super) async fn handle_mcp_sse(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    let _identity = verify_auth(&headers, &state.auth_manager.load())?;
+pub(super) async fn handle_mcp_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authenticate(&headers, &state).await {
+        return *response;
+    }
 
     // For SSE transport, we send an initial "endpoint" message
     // Real implementation would maintain a session and stream responses
-    let stream = stream::once(async { Ok(Event::default().event("endpoint").data("/mcp")) });
+    let stream = stream::once(async {
+        Ok::<_, Infallible>(Event::default().event("endpoint").data("/mcp"))
+    });
 
-    Ok(Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(Duration::from_secs(30))
-            .text("ping"),
-    ))
+    Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 /// Handle toolset endpoint - JSON-RPC scoped to a toolset
@@ -104,35 +122,43 @@ pub(super) async fn handle_toolset_request(
     headers: HeaderMap,
     Path(toolset_name): Path<String>,
     Json(request): Json<JsonRpcRequest>,
-) -> Result<Response, StatusCode> {
-    let identity = verify_auth(&headers, &state.auth_manager.load())?;
+) -> Response {
+    let caller = match authenticate(&headers, &state).await {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
     if let Some(accepted) = accept_notification(&request) {
-        return Ok(accepted);
+        return accepted;
     }
+    log_principal(&caller, &request);
 
-    // For tool calls, check tool-level permissions
+    // For tool calls, check tool-level permissions of a legacy token. A
+    // principal's are checked in the gateway, which answers a tool it may not
+    // call like an unknown one.
     if request.method == "tools/call"
+        && let Caller::Token(identity) = &caller
         && let Some(tool_name) = request.params.get("name").and_then(|v| v.as_str())
-        && let Err(e) = AuthManager::check_tool_permission(identity.as_ref(), tool_name)
+        && let Err(e) = AuthManager::check_tool_permission(Some(identity), tool_name)
     {
         tracing::warn!("Tool permission denied: {e}");
-        return Err(StatusCode::FORBIDDEN);
+        return StatusCode::FORBIDDEN.into_response();
     }
 
-    let response = state
+    match state
         .gateway
         .ask(HandleToolsetRequest {
             request,
-            identity: identity.map(Arc::new),
+            caller: Arc::new(caller),
             toolset_name,
         })
         .await
-        .map_err(|e| {
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => {
             tracing::error!("Gateway error: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(Json(response).into_response())
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// List available toolsets

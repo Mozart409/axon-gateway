@@ -12,10 +12,15 @@ use thiserror::Error;
 
 mod auth;
 mod rbac;
+mod tokens;
 mod views;
 
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
 pub use rbac::{Actor, AuditRecord};
+pub use tokens::{
+    ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, MAX_SERVICE_TOKEN_LIFETIME,
+    MAX_USER_TOKEN_LIFETIME, NewToken, PAT_PREFIX, ServiceAccount, TokenError,
+};
 
 const MAX_CONNECTIONS: u32 = 10;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);

@@ -10,6 +10,7 @@
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
+use chrono::{DateTime, TimeDelta, Utc};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -18,8 +19,12 @@ use crate::policy::{
     GrantConfig, GrantView, GroupView, Permission, Permissions, Policy, RbacConfig, Role,
     RoleBinding, RoleSubject, Source, validate_grant, validate_group_name,
 };
+use crate::principal::TokenScope;
 use crate::server::AppState;
-use crate::store::{Actor, AuditRecord, SessionUser, Store, StoreError, User};
+use crate::store::{
+    Actor, ApiToken, AuditRecord, DEFAULT_TOKEN_LIFETIME, IssuedToken, NewToken, ServiceAccount,
+    SessionUser, Store, StoreError, TokenError, User,
+};
 
 /// How often the policy is re-read from the database, so that changes made
 /// through another replica show up here.
@@ -27,6 +32,12 @@ pub const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Longest group description, in characters.
 const MAX_DESCRIPTION_CHARS: usize = 500;
+
+/// Most backends or tool globs one token may be narrowed to.
+const MAX_SCOPE_ENTRIES: usize = 50;
+
+/// Longest backend name or tool glob in a token scope, in characters.
+const MAX_SCOPE_ENTRY_CHARS: usize = 200;
 
 /// The live policy: `[rbac]` from config merged with the database rows.
 #[derive(Debug)]
@@ -102,6 +113,19 @@ pub enum AdminError {
 
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl From<TokenError> for AdminError {
+    fn from(error: TokenError) -> Self {
+        match error {
+            TokenError::InvalidName | TokenError::ExpiryInPast | TokenError::ExpiryTooLong(_) => {
+                Self::Invalid(error.to_string())
+            }
+            TokenError::UnknownOwner => Self::NotFound,
+            TokenError::Store(error) => Self::Store(error),
+            TokenError::Query(error) => Self::Store(StoreError::Query(error)),
+        }
+    }
 }
 
 fn read_only() -> AdminError {
@@ -537,6 +561,300 @@ impl<'a> Admin<'a> {
             return Err(AdminError::NotFound);
         }
         self.reload().await;
+        Ok(())
+    }
+}
+
+/// Whole days in a token lifetime, for forms and messages.
+pub fn lifetime_days(lifetime: Duration) -> u64 {
+    lifetime.as_secs() / 86_400
+}
+
+/// When a token issued now with `expires_in_days` (default
+/// [`DEFAULT_TOKEN_LIFETIME`]) expires. The store enforces the owner's maximum.
+fn expiry(expires_in_days: Option<u32>) -> Result<DateTime<Utc>, AdminError> {
+    let days = expires_in_days.map_or_else(|| lifetime_days(DEFAULT_TOKEN_LIFETIME), u64::from);
+    if days == 0 {
+        return Err(AdminError::Invalid(
+            "expires_in_days must be at least 1".to_owned(),
+        ));
+    }
+    i64::try_from(days)
+        .ok()
+        .and_then(TimeDelta::try_days)
+        .and_then(|lifetime| Utc::now().checked_add_signed(lifetime))
+        .ok_or_else(|| AdminError::Invalid("expires_in_days is too large".to_owned()))
+}
+
+/// Trims and deduplicates one scope list. A blank entry is refused rather than
+/// dropped: a token narrowed to nothing but blanks would otherwise end up
+/// unnarrowed.
+fn clean_scope_list(entries: &[String], what: &str) -> Result<Vec<String>, AdminError> {
+    if entries.len() > MAX_SCOPE_ENTRIES {
+        return Err(AdminError::Invalid(format!(
+            "at most {MAX_SCOPE_ENTRIES} {what} per token"
+        )));
+    }
+    let mut cleaned: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.chars().count() > MAX_SCOPE_ENTRY_CHARS {
+            return Err(AdminError::Invalid(format!(
+                "each of the {what} must be 1 to {MAX_SCOPE_ENTRY_CHARS} characters"
+            )));
+        }
+        if !cleaned.iter().any(|seen| seen == entry) {
+            cleaned.push(entry.to_owned());
+        }
+    }
+    Ok(cleaned)
+}
+
+/// Issues a token for `owner_id`; the owner must already be known to be
+/// allowed to have one.
+async fn issue_token(
+    store: &Store,
+    actor: &Actor,
+    owner_id: Uuid,
+    name: &str,
+    expires_in_days: Option<u32>,
+    scope: &TokenScope,
+) -> Result<IssuedToken, AdminError> {
+    let scope_backends = clean_scope_list(&scope.backends, "backends")?;
+    let scope_tools = clean_scope_list(&scope.tools, "tool patterns")?;
+    let expires_at = expiry(expires_in_days)?;
+    let new = NewToken {
+        owner_id,
+        name: name.trim(),
+        scope_backends: &scope_backends,
+        scope_tools: &scope_tools,
+        expires_at,
+    };
+    Ok(store.create_token(actor, &new).await?)
+}
+
+/// Where a token is in its life
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenState {
+    Active,
+    Expired,
+    Revoked,
+}
+
+impl TokenState {
+    /// The state of `token` now; revoked wins over expired.
+    pub fn of(token: &ApiToken) -> Self {
+        if token.revoked {
+            Self::Revoked
+        } else if token.expires_at <= Utc::now() {
+            Self::Expired
+        } else {
+            Self::Active
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+/// The token operations every signed-in user has on their own tokens.
+pub struct MyTokens<'a> {
+    store: &'a Store,
+    actor: Actor,
+    owner_id: Uuid,
+}
+
+impl<'a> MyTokens<'a> {
+    pub fn new(store: &'a Store, session: &SessionUser) -> Self {
+        Self {
+            store,
+            actor: Actor {
+                user_id: Some(session.user.id),
+                label: actor_label(&session.user),
+            },
+            owner_id: session.user.id,
+        }
+    }
+
+    /// The service for a session; `None` outside multi-user mode.
+    pub fn from_state(state: &'a AppState, session: &SessionUser) -> Option<Self> {
+        let (store, _) = state.multi_user()?;
+        Some(Self::new(store, session))
+    }
+
+    /// The caller's tokens, newest first, revoked and expired ones included.
+    ///
+    /// # Errors
+    /// A store error.
+    pub async fn list(&self) -> Result<Vec<ApiToken>, AdminError> {
+        Ok(self.store.list_tokens(self.owner_id).await?)
+    }
+
+    /// Issues a token for the caller. `expires_in_days` defaults to 30 days
+    /// and is capped by the store at 90.
+    ///
+    /// # Errors
+    /// Invalid for a bad name, scope or expiry, or an expiry beyond the
+    /// maximum; a store error.
+    pub async fn create(
+        &self,
+        name: &str,
+        expires_in_days: Option<u32>,
+        scope: &TokenScope,
+    ) -> Result<IssuedToken, AdminError> {
+        issue_token(
+            self.store,
+            &self.actor,
+            self.owner_id,
+            name,
+            expires_in_days,
+            scope,
+        )
+        .await
+    }
+
+    /// Revokes one of the caller's tokens.
+    ///
+    /// # Errors
+    /// Not found when the caller has no such live token; a store error.
+    pub async fn revoke(&self, id: Uuid) -> Result<(), AdminError> {
+        if !self
+            .store
+            .revoke_token(&self.actor, Some(self.owner_id), id)
+            .await?
+        {
+            return Err(AdminError::NotFound);
+        }
+        Ok(())
+    }
+}
+
+impl Admin<'_> {
+    /// A service account by id (an id of a human is not found).
+    async fn account(&self, id: Uuid) -> Result<ServiceAccount, AdminError> {
+        self.require(Permission::ServiceAccountsManage)?;
+        self.store
+            .service_account(id)
+            .await?
+            .ok_or(AdminError::NotFound)
+    }
+
+    /// All service accounts, by name.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`; a store error.
+    pub async fn service_accounts(&self) -> Result<Vec<ServiceAccount>, AdminError> {
+        self.require(Permission::ServiceAccountsManage)?;
+        Ok(self.store.list_service_accounts().await?)
+    }
+
+    /// One service account.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown id.
+    pub async fn service_account(&self, id: Uuid) -> Result<ServiceAccount, AdminError> {
+        self.account(id).await
+    }
+
+    /// Creates a service account. Its name follows the group name rules.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, invalid for a bad name or
+    /// description, conflict when the name is taken.
+    pub async fn create_service_account(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<ServiceAccount, AdminError> {
+        self.require(Permission::ServiceAccountsManage)?;
+        validate_group_name(name).map_err(AdminError::Invalid)?;
+        let description = clean_description(description)?;
+        self.store
+            .create_service_account(&self.actor, name, description.as_deref())
+            .await?
+            .ok_or_else(already_exists)
+    }
+
+    /// Disables or re-enables a service account; its tokens stop or start
+    /// working with it. Setting the state it already has is not an error.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown id.
+    pub async fn set_service_account_disabled(
+        &self,
+        id: Uuid,
+        disabled: bool,
+    ) -> Result<(), AdminError> {
+        self.account(id).await?;
+        self.store
+            .set_service_account_disabled(&self.actor, id, disabled)
+            .await?;
+        Ok(())
+    }
+
+    /// Deletes a service account with its tokens and group memberships.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown id.
+    pub async fn delete_service_account(&self, id: Uuid) -> Result<(), AdminError> {
+        self.account(id).await?;
+        if !self.store.delete_service_account(&self.actor, id).await? {
+            return Err(AdminError::NotFound);
+        }
+        // Its memberships and bindings went with it.
+        self.reload().await;
+        Ok(())
+    }
+
+    /// The tokens of a service account, newest first.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown id.
+    pub async fn service_account_tokens(&self, id: Uuid) -> Result<Vec<ApiToken>, AdminError> {
+        self.account(id).await?;
+        Ok(self.store.list_tokens(id).await?)
+    }
+
+    /// Issues a token for a service account; `expires_in_days` defaults to 30
+    /// days and is capped by the store at 365.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown
+    /// id, invalid for a bad name, scope or expiry.
+    pub async fn issue_service_account_token(
+        &self,
+        id: Uuid,
+        name: &str,
+        expires_in_days: Option<u32>,
+        scope: &TokenScope,
+    ) -> Result<IssuedToken, AdminError> {
+        self.account(id).await?;
+        issue_token(self.store, &self.actor, id, name, expires_in_days, scope).await
+    }
+
+    /// Revokes a token of a service account.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown
+    /// account or a token that is not a live token of it.
+    pub async fn revoke_service_account_token(
+        &self,
+        id: Uuid,
+        token_id: Uuid,
+    ) -> Result<(), AdminError> {
+        self.account(id).await?;
+        if !self
+            .store
+            .revoke_token(&self.actor, Some(id), token_id)
+            .await?
+        {
+            return Err(AdminError::NotFound);
+        }
         Ok(())
     }
 }

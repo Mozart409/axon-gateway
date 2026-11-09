@@ -15,6 +15,7 @@ mod gateway;
 mod metrics;
 mod oidc;
 mod policy;
+mod principal;
 mod rbac;
 mod registry;
 mod server;
@@ -44,6 +45,22 @@ use crate::server::AppState;
 
 /// How often expired dashboard sessions and login flows are deleted.
 const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The legacy token auth. In multi-user mode its tokens are a way around RBAC.
+fn setup_auth(config: &Config, multi_user: bool) -> SharedAuth {
+    let auth_manager = SharedAuth::new(AuthManager::new(&config.gateway, &config.tokens));
+    if auth_manager.load().auth_required() {
+        tracing::info!("Authentication enabled");
+    } else if !multi_user {
+        tracing::warn!("No authentication configured - gateway is open");
+    }
+    if multi_user && (config.gateway.auth_token.is_some() || !config.tokens.is_empty()) {
+        tracing::warn!(
+            "gateway.auth_token and [[tokens]] bypass RBAC and are deprecated in favour of personal access tokens and service accounts"
+        );
+    }
+    auth_manager
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -102,13 +119,7 @@ async fn main() -> Result<()> {
         .wrap_err("failed to install Prometheus metrics recorder")?;
     tracing::info!("Prometheus metrics available at /metrics");
 
-    // Initialize auth manager
-    let auth_manager = SharedAuth::new(AuthManager::new(&config.gateway, &config.tokens));
-    if auth_manager.load().auth_required() {
-        tracing::info!("Authentication enabled");
-    } else {
-        tracing::warn!("No authentication configured - gateway is open");
-    }
+    let auth_manager = setup_auth(&config, store.is_some() && oidc.is_some());
 
     // Spawn registry actor (with toolsets if configured)
     let registry = if config.toolsets.is_empty() {

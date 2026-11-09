@@ -1,5 +1,6 @@
 //! The JSON admin API under `/api/v1`: RBAC groups, grants, role bindings,
-//! users and the audit log.
+//! users and the audit log (and, from `tokens_api`, personal access tokens and
+//! service accounts).
 //!
 //! Every route needs a dashboard session (`session::require_session`, which
 //! answers 401 JSON here); writes also need the session's `X-CSRF-Token` and a
@@ -33,7 +34,7 @@ const MAX_USERS_LIMIT: i64 = 500;
 const DEFAULT_AUDIT_LIMIT: i64 = 50;
 const MAX_AUDIT_LIMIT: i64 = 200;
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(super) type ApiResult<T> = Result<T, ApiError>;
 
 /// An [`AdminError`] as a JSON response
 pub(super) struct ApiError(AdminError);
@@ -70,7 +71,7 @@ impl IntoResponse for ApiError {
 }
 
 /// `Json<T>` whose rejection is a 400 JSON error
-struct ApiJson<T>(T);
+pub(super) struct ApiJson<T>(pub(super) T);
 
 impl<S, T> FromRequest<S> for ApiJson<T>
 where
@@ -88,7 +89,7 @@ where
 }
 
 /// `Path<T>` whose rejection is a 400 JSON error
-struct ApiPath<T>(T);
+pub(super) struct ApiPath<T>(pub(super) T);
 
 impl<S, T> FromRequestParts<S> for ApiPath<T>
 where
@@ -163,6 +164,7 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         )
         .route("/api/v1/users", get(handle_list_users))
         .route("/api/v1/audit", get(handle_list_audit))
+        .merge(super::tokens_api::routes())
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -187,7 +189,7 @@ async fn require_multi_user(
     next.run(request).await
 }
 
-async fn admin<'a>(state: &'a AppState, session: &SessionUser) -> ApiResult<Admin<'a>> {
+pub(super) async fn admin<'a>(state: &'a AppState, session: &SessionUser) -> ApiResult<Admin<'a>> {
     Admin::from_state(state, session)
         .await
         .ok_or_else(|| AdminError::NotFound.into())

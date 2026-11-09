@@ -15,35 +15,41 @@ use super::views::{build_fingerprint, csrf_hx_headers, render_user_bar};
 use crate::policy::{
     GrantView, GroupView, Permission, Permissions, Role, RoleBinding, RoleSubject, Source,
 };
-use crate::store::{AuditRecord, SessionUser, User};
+use crate::store::{AuditRecord, ServiceAccount, SessionUser, User};
 
 /// Admin actions answer errors with 4xx/5xx and a flash fragment; htmx drops
 /// those responses unless told to swap them.
 const HTMX_CONFIG: &str = r#"{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}"#;
 
-const CARD: &str = "mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900";
-const HEADING: &str = "text-lg font-semibold text-slate-900 dark:text-slate-100";
-const MUTED: &str = "text-sm text-slate-600 dark:text-slate-300";
-const FAINT: &str = "text-slate-500 dark:text-slate-400";
-const TABLE_WRAP: &str =
+pub(super) const CARD: &str = "mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900";
+pub(super) const HEADING: &str = "text-lg font-semibold text-slate-900 dark:text-slate-100";
+pub(super) const MUTED: &str = "text-sm text-slate-600 dark:text-slate-300";
+pub(super) const FAINT: &str = "text-slate-500 dark:text-slate-400";
+pub(super) const TABLE_WRAP: &str =
     "mt-4 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800";
-const TABLE: &str = "min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800";
-const THEAD: &str = "bg-slate-50 dark:bg-slate-800/80";
-const TBODY: &str = "divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-900";
-const TH: &str = "px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300";
-const TD: &str = "px-4 py-3 align-top text-slate-700 dark:text-slate-200";
-const CODE: &str = "text-slate-900 dark:text-slate-100";
-const FORM_ROW: &str = "mt-4 flex flex-wrap items-end gap-3";
-const LABEL: &str = "flex flex-col gap-1 text-xs font-medium text-slate-600 dark:text-slate-300";
-const INPUT: &str = "rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100";
-const BUTTON: &str = "rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300";
-const BUTTON_SMALL: &str = "rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800";
-const BUTTON_DANGER: &str = "rounded-md border border-red-300 px-2 py-1 text-xs text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950/40";
-const LINK: &str = "font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100";
-const BACK_LINK: &str = "inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100";
+pub(super) const TABLE: &str = "min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800";
+pub(super) const THEAD: &str = "bg-slate-50 dark:bg-slate-800/80";
+pub(super) const TBODY: &str =
+    "divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-900";
+pub(super) const TH: &str = "px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300";
+pub(super) const TD: &str = "px-4 py-3 align-top text-slate-700 dark:text-slate-200";
+pub(super) const CODE: &str = "text-slate-900 dark:text-slate-100";
+pub(super) const FORM_ROW: &str = "mt-4 flex flex-wrap items-end gap-3";
+pub(super) const LABEL: &str =
+    "flex flex-col gap-1 text-xs font-medium text-slate-600 dark:text-slate-300";
+pub(super) const INPUT: &str = "rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100";
+pub(super) const BUTTON: &str = "rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300";
+pub(super) const BUTTON_SMALL: &str = "rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800";
+pub(super) const BUTTON_DANGER: &str = "rounded-md border border-red-300 px-2 py-1 text-xs text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950/40";
+pub(super) const LINK: &str = "font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100";
+pub(super) const BACK_LINK: &str = "inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100";
 
 /// What the signed-in user may do on the admin pages
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per permission the pages check"
+)]
 pub(super) struct Access {
     /// Create and edit groups and grants (`groups.manage`)
     pub manage_groups: bool,
@@ -51,6 +57,8 @@ pub(super) struct Access {
     pub manage_roles: bool,
     /// Read the audit log (`audit.read`)
     pub read_audit: bool,
+    /// Manage service accounts and their tokens (`service_accounts.manage`)
+    pub manage_service_accounts: bool,
 }
 
 impl Access {
@@ -59,6 +67,7 @@ impl Access {
             manage_groups: permissions.has(Permission::GroupsManage),
             manage_roles: permissions.has(Permission::RolesManage),
             read_audit: permissions.has(Permission::AuditRead),
+            manage_service_accounts: permissions.has(Permission::ServiceAccountsManage),
         }
     }
 }
@@ -90,6 +99,8 @@ pub(super) struct GroupDetail {
     /// Ids of the users added by hand (database groups only)
     pub members: Vec<Uuid>,
     pub users: Vec<User>,
+    /// Service accounts that may be members too; empty without the permission to list them
+    pub accounts: Vec<ServiceAccount>,
     /// Configured `[[auth.oidc]]` ids an `IdP` mapping may name
     pub providers: Vec<String>,
 }
@@ -116,6 +127,15 @@ fn label_for(users: &[User], id: Uuid) -> String {
         .iter()
         .find(|user| user.id == id)
         .map_or_else(|| id.to_string(), |user| user_label(user).to_owned())
+}
+
+/// The label of a group member: a user, a service account (marked as one) or,
+/// when unknown, the id itself.
+fn member_label(detail: &GroupDetail, id: Uuid) -> String {
+    match detail.accounts.iter().find(|account| account.id == id) {
+        Some(account) => format!("{} (service account)", account.name),
+        None => label_for(&detail.users, id),
+    }
 }
 
 fn group_href(name: &str) -> String {
@@ -147,7 +167,12 @@ pub(super) fn render_flash_area(oob: bool) -> Markup {
 }
 
 /// Page frame of the admin pages: head, user bar, content and footer.
-fn render_layout(state: &AppState, user: &SessionUser, title: &str, content: &Markup) -> Markup {
+pub(super) fn render_layout(
+    state: &AppState,
+    user: &SessionUser,
+    title: &str,
+    content: &Markup,
+) -> Markup {
     let hx_headers = csrf_hx_headers(user);
 
     html! {
@@ -210,6 +235,11 @@ pub(super) fn render_admin_page(
             @if overview.access.read_audit {
                 p class="mt-3 text-sm" {
                     a href="/ui/admin/audit" class=(LINK) { "Audit log" }
+                }
+            }
+            @if overview.access.manage_service_accounts {
+                p class="mt-3 text-sm" {
+                    a href="/ui/admin/service-accounts" class=(LINK) { "Service accounts" }
                 }
             }
         }
@@ -683,6 +713,11 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
         .iter()
         .filter(|user| !detail.members.contains(&user.id))
         .collect();
+    let account_candidates: Vec<&ServiceAccount> = detail
+        .accounts
+        .iter()
+        .filter(|account| !detail.members.contains(&account.id))
+        .collect();
 
     html! {
         section id="group-members" class=(CARD) {
@@ -699,7 +734,7 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
                     ul class="mt-4 space-y-2 text-sm" {
                         @for id in &detail.members {
                             li class="flex items-center gap-3" {
-                                span { (label_for(&detail.users, *id)) }
+                                span { (member_label(detail, *id)) }
                                 @if editable {
                                     form
                                         hx-post=(format!("/ui/actions/admin/groups/{name}/members/remove"))
@@ -715,7 +750,7 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
                     }
                 }
             }
-            @if editable && !candidates.is_empty() {
+            @if editable && !(candidates.is_empty() && account_candidates.is_empty()) {
                 form
                     class=(FORM_ROW)
                     hx-post=(format!("/ui/actions/admin/groups/{name}/members/add"))
@@ -727,6 +762,9 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
                         select class=(INPUT) name="user_id" required {
                             @for user in candidates {
                                 option value=(user.id) { (user_label(user)) }
+                            }
+                            @for account in account_candidates {
+                                option value=(account.id) { (account.name) " (service account)" }
                             }
                         }
                     }
@@ -873,12 +911,14 @@ mod tests {
         manage_groups: true,
         manage_roles: true,
         read_audit: true,
+        manage_service_accounts: true,
     };
 
     const AUDITOR: Access = Access {
         manage_groups: false,
         manage_roles: false,
         read_audit: true,
+        manage_service_accounts: false,
     };
 
     fn overview(access: Access) -> AdminOverview {
@@ -945,6 +985,7 @@ mod tests {
             group: group("ops", None, Source::Config),
             members: Vec::new(),
             users: vec![user(1, "bob@example.com")],
+            accounts: Vec::new(),
             providers: vec![String::from("pocket")],
         };
         let html = render_group_page(&test_state(), &session(true), &detail).into_string();
@@ -960,6 +1001,13 @@ mod tests {
             group: group("devs", None, Source::Local),
             members: vec![Uuid::from_u128(1)],
             users: vec![user(1, "bob@example.com"), user(2, "eve@example.com")],
+            accounts: vec![ServiceAccount {
+                id: Uuid::from_u128(3),
+                name: String::from("ci-bot"),
+                description: None,
+                disabled: false,
+                created_at: Utc::now(),
+            }],
             providers: vec![String::from("pocket")],
         };
         let html = render_group_page(&test_state(), &session(true), &detail).into_string();
@@ -973,6 +1021,8 @@ mod tests {
         // Only users that are not members yet can be added.
         let add = html.find("members/add").expect("add form");
         assert!(html[add..].contains("eve@example.com"));
+        // Service accounts can be members too, and are marked as such.
+        assert!(html[add..].contains("ci-bot (service account)"));
         assert!(!html[add..].contains("<option value=\"00000000-0000-0000-0000-000000000001\">"));
     }
 
