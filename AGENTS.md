@@ -78,7 +78,7 @@ bacon pedantic
 - **gateway.rs**: GatewayActor - orchestrates MCP protocol handling
 - **backend.rs**: BackendActor - per-MCP-server connection management
 - **registry.rs**: RegistryActor - tool aggregation and routing
-- **server.rs**: HTTP server (axum) - endpoints and request handling
+- **server.rs**: HTTP server (axum) - router, middleware, shared state; handlers in `server/{ui,mcp,api,auth}.rs` (`api.rs` has `/health`, `/livez`, `/readyz`, `/build`, `/status*`, `/metrics`)
 - **config.rs**: Config types and TOML parsing
 - **types.rs**: Core domain types (ToolDefinition, JsonRpc, etc.)
 - **error.rs**: Error types using thiserror
