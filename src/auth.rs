@@ -13,6 +13,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use subtle::ConstantTimeEq;
 
+use crate::authz::{Resource, Scope};
 use crate::config::{GatewayConfig, TokenConfig};
 
 /// Resolved identity from a valid auth token
@@ -26,6 +27,16 @@ pub struct TokenIdentity {
     pub allowed_backends: Vec<String>,
     /// Rate limit for this token (requests per minute, 0 = unlimited)
     pub rate_limit_per_minute: u32,
+}
+
+impl TokenIdentity {
+    /// The tools and backends this token may use
+    pub fn scope(&self) -> Scope<'_> {
+        Scope {
+            tools: &self.allowed_tools,
+            backends: &self.allowed_backends,
+        }
+    }
 }
 
 /// Rate limiter entry tracking request counts per window
@@ -113,24 +124,16 @@ impl AuthManager {
         identity: Option<&TokenIdentity>,
         tool_name: &str,
     ) -> Result<(), AuthError> {
-        let Some(identity) = identity else {
-            return Ok(()); // No identity = shared token = all allowed
-        };
-
-        if identity.allowed_tools.is_empty() {
-            return Ok(()); // Empty = all tools allowed
-        }
-
-        for pattern in &identity.allowed_tools {
-            if tool_matches_pattern(tool_name, pattern) {
-                return Ok(());
+        match identity {
+            // No identity = shared token = all allowed
+            Some(identity) if !identity.scope().allows(Resource::Tool(tool_name)) => {
+                Err(AuthError::ToolNotPermitted {
+                    tool: tool_name.to_string(),
+                    token: identity.name.clone(),
+                })
             }
+            _ => Ok(()),
         }
-
-        Err(AuthError::ToolNotPermitted {
-            tool: tool_name.to_string(),
-            token: identity.name.clone(),
-        })
     }
 
     /// Check if a token identity is allowed to access a specific backend
@@ -138,25 +141,16 @@ impl AuthManager {
         identity: Option<&TokenIdentity>,
         backend_name: &str,
     ) -> Result<(), AuthError> {
-        let Some(identity) = identity else {
-            return Ok(()); // Shared token = all allowed
-        };
-
-        if identity.allowed_backends.is_empty() {
-            return Ok(()); // Empty = all backends allowed
+        match identity {
+            // Shared token = all allowed
+            Some(identity) if !identity.scope().allows(Resource::Backend(backend_name)) => {
+                Err(AuthError::BackendNotPermitted {
+                    backend: backend_name.to_string(),
+                    token: identity.name.clone(),
+                })
+            }
+            _ => Ok(()),
         }
-
-        if identity
-            .allowed_backends
-            .contains(&backend_name.to_string())
-        {
-            return Ok(());
-        }
-
-        Err(AuthError::BackendNotPermitted {
-            backend: backend_name.to_string(),
-            token: identity.name.clone(),
-        })
     }
 
     /// Check rate limit for a given token name
@@ -247,22 +241,6 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
-/// Check if a tool name matches a pattern.
-///
-/// Supports:
-/// - Exact match: `"backend_tool_name"`
-/// - Prefix wildcard: `"backend_*"` (matches all tools from backend)
-/// - Wildcard only: `"*"` (matches everything)
-pub fn tool_matches_pattern(tool_name: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return tool_name.starts_with(prefix);
-    }
-    tool_name == pattern
-}
-
 /// Authentication errors
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum AuthError {
@@ -290,15 +268,6 @@ mod tests {
         assert!(!constant_time_eq("hello", "hell"));
         assert!(!constant_time_eq("", "a"));
         assert!(constant_time_eq("", ""));
-    }
-
-    #[test]
-    fn test_tool_matches_pattern() {
-        assert!(tool_matches_pattern("backend_tool", "backend_tool"));
-        assert!(tool_matches_pattern("backend_tool", "backend_*"));
-        assert!(tool_matches_pattern("anything", "*"));
-        assert!(!tool_matches_pattern("backend_tool", "other_*"));
-        assert!(!tool_matches_pattern("backend_tool", "backend_other"));
     }
 
     #[test]

@@ -130,7 +130,7 @@ impl RegistryActor {
                 group
                     .tools
                     .iter()
-                    .any(|pattern| crate::auth::tool_matches_pattern(&tool.name, pattern))
+                    .any(|pattern| crate::authz::tool_matches_pattern(&tool.name, pattern))
             })
             .cloned()
             .collect()

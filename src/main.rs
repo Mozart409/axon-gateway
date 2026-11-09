@@ -7,6 +7,7 @@
 //!   `MCP_GATEWAY_CONFIG=config.toml` mcp-gateway
 
 mod auth;
+mod authz;
 mod backend;
 mod config;
 mod error;
