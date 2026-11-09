@@ -596,6 +596,11 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 11. Phased plan
 
+Status (2026-11-09): Phases 0, 1, 2a, 2b and 3a are done and committed. Resume
+at Phase 3b. Open caveats: OIDC login is untested against a real IdP, and a
+plain-text 403 from the CSRF check can replace an admin page section (the
+htmx config swaps 4xx responses).
+
 ### Phase 0 - Groundwork (no behaviour change)
 
 - [x] Split `server.rs` into `server/mcp.rs`, `server/ui/`, `server/api.rs`,
