@@ -60,6 +60,7 @@ mod admin_ui;
 mod admin_views;
 mod api;
 mod auth;
+mod break_glass;
 mod mcp;
 mod session;
 mod tokens_api;
@@ -198,6 +199,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(ui_routes)
         // Dashboard login
         .merge(auth_routes)
+        .merge(break_glass::routes())
         // JSON admin API
         .merge(admin_api::router(state.clone()))
         // Status endpoints
@@ -362,9 +364,12 @@ pub async fn serve(
         })?;
     tracing::info!("MCP Gateway listening on {}", bind);
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
 
     Ok(())
 }

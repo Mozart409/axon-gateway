@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -26,8 +26,8 @@ use super::{AppState, reject_cross_site_middleware, session};
 use crate::policy::{
     GrantConfig, GrantView, GroupView, Permission, Role, RoleBinding, RoleSubject, Source,
 };
-use crate::rbac::{Admin, AdminError, resolve};
-use crate::store::{AuditRecord, SessionUser, User};
+use crate::rbac::{Admin, AdminError, ManagedUser, resolve};
+use crate::store::{AuditRecord, SessionUser};
 
 const DEFAULT_USERS_LIMIT: i64 = 100;
 const MAX_USERS_LIMIT: i64 = 500;
@@ -163,6 +163,7 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             delete(handle_delete_role_binding),
         )
         .route("/api/v1/users", get(handle_list_users))
+        .route("/api/v1/users/{id}", patch(handle_update_user))
         .route("/api/v1/audit", get(handle_list_audit))
         .merge(super::tokens_api::routes())
         .route_layer(middleware::from_fn(session::require_csrf))
@@ -247,7 +248,8 @@ fn binding_json(binding: &RoleBinding) -> Value {
     })
 }
 
-fn user_json(user: &User) -> Value {
+fn user_json(managed: &ManagedUser) -> Value {
+    let user = &managed.user;
     json!({
         "id": user.id,
         "issuer": user.issuer,
@@ -256,6 +258,8 @@ fn user_json(user: &User) -> Value {
         "display_name": user.display_name,
         "groups": user.groups,
         "is_admin": user.is_admin,
+        "last_login_at": managed.last_login_at.map(|at| at.to_rfc3339()),
+        "disabled": managed.disabled,
     })
 }
 
@@ -550,9 +554,29 @@ async fn handle_list_users(
         .limit
         .unwrap_or(DEFAULT_USERS_LIMIT)
         .clamp(1, MAX_USERS_LIMIT);
-    let users = admin(&state, &session).await?.users(limit).await?;
+    let users = admin(&state, &session).await?.managed_users(limit).await?;
     let users: Vec<Value> = users.iter().map(user_json).collect();
     Ok(Json(json!({ "users": users })))
+}
+
+/// `PATCH /api/v1/users/{id}` body
+#[derive(Debug, Deserialize)]
+struct UpdateUserBody {
+    disabled: bool,
+}
+
+/// `PATCH /api/v1/users/{id}`: disables or re-enables the user
+async fn handle_update_user(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(body): ApiJson<UpdateUserBody>,
+) -> ApiResult<Json<Value>> {
+    let user = admin(&state, &session)
+        .await?
+        .set_user_disabled(id, body.disabled)
+        .await?;
+    Ok(Json(user_json(&user)))
 }
 
 /// `GET /api/v1/audit?limit=&before=`: `before` is an entry id, for paging

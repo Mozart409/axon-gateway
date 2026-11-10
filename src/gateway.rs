@@ -1474,6 +1474,7 @@ mod tests {
                     name: String::from("dev"),
                     description: None,
                     idp: Vec::new(),
+                    service_accounts: Vec::new(),
                 }],
                 grants: vec![grant("public", &["*"]), grant("secret", &["nothing"])],
                 role_bindings: Vec::new(),

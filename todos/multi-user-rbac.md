@@ -596,8 +596,8 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 11. Phased plan
 
-Status (2026-11-09): Phases 0, 1, 2a, 2b and 3a are done and committed. Resume
-at Phase 3b. Open caveats: OIDC login is untested against a real IdP, and a
+Status (2026-11-10): Phases 0, 1, 2a, 2b, 3a and 3b are done and committed. Resume
+at Phase 3c. Open caveats: OIDC login is untested against a real IdP, and a
 plain-text 403 from the CSRF check can replace an admin page section (the
 htmx config swaps 4xx responses).
 
@@ -694,15 +694,28 @@ htmx config swaps 4xx responses).
 
 ### Phase 3b - Agent tokens, rest
 
-- [ ] Legacy `auth_token` / `[[tokens]]` mapped to config service accounts.
-- [ ] Service accounts in config groups (today only database groups take
-      them as members).
-- [ ] Admin disable of a human user (suspends their tokens).
-- [ ] Record the client IP on token use (`last_used_ip` is written as null).
+- [x] Legacy `[[tokens]]` mapped to config service accounts (multi-user mode):
+      label `config:<name>`, strict RBAC (the config groups that list the name
+      in `service_accounts`, narrowed by `allowed_tools`/`allowed_backends`;
+      in no group it sees nothing, with a startup warning). The shared
+      `gateway.auth_token` is refused in multi-user mode (401, startup warning).
+- [x] Service accounts in config groups: `[[rbac.groups]] service_accounts`
+      lists names, matching `[[tokens]]` entries and database service
+      accounts alike.
+- [x] Admin disable of a human user (`/ui/admin/users`,
+      `PATCH /api/v1/users/{id}`): ends their sessions, refuses their login
+      and suspends their tokens.
+- [x] Record the client IP on token use: the peer, or the rightmost
+      `X-Forwarded-For` entry when the peer is loopback or private.
+- [x] Break-glass CLI `axon-gateway admin login-link`: a one-time code
+      (15 minutes) for a 1-hour admin UI session as the built-in break-glass
+      user; both steps audited; disabling that user switches it off.
+
+### Phase 3c - Toolsets and tool-call audit
+
 - [ ] User-defined toolsets and PAT toolset pinning.
 - [ ] Tool-call audit, with argument capture policy (annotation defaults,
       overrides), `audit_arguments` table and `audit.read_sensitive`.
-- [ ] Break-glass CLI `axon-gateway admin ...`.
 
 ### Phase 4 - Spec-compliant MCP transport
 

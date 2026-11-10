@@ -63,7 +63,7 @@ pub(super) fn safe_return_to(raw: Option<&str>) -> String {
 
 /// A `__Host-` cookie: `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no
 /// `Domain`.
-fn host_cookie(name: &'static str, value: String, max_age_secs: i64) -> Cookie<'static> {
+pub(super) fn host_cookie(name: &'static str, value: String, max_age_secs: i64) -> Cookie<'static> {
     Cookie::build((name, value))
         .path("/")
         .secure(true)
@@ -111,7 +111,12 @@ fn login_href(provider_id: &str, return_to: &str) -> String {
     format!("/auth/login/{provider_id}?return_to={encoded}")
 }
 
-fn error_page(state: &AppState, status: StatusCode, title: &str, message: &str) -> Response {
+pub(super) fn error_page(
+    state: &AppState,
+    status: StatusCode,
+    title: &str,
+    message: &str,
+) -> Response {
     (
         status,
         Html(views::render_auth_error_page(state, title, message).into_string()),
@@ -420,6 +425,19 @@ async fn finish_login(
             tracing::warn!(%error, "could not record a dashboard user");
             Box::new(database_unavailable(state))
         })?;
+    let disabled = store.user_disabled(user.id).await.map_err(|error| {
+        tracing::warn!(%error, "could not check whether a dashboard user is disabled");
+        Box::new(database_unavailable(state))
+    })?;
+    if disabled {
+        tracing::info!(user_id = %user.id, "a login was refused: the user is disabled");
+        return Err(Box::new(error_page(
+            state,
+            StatusCode::FORBIDDEN,
+            "Access denied",
+            "Your account has been disabled by an administrator.",
+        )));
+    }
     let session = store
         .create_session(user.id, &flow.provider_id, Some(&login.id_token))
         .await

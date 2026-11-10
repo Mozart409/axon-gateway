@@ -11,11 +11,13 @@ use sqlx::postgres::PgPoolOptions;
 use thiserror::Error;
 
 mod auth;
+mod break_glass;
 mod rbac;
 mod tokens;
 mod views;
 
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
+pub use break_glass::{BREAK_GLASS_CODE_TTL, BREAK_GLASS_SESSION_MAX_AGE};
 pub use rbac::{Actor, AuditRecord};
 pub use tokens::{
     ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, MAX_SERVICE_TOKEN_LIFETIME,

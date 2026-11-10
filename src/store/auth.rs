@@ -7,10 +7,13 @@
 use std::fmt;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use super::rbac::{Actor, audit};
 use super::{Store, StoreError};
 
 /// A session that has not been used for this long is gone
@@ -44,6 +47,15 @@ pub struct User {
     pub display_name: Option<String>,
     pub groups: Vec<String>,
     pub is_admin: bool,
+}
+
+/// A human user with what the users page needs on top of [`User`]
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct UserState {
+    #[sqlx(flatten)]
+    pub user: User,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub disabled_at: Option<DateTime<Utc>>,
 }
 
 /// The plaintext token of a new session; only its hash is stored. The CSRF
@@ -135,12 +147,12 @@ impl From<SessionRow> for SessionUser {
 }
 
 /// The SHA-256 of a secret, hex encoded: the only form that is stored
-fn hash_secret(secret: &str) -> String {
+pub(super) fn hash_secret(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
 
 /// 32 random bytes, hex encoded
-fn random_secret() -> Result<String, StoreError> {
+pub(super) fn random_secret() -> Result<String, StoreError> {
     let mut raw = [0_u8; SECRET_BYTES];
     getrandom::fill(&mut raw).map_err(|error| StoreError::Random(error.to_string()))?;
     Ok(hex::encode(raw))
@@ -174,6 +186,100 @@ impl Store {
         .await?)
     }
 
+    /// Whether the user is disabled. `false` for an unknown id.
+    ///
+    /// # Errors
+    /// Fails when the query fails.
+    pub async fn user_disabled(&self, id: Uuid) -> Result<bool, StoreError> {
+        let disabled: Option<bool> =
+            sqlx::query_scalar("select disabled_at is not null from users where id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(disabled.unwrap_or(false))
+    }
+
+    /// One human user with their last login and disabled state; `None` for an
+    /// unknown id or a service account.
+    ///
+    /// # Errors
+    /// Fails when the query fails.
+    pub async fn user_state(&self, id: Uuid) -> Result<Option<UserState>, StoreError> {
+        Ok(sqlx::query_as(
+            "select id, issuer, subject, email, display_name, groups, is_admin, \
+                    last_login_at, disabled_at \
+             from users where kind = 'user' and id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Up to `limit` human users (not service accounts) with their last login
+    /// and disabled state, ordered by email, display name or subject.
+    ///
+    /// # Errors
+    /// Fails when the query fails.
+    pub async fn list_user_states(&self, limit: i64) -> Result<Vec<UserState>, StoreError> {
+        Ok(sqlx::query_as(
+            "select id, issuer, subject, email, display_name, groups, is_admin, \
+                    last_login_at, disabled_at \
+             from users where kind = 'user' \
+             order by lower(coalesce(email, display_name, subject)), id limit $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Disables or re-enables a human user. Disabling also ends the user's
+    /// sessions; their tokens stop working through the disabled flag.
+    /// `false` when there is no such user (service accounts are not users
+    /// here) or it is already in that state.
+    ///
+    /// # Errors
+    /// Fails when the transaction fails.
+    pub async fn set_user_disabled(
+        &self,
+        actor: &Actor,
+        id: Uuid,
+        disabled: bool,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let name: Option<String> = sqlx::query_scalar(
+            "update users set disabled_at = case when $2 then now() else null end \
+             where id = $1 and kind = 'user' and (disabled_at is not null) <> $2 \
+             returning coalesce(nullif(btrim(email), ''), subject)",
+        )
+        .bind(id)
+        .bind(disabled)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(name) = name else {
+            return Ok(false);
+        };
+        if disabled {
+            sqlx::query("delete from sessions where user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        audit(
+            &mut tx,
+            actor,
+            if disabled {
+                "user.disable"
+            } else {
+                "user.enable"
+            },
+            &format!("user:{name}"),
+            json!({ "user_id": id }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Opens a session for `user_id` and returns its plaintext secrets.
     ///
     /// # Errors
@@ -201,8 +307,9 @@ impl Store {
         Ok(NewSession { token })
     }
 
-    /// Resolves a session cookie, if the session exists, has not passed its
-    /// maximum age and has not been idle too long. `last_seen_at` is bumped at
+    /// Resolves a session cookie, if the session exists, its user is not
+    /// disabled, it has not passed its maximum age and has not been idle too
+    /// long. `last_seen_at` is bumped at
     /// most once a minute.
     ///
     /// # Errors
@@ -214,6 +321,7 @@ impl Store {
                         u.groups, u.is_admin, s.provider_id, s.csrf_token, s.id_token \
                  from sessions s join users u on u.id = s.user_id \
                  where s.token_hash = $1 \
+                   and u.disabled_at is null \
                    and s.expires_at > now() \
                    and s.last_seen_at > now() - make_interval(secs => $2) \
              ), touched as ( \
@@ -582,5 +690,141 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    fn cli() -> Actor {
+        Actor {
+            user_id: None,
+            label: "cli".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabling_a_user_ends_their_sessions_and_audits_once() {
+        let Some(store) = test_store("axon_store_user_disable").await else {
+            return;
+        };
+        let user = store
+            .upsert_user_on_login(&login(&[], false))
+            .await
+            .unwrap();
+        let new = store.create_session(user.id, "main", None).await.unwrap();
+        assert!(!store.user_disabled(user.id).await.unwrap());
+
+        assert!(
+            store
+                .set_user_disabled(&cli(), user.id, true)
+                .await
+                .unwrap()
+        );
+        assert!(store.user_disabled(user.id).await.unwrap());
+        assert!(store.session_user(&new.token).await.unwrap().is_none());
+        let sessions: i64 = sqlx::query_scalar("select count(*) from sessions")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+        // The login still updates the row and returns the user; the caller refuses it.
+        let again = store
+            .upsert_user_on_login(&login(&[], false))
+            .await
+            .unwrap();
+        assert_eq!(again.id, user.id);
+        assert!(store.user_disabled(user.id).await.unwrap());
+
+        // No transition, no second audit row.
+        assert!(
+            !store
+                .set_user_disabled(&cli(), user.id, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_user_disabled(&cli(), user.id, false)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_user_disabled(&cli(), user.id, false)
+                .await
+                .unwrap()
+        );
+        assert!(!store.user_disabled(user.id).await.unwrap());
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("select action, target from audit_log order by id")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "user.disable".to_string(),
+                    "user:alice@example.com".to_string()
+                ),
+                (
+                    "user.enable".to_string(),
+                    "user:alice@example.com".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_user_disabled_skips_service_accounts_and_unknown_ids() {
+        let Some(store) = test_store("axon_store_user_disable_kind").await else {
+            return;
+        };
+        let account: Uuid = sqlx::query_scalar(
+            "insert into users (issuer, subject, kind) values ('service', 'ci', 'service') \
+             returning id",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !store
+                .set_user_disabled(&cli(), account, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_user_disabled(&cli(), Uuid::new_v4(), true)
+                .await
+                .unwrap()
+        );
+        assert!(!store.user_disabled(account).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_user_states_lists_humans_with_state() {
+        let Some(store) = test_store("axon_store_user_states").await else {
+            return;
+        };
+        let user = store.upsert_user_on_login(&login(&[], true)).await.unwrap();
+        sqlx::query(
+            "insert into users (issuer, subject, kind) values ('service', 'ci', 'service')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let states = store.list_user_states(10).await.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].user, user);
+        assert!(states[0].last_login_at.is_some());
+        assert!(states[0].disabled_at.is_none());
+
+        store
+            .set_user_disabled(&cli(), user.id, true)
+            .await
+            .unwrap();
+        let states = store.list_user_states(10).await.unwrap();
+        assert!(states[0].disabled_at.is_some());
     }
 }

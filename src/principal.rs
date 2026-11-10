@@ -107,6 +107,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             idp: Vec::<IdpMapping>::new(),
+            service_accounts: Vec::new(),
         }
     }
 

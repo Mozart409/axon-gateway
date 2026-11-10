@@ -17,7 +17,7 @@ use futures::stream;
 use serde_json::json;
 
 use super::AppState;
-use super::auth::authenticate;
+use super::auth::{ClientIp, authenticate};
 use crate::auth::AuthManager;
 use crate::gateway::{Caller, HandleRequest, HandleToolsetRequest};
 use crate::types::JsonRpcRequest;
@@ -37,26 +37,32 @@ fn accept_notification(request: &JsonRpcRequest) -> Option<Response> {
 }
 
 /// Log which principal (user or service account and token) sent a request.
-fn log_principal(caller: &Caller, request: &JsonRpcRequest) {
+fn log_principal(caller: &Caller, request: &JsonRpcRequest, client_ip: Option<&str>) {
     if let Caller::Principal(principal) = caller {
-        tracing::debug!(principal = principal.label(), method = %request.method, "MCP request");
+        tracing::debug!(
+            principal = principal.label(),
+            method = %request.method,
+            ip = client_ip,
+            "MCP request"
+        );
     }
 }
 
 /// Handle POST /mcp - JSON-RPC over HTTP
 pub(super) async fn handle_mcp_request(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
-    let caller = match authenticate(&headers, &state).await {
+    let caller = match authenticate(&headers, &state, client_ip.as_deref()).await {
         Ok(caller) => caller,
         Err(response) => return *response,
     };
     if let Some(accepted) = accept_notification(&request) {
         return accepted;
     }
-    log_principal(&caller, &request);
+    log_principal(&caller, &request, client_ip.as_deref());
 
     // For tool calls, check tool-level permissions of a legacy token. A
     // principal's are checked in the gateway, which answers a tool it may not
@@ -93,8 +99,12 @@ pub(super) async fn handle_mcp_request(
 /// 2. Server sends `endpoint` event with POST URL
 /// 3. Client sends JSON-RPC requests to that POST URL
 /// 4. Server streams responses via SSE
-pub(super) async fn handle_mcp_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(response) = authenticate(&headers, &state).await {
+pub(super) async fn handle_mcp_sse(
+    State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authenticate(&headers, &state, client_ip.as_deref()).await {
         return *response;
     }
 
@@ -119,18 +129,19 @@ pub(super) async fn handle_mcp_sse(State(state): State<AppState>, headers: Heade
 /// Tool calls are forwarded normally (no restriction to toolset tools at call time).
 pub(super) async fn handle_toolset_request(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     headers: HeaderMap,
     Path(toolset_name): Path<String>,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
-    let caller = match authenticate(&headers, &state).await {
+    let caller = match authenticate(&headers, &state, client_ip.as_deref()).await {
         Ok(caller) => caller,
         Err(response) => return *response,
     };
     if let Some(accepted) = accept_notification(&request) {
         return accepted;
     }
-    log_principal(&caller, &request);
+    log_principal(&caller, &request, client_ip.as_deref());
 
     // For tool calls, check tool-level permissions of a legacy token. A
     // principal's are checked in the gateway, which answers a tool it may not

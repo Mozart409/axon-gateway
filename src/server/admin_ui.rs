@@ -1,5 +1,6 @@
 //! The admin pages under `/ui/admin` and their htmx actions under
-//! `/ui/actions/admin`: RBAC groups, grants, role bindings and the audit log.
+//! `/ui/actions/admin`: RBAC groups, grants, role bindings, users and the
+//! audit log.
 //! (The service account pages are in `tokens_ui`, which reuses the helpers
 //! here.)
 //!
@@ -22,7 +23,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use super::admin_views::{self, Access, AdminOverview, GroupDetail, GroupRow, render_flash_area};
+use super::admin_views::{
+    self, Access, AdminOverview, GroupDetail, GroupRow, UsersPage, render_flash_area,
+};
 use super::{AppState, FlashLevel, FlashMessage, views};
 use crate::gateway::GetDetailedStatus;
 use crate::policy::{AUTHENTICATED_GROUP, GrantConfig, Role, RoleSubject};
@@ -42,6 +45,7 @@ pub(super) fn page_routes() -> Router<AppState> {
         .route("/ui/admin", get(handle_admin))
         .route("/ui/admin/groups/{name}", get(handle_admin_group))
         .route("/ui/admin/audit", get(handle_admin_audit))
+        .route("/ui/admin/users", get(handle_admin_users))
 }
 
 /// The POST actions, to merge into the routes behind the CSRF and same-site
@@ -85,6 +89,14 @@ pub(super) fn action_routes() -> Router<AppState> {
         .route(
             "/ui/actions/admin/role-bindings/{id}/delete",
             post(handle_admin_binding_delete),
+        )
+        .route(
+            "/ui/actions/admin/users/{id}/disable",
+            post(handle_admin_user_disable),
+        )
+        .route(
+            "/ui/actions/admin/users/{id}/enable",
+            post(handle_admin_user_enable),
         )
 }
 
@@ -347,6 +359,72 @@ pub(super) async fn handle_admin_group(
             .into_response(),
         Err(error) => page_error(&state, &session, &error),
     }
+}
+
+async fn load_users_page(
+    state: &AppState,
+    session: &SessionUser,
+    admin: &Admin<'_>,
+) -> Result<UsersPage, AdminError> {
+    Ok(UsersPage {
+        access: access_of(state, session),
+        viewer: session.user.id,
+        users: admin.managed_users(USERS_LIMIT).await?,
+    })
+}
+
+/// Handle GET /ui/admin/users - the human users and their state
+pub(super) async fn handle_admin_users(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+) -> Response {
+    let (session, admin) = match admin_for(&state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    match load_users_page(&state, &session, &admin).await {
+        Ok(page) => Html(admin_views::render_users_page(&state, &session, &page).into_string())
+            .into_response(),
+        Err(error) => page_error(&state, &session, &error),
+    }
+}
+
+/// Disables or re-enables a user, then answers the re-rendered users table.
+async fn set_user_disabled(
+    state: &AppState,
+    user: Option<Extension<SessionUser>>,
+    id: Uuid,
+    disabled: bool,
+) -> Response {
+    let (session, admin) = match admin_for(state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    if let Err(error) = admin.set_user_disabled(id, disabled).await {
+        return error_response(&error);
+    }
+    match load_users_page(state, &session, &admin).await {
+        Ok(page) => fragment(&admin_views::render_users_section(&page)),
+        Err(error) => error_response(&error),
+    }
+}
+
+/// Handle POST /ui/actions/admin/users/{id}/disable
+pub(super) async fn handle_admin_user_disable(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    set_user_disabled(&state, user, id, true).await
+}
+
+/// Handle POST /ui/actions/admin/users/{id}/enable
+pub(super) async fn handle_admin_user_enable(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    set_user_disabled(&state, user, id, false).await
 }
 
 /// `GET /ui/admin/audit?before=`: `before` is an entry id, for paging

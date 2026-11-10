@@ -268,6 +268,10 @@ pub struct RbacGroupConfig {
     /// Identity provider claim values whose holders are members of this group
     #[serde(default)]
     pub idp: Vec<IdpMapping>,
+    /// Service account names that are members of this group: a `[[tokens]]` entry's
+    /// `name` or a database service account's name
+    #[serde(default)]
+    pub service_accounts: Vec<String>,
 }
 
 /// `(provider, claim value)` that puts a user into a group
@@ -380,6 +384,21 @@ impl RbacConfig {
             validate_group_name(&group.name)?;
             if !names.insert(group.name.as_str()) {
                 return Err(format!("duplicate rbac group {:?}", group.name));
+            }
+            let mut accounts: HashSet<&str> = HashSet::new();
+            for account in &group.service_accounts {
+                if account.is_empty() {
+                    return Err(format!(
+                        "rbac group {:?} lists an empty service account name",
+                        group.name
+                    ));
+                }
+                if !accounts.insert(account.as_str()) {
+                    return Err(format!(
+                        "rbac group {:?} lists service account {account:?} twice",
+                        group.name
+                    ));
+                }
             }
             for mapping in &group.idp {
                 if !providers.contains(&mapping.provider.as_str()) {
@@ -515,6 +534,7 @@ struct GroupDef {
     name: String,
     description: Option<String>,
     idp: Vec<IdpMapping>,
+    service_accounts: Vec<String>,
     source: Source,
 }
 
@@ -524,6 +544,7 @@ impl GroupDef {
             name: group.name.clone(),
             description: group.description.clone(),
             idp: group.idp.clone(),
+            service_accounts: group.service_accounts.clone(),
             source,
         }
     }
@@ -657,14 +678,30 @@ impl Policy {
         groups.into_iter().collect()
     }
 
-    /// Groups of a service account: only its database memberships. No
-    /// [`AUTHENTICATED_GROUP`] and no `IdP` mappings, an account has no login. Sorted,
-    /// deduplicated.
-    pub fn groups_for_service_account(&self, account_id: Uuid) -> Vec<String> {
+    /// Groups of a database service account: its database memberships plus every config
+    /// group that lists `name` in `service_accounts`. No [`AUTHENTICATED_GROUP`] and no
+    /// `IdP` mappings, an account has no login. Sorted, deduplicated.
+    pub fn groups_for_service_account(&self, account_id: Uuid, name: &str) -> Vec<String> {
         self.memberships
             .iter()
             .filter(|(member, _)| *member == account_id)
             .map(|(_, group)| group.clone())
+            .chain(self.groups_for_config_account(name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Groups of a config service account (a `[[tokens]]` entry): the config groups that
+    /// list `name` in `service_accounts`, sorted. No [`AUTHENTICATED_GROUP`].
+    pub fn groups_for_config_account(&self, name: &str) -> Vec<String> {
+        self.groups
+            .iter()
+            .filter(|group| {
+                group.source == Source::Config
+                    && group.service_accounts.iter().any(|account| account == name)
+            })
+            .map(|group| group.name.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -891,6 +928,7 @@ mod tests {
                     value: (*value).to_string(),
                 })
                 .collect(),
+            service_accounts: Vec::new(),
         }
     }
 
@@ -1575,6 +1613,7 @@ mod tests {
                     name: "ops".to_string(),
                     description: Some("Operations".to_string()),
                     idp: group("ops", &[("entra", "id-ops")]).idp,
+                    service_accounts: Vec::new(),
                 },
                 group("it", &[("entra", "id-evil")]),
                 group("beta", &[]),
@@ -1898,14 +1937,17 @@ mod tests {
     fn service_account_groups_are_memberships_only() {
         let policy = Policy::from_parts(&merged_config(), &db_snapshot());
         // `it` is a config group: the membership row for it is dropped, `ghost` does not exist
-        assert_eq!(policy.groups_for_service_account(user()), ["beta"]);
         assert_eq!(
-            policy.groups_for_service_account(Uuid::from_u128(2)),
+            policy.groups_for_service_account(user(), "nobody"),
+            ["beta"]
+        );
+        assert_eq!(
+            policy.groups_for_service_account(Uuid::from_u128(2), "nobody"),
             ["beta"]
         );
         // no memberships: nothing, not even `authenticated`
         assert_eq!(
-            policy.groups_for_service_account(Uuid::from_u128(99)),
+            policy.groups_for_service_account(Uuid::from_u128(99), "nobody"),
             Vec::<String>::new()
         );
     }
@@ -1917,8 +1959,85 @@ mod tests {
         let login = policy.groups_for(Uuid::from_u128(99), "entra", &strings(&["id-ops", "id-it"]));
         assert!(login.contains(&"ops".to_string()));
         assert_eq!(
-            policy.groups_for_service_account(Uuid::from_u128(99)),
+            policy.groups_for_service_account(Uuid::from_u128(99), "nobody"),
             Vec::<String>::new()
         );
+    }
+
+    fn with_accounts(name: &str, accounts: &[&str]) -> RbacGroupConfig {
+        RbacGroupConfig {
+            service_accounts: strings(accounts),
+            ..group(name, &[])
+        }
+    }
+
+    #[test]
+    fn config_account_groups_come_from_service_accounts_lists() {
+        let config = RbacConfig {
+            groups: vec![
+                with_accounts("zeta", &["ci", "bot"]),
+                with_accounts("alpha", &["ci"]),
+                with_accounts("other", &["bot"]),
+            ],
+            grants: Vec::new(),
+            role_bindings: Vec::new(),
+        };
+        let policy = Policy::from_config(&config);
+        assert_eq!(policy.groups_for_config_account("ci"), ["alpha", "zeta"]);
+        assert_eq!(policy.groups_for_config_account("bot"), ["other", "zeta"]);
+        assert_eq!(
+            policy.groups_for_config_account("nobody"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn database_account_groups_add_config_lists_to_memberships() {
+        let config = RbacConfig {
+            groups: vec![with_accounts("ops", &["svc"]), group("it", &[])],
+            grants: Vec::new(),
+            role_bindings: Vec::new(),
+        };
+        let snapshot = RbacSnapshot {
+            groups: vec![group("beta", &[])],
+            memberships: vec![(user(), "beta".to_string())],
+            ..RbacSnapshot::default()
+        };
+        let policy = Policy::from_parts(&config, &snapshot);
+        assert_eq!(
+            policy.groups_for_service_account(user(), "svc"),
+            ["beta", "ops"]
+        );
+        assert_eq!(policy.groups_for_service_account(user(), "x"), ["beta"]);
+        // a database group's own `service_accounts` is never consulted
+        let mut db_group = group("dbg", &[]);
+        db_group.service_accounts = strings(&["svc"]);
+        let snapshot = RbacSnapshot {
+            groups: vec![db_group],
+            ..RbacSnapshot::default()
+        };
+        let policy = Policy::from_parts(&config, &snapshot);
+        assert_eq!(policy.groups_for_config_account("svc"), ["ops"]);
+    }
+
+    #[test]
+    fn validate_rejects_bad_service_account_lists() {
+        for accounts in [&[""][..], &["ci", "ci"][..]] {
+            let config = RbacConfig {
+                groups: vec![with_accounts("it", accounts)],
+                grants: Vec::new(),
+                role_bindings: Vec::new(),
+            };
+            assert!(
+                validate_err(&config).contains("service account"),
+                "{accounts:?}"
+            );
+        }
+        let config = RbacConfig {
+            groups: vec![with_accounts("it", &["ci", "bot"])],
+            grants: Vec::new(),
+            role_bindings: Vec::new(),
+        };
+        assert_eq!(config.validate(&[], &[]), Ok(()));
     }
 }

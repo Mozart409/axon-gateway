@@ -1,5 +1,5 @@
-//! HTML rendering (maud) for the admin pages: groups, grants, role bindings
-//! and the audit log.
+//! HTML rendering (maud) for the admin pages: groups, grants, role bindings,
+//! users and the audit log.
 //!
 //! Like `views`, these are pure view functions. The page handlers and the
 //! htmx actions live in `admin_ui`; every section here is also the fragment an
@@ -15,6 +15,7 @@ use super::views::{build_fingerprint, csrf_hx_headers, render_user_bar};
 use crate::policy::{
     GrantView, GroupView, Permission, Permissions, Role, RoleBinding, RoleSubject, Source,
 };
+use crate::rbac::ManagedUser;
 use crate::store::{AuditRecord, ServiceAccount, SessionUser, User};
 
 /// Admin actions answer errors with 4xx/5xx and a flash fragment; htmx drops
@@ -59,6 +60,8 @@ pub(super) struct Access {
     pub read_audit: bool,
     /// Manage service accounts and their tokens (`service_accounts.manage`)
     pub manage_service_accounts: bool,
+    /// Disable and re-enable users (`users.manage`)
+    pub manage_users: bool,
 }
 
 impl Access {
@@ -68,8 +71,17 @@ impl Access {
             manage_roles: permissions.has(Permission::RolesManage),
             read_audit: permissions.has(Permission::AuditRead),
             manage_service_accounts: permissions.has(Permission::ServiceAccountsManage),
+            manage_users: permissions.has(Permission::UsersManage),
         }
     }
+}
+
+/// Everything `/ui/admin/users` shows
+pub(super) struct UsersPage {
+    pub access: Access,
+    /// The signed-in user, who cannot disable themselves
+    pub viewer: Uuid,
+    pub users: Vec<ManagedUser>,
 }
 
 /// A group and how many users were added to it by hand
@@ -235,6 +247,11 @@ pub(super) fn render_admin_page(
             @if overview.access.read_audit {
                 p class="mt-3 text-sm" {
                     a href="/ui/admin/audit" class=(LINK) { "Audit log" }
+                }
+            }
+            @if overview.access.manage_users {
+                p class="mt-3 text-sm" {
+                    a href="/ui/admin/users" class=(LINK) { "Users" }
                 }
             }
             @if overview.access.manage_service_accounts {
@@ -775,6 +792,119 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
     }
 }
 
+/// Users page (`GET /ui/admin/users`).
+pub(super) fn render_users_page(state: &AppState, user: &SessionUser, page: &UsersPage) -> Markup {
+    let content = html! {
+        section class=(CARD) {
+            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
+            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                "Users"
+            }
+        }
+        (render_flash_area(false))
+        (render_users_section(page))
+    };
+    render_layout(state, user, "Users", &content)
+}
+
+fn user_state_badge(disabled: bool) -> Markup {
+    html! {
+        @if disabled {
+            span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
+                "disabled"
+            }
+        } @else {
+            span class="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300" {
+                "enabled"
+            }
+        }
+    }
+}
+
+/// The users table, the swap target of the disable and enable actions.
+pub(super) fn render_users_section(page: &UsersPage) -> Markup {
+    html! {
+        section id="admin-users" class=(CARD) {
+            h2 class=(HEADING) { "Users" }
+            p class=(format!("mt-1 {MUTED}")) {
+                "A disabled user cannot log in, their sessions end and their tokens stop working. "
+                "Service accounts are on their own page."
+            }
+            @if page.users.is_empty() {
+                p class=(format!("mt-4 text-sm {FAINT}")) { "No users yet." }
+            } @else {
+                div class=(TABLE_WRAP) {
+                    table class=(TABLE) {
+                        thead class=(THEAD) {
+                            tr {
+                                th class=(TH) { "User" }
+                                th class=(TH) { "Issuer" }
+                                th class=(TH) { "Last login" }
+                                th class=(TH) { "Admin" }
+                                th class=(TH) { "State" }
+                                @if page.access.manage_users {
+                                    th class=(TH) {}
+                                }
+                            }
+                        }
+                        tbody class=(TBODY) {
+                            @for row in &page.users {
+                                (render_user_row(page, row))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_user_row(page: &UsersPage, row: &ManagedUser) -> Markup {
+    let user = &row.user;
+    let (action, label) = if row.disabled {
+        ("enable", "Enable")
+    } else {
+        ("disable", "Disable")
+    };
+    html! {
+        tr {
+            td class=(TD) { (user_label(user)) }
+            td class=(TD) { code class=(CODE) { (user.issuer) } }
+            td class=(format!("{TD} whitespace-nowrap")) {
+                @if let Some(at) = row.last_login_at {
+                    (at.format("%Y-%m-%d %H:%M UTC"))
+                } @else {
+                    span class=(FAINT) { "-" }
+                }
+            }
+            td class=(TD) {
+                @if user.is_admin {
+                    span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
+                        "admin"
+                    }
+                }
+            }
+            td class=(TD) { (user_state_badge(row.disabled)) }
+            @if page.access.manage_users {
+                td class=(TD) {
+                    // Disabling yourself is refused, so the button is left out.
+                    @if user.id != page.viewer || row.disabled {
+                        button
+                            class=(BUTTON_SMALL)
+                            type="button"
+                            hx-post=(format!("/ui/actions/admin/users/{}/{action}", user.id))
+                            hx-target="#admin-users"
+                            hx-swap="outerHTML"
+                        {
+                            (label)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Audit log page (`GET /ui/admin/audit`), newest first. `before` is the
 /// entry id this page starts below; `older` is the id for the next page, when
 /// there is one.
@@ -912,6 +1042,7 @@ mod tests {
         manage_roles: true,
         read_audit: true,
         manage_service_accounts: true,
+        manage_users: true,
     };
 
     const AUDITOR: Access = Access {
@@ -919,6 +1050,7 @@ mod tests {
         manage_roles: false,
         read_audit: true,
         manage_service_accounts: false,
+        manage_users: false,
     };
 
     fn overview(access: Access) -> AdminOverview {

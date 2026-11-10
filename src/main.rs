@@ -6,6 +6,7 @@
 //! Or with environment variable:
 //!   `MCP_GATEWAY_CONFIG=config.toml` mcp-gateway
 
+mod admin_cli;
 mod auth;
 mod authz;
 mod backend;
@@ -46,7 +47,8 @@ use crate::server::AppState;
 /// How often expired dashboard sessions and login flows are deleted.
 const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// The legacy token auth. In multi-user mode its tokens are a way around RBAC.
+/// The legacy token auth. In multi-user mode `[[tokens]]` are config service accounts
+/// under RBAC and the shared token is refused.
 fn setup_auth(config: &Config, multi_user: bool) -> SharedAuth {
     let auth_manager = SharedAuth::new(AuthManager::new(&config.gateway, &config.tokens));
     if auth_manager.load().auth_required() {
@@ -54,10 +56,30 @@ fn setup_auth(config: &Config, multi_user: bool) -> SharedAuth {
     } else if !multi_user {
         tracing::warn!("No authentication configured - gateway is open");
     }
-    if multi_user && (config.gateway.auth_token.is_some() || !config.tokens.is_empty()) {
-        tracing::warn!(
-            "gateway.auth_token and [[tokens]] bypass RBAC and are deprecated in favour of personal access tokens and service accounts"
-        );
+    if multi_user {
+        if config.gateway.auth_token.is_some() {
+            tracing::warn!(
+                "gateway.auth_token is ignored in multi-user mode (requests with it get 401): use a service account token, or `axon-gateway admin login-link` to sign in"
+            );
+        }
+        if !config.tokens.is_empty() {
+            tracing::info!(
+                "[[tokens]] are config service accounts in multi-user mode: their tools come from [[rbac.groups]] service_accounts"
+            );
+        }
+        for token in &config.tokens {
+            let listed = config
+                .rbac
+                .groups
+                .iter()
+                .any(|group| group.service_accounts.contains(&token.name));
+            if !listed {
+                tracing::warn!(
+                    token = %token.name,
+                    "[[tokens]] entry is in no [[rbac.groups]] service_accounts list and can call no tools"
+                );
+            }
+        }
     }
     auth_manager
 }
@@ -66,6 +88,11 @@ fn setup_auth(config: &Config, multi_user: bool) -> SharedAuth {
 async fn main() -> Result<()> {
     // Install color_eyre for pretty error reporting
     color_eyre::install()?;
+
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "admin") {
+        return admin_cli::run(&args).await;
+    }
 
     // Logging, plus OTLP trace export when OTEL_EXPORTER_OTLP_*ENDPOINT is set
     let telemetry = telemetry::init(env::var("AXON_LOG_JSON").is_ok());

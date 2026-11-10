@@ -911,6 +911,7 @@ mod tests {
                     provider: String::from("pocket"),
                     value: String::from("it-claim"),
                 }],
+                service_accounts: Vec::new(),
             }],
             grants: vec![
                 grant("authenticated", "files", &["read_*"], &[]),

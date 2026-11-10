@@ -159,6 +159,26 @@ fn clean_description(description: Option<&str>) -> Result<Option<String>, AdminE
     Ok(Some(description.to_owned()))
 }
 
+/// A human user as the users page lists them
+#[derive(Debug, Clone)]
+pub struct ManagedUser {
+    pub user: User,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub disabled: bool,
+}
+
+fn managed_user(
+    user: User,
+    last_login_at: Option<DateTime<Utc>>,
+    disabled_at: Option<DateTime<Utc>>,
+) -> ManagedUser {
+    ManagedUser {
+        user,
+        last_login_at,
+        disabled: disabled_at.is_some(),
+    }
+}
+
 /// The admin operations for one logged-in user.
 pub struct Admin<'a> {
     store: &'a Store,
@@ -309,6 +329,58 @@ impl<'a> Admin<'a> {
     pub async fn users(&self, limit: i64) -> Result<Vec<User>, AdminError> {
         self.require_any(&[Permission::UsersManage, Permission::GroupsManage])?;
         Ok(self.store.list_users(limit).await?)
+    }
+
+    /// Up to `limit` human users (not service accounts) with their last login
+    /// and disabled state.
+    ///
+    /// # Errors
+    /// Forbidden without `users.manage` or `groups.manage`; a store error.
+    pub async fn managed_users(&self, limit: i64) -> Result<Vec<ManagedUser>, AdminError> {
+        self.require_any(&[Permission::UsersManage, Permission::GroupsManage])?;
+        Ok(self
+            .store
+            .list_user_states(limit)
+            .await?
+            .into_iter()
+            .map(|state| managed_user(state.user, state.last_login_at, state.disabled_at))
+            .collect())
+    }
+
+    /// Disables or re-enables a human user: a disabled user cannot log in,
+    /// their sessions end and their tokens stop working. Setting the state
+    /// the user already has is not an error.
+    ///
+    /// # Errors
+    /// Forbidden without `users.manage`, not found for an unknown id or a
+    /// service account, conflict when disabling yourself.
+    pub async fn set_user_disabled(
+        &self,
+        id: Uuid,
+        disabled: bool,
+    ) -> Result<ManagedUser, AdminError> {
+        self.require(Permission::UsersManage)?;
+        if disabled && self.actor.user_id == Some(id) {
+            return Err(AdminError::Conflict(
+                "you cannot disable your own account".to_owned(),
+            ));
+        }
+        if self.store.user_state(id).await?.is_none() {
+            return Err(AdminError::NotFound);
+        }
+        self.store
+            .set_user_disabled(&self.actor, id, disabled)
+            .await?;
+        let state = self
+            .store
+            .user_state(id)
+            .await?
+            .ok_or(AdminError::NotFound)?;
+        Ok(managed_user(
+            state.user,
+            state.last_login_at,
+            state.disabled_at,
+        ))
     }
 
     /// Up to `limit` audit entries, newest first, older than `before`.
@@ -883,6 +955,7 @@ mod tests {
                 name: "ops".to_owned(),
                 description: None,
                 idp: Vec::new(),
+                service_accounts: Vec::new(),
             }],
             grants: Vec::new(),
             role_bindings: Vec::new(),

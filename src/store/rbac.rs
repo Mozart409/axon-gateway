@@ -145,6 +145,7 @@ impl Store {
                 idp: idp.remove(&name).unwrap_or_default(),
                 name,
                 description,
+                service_accounts: Vec::new(),
             })
             .collect();
 

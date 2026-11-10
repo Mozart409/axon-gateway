@@ -359,11 +359,16 @@ owner's opt-outs, in both `tools/list` and `tools/call`. A tool the token may
 not use is hidden like one that does not exist: `tools/call` answers it with
 the same `Unknown tool` error (-32601) as for a name no backend has, and a
 backend outside the policy is listed nowhere. Without a valid token in
-multi-user mode the endpoints answer 401 with `WWW-Authenticate: Bearer`. The
-legacy `gateway.auth_token` and `[[tokens]]` still work, but they bypass RBAC
-(they keep their own ACL) and are deprecated in favour of personal access
-tokens and service accounts; the gateway logs a warning at startup when they
-are set in multi-user mode.
+multi-user mode the endpoints answer 401 with `WWW-Authenticate: Bearer`. In
+multi-user mode the shared `gateway.auth_token` is refused (401) and the
+gateway warns at startup that it is ignored. Use service accounts instead, and
+`axon-gateway admin login-link` for emergencies. A `[[tokens]]` entry becomes a
+service account declared in config, under RBAC like any other principal. It
+gets the tools of the config groups that list its `name` in
+`service_accounts`, narrowed by its `allowed_tools` and `allowed_backends`. A
+token in no group can call nothing, and the gateway warns about it at startup.
+Its rate limit still applies. Logs name it `config:<name>`. Standalone (no
+`[database]`), `auth_token` and `[[tokens]]` behave as before.
 
 ```toml
 [[rbac.groups]]
@@ -483,14 +488,22 @@ held by the `admin` role) for agents and scripts that belong to no person. It
 has a name (`[a-z0-9_-]+`, like a group), an optional description, and no
 login. Because it is a user row of its own kind, it joins groups like a user:
 add it on a group's page (the member list marks it as a service account) or
-with `PUT /api/v1/groups/{name}/members/{id}`, and give that group grants. It
-is a member of database groups only: a group declared in `config.toml` takes
-members from its IdP mappings alone, so a service account cannot join one
-(the write answers 409). Its groups are exactly its memberships, without the
-built-in `authenticated` group. Disabling the account stops all its tokens at
-once (enabling it restores them), and deleting it removes its tokens and
-memberships. Admins manage accounts on `/ui/admin/service-accounts` (linked
-from `/ui/admin`).
+with `PUT /api/v1/groups/{name}/members/{id}`, and give that group grants. A group
+declared in `config.toml` cannot take database members (the write answers 409),
+but lists service accounts by name in `service_accounts`, which applies to
+database accounts and `[[tokens]]` entries of that name alike. Its groups are
+exactly its memberships, without the built-in `authenticated` group. Disabling
+the account stops all its tokens at once (enabling it restores them), and
+deleting it removes its tokens and memberships. Each token records when it was
+last used and from which address: the peer, or, when the peer is a loopback or
+private address (a reverse proxy), the rightmost `X-Forwarded-For` entry. Admins
+manage accounts on `/ui/admin/service-accounts` (linked from `/ui/admin`).
+
+```toml
+[[rbac.groups]]
+name = "agents"
+service_accounts = ["ci-bot", "hermes"]
+```
 
 | Endpoint                                                 | Method           | Needs                      |
 | -------------------------------------------------------- | ---------------- | -------------------------- |
@@ -518,6 +531,29 @@ curl -X POST https://axon.homelab.internal/api/v1/tokens \
   -H "Cookie: $SESSION" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
   -d '{"name": "agent", "scope_tools": ["prom_*"]}'
 ```
+
+**Disabling users.** Admins with `users.manage` (the `admin` role) list human
+users on `/ui/admin/users` and disable or re-enable them. A disabled user's
+sessions end at once, the login is refused, and their personal access tokens
+stop working until re-enabled. An admin cannot disable themselves. API:
+`GET /api/v1/users` (each user has `disabled`), and
+`PATCH /api/v1/users/{id}` with `{"disabled": true|false}`, which needs
+`users.manage`. Audit actions are `user.disable` and `user.enable`.
+
+**Break-glass login.** When the identity provider is down, run on a host that
+reaches the database:
+
+```sh
+axon-gateway admin login-link --config /path/to/config.toml
+```
+
+It prints `<base_url>/auth/break-glass?code=...`. The link works once and
+expires after 15 minutes. Opening it shows a confirmation button; confirming
+starts a one-hour admin session as the built-in user "Break-glass admin".
+Creating the link (`break_glass.link_created`) and using it
+(`break_glass.login`) are audited. To switch break-glass off, disable that user
+on `/ui/admin/users`. `--config` defaults to `AXON_GATEWAY_CONFIG`, then
+`config.toml`.
 
 ## Tracing
 
