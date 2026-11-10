@@ -491,7 +491,10 @@ add it on a group's page (the member list marks it as a service account) or
 with `PUT /api/v1/groups/{name}/members/{id}`, and give that group grants. A group
 declared in `config.toml` cannot take database members (the write answers 409),
 but lists service accounts by name in `service_accounts`, which applies to
-database accounts and `[[tokens]]` entries of that name alike. Its groups are
+database accounts and `[[tokens]]` entries of that name alike. A database
+account cannot take the name of a `[[tokens]]` entry (409), so it cannot
+inherit that entry's config groups. Listing a database account by name trusts
+whoever holds `service_accounts.manage` to create it. Its groups are
 exactly its memberships, without the built-in `authenticated` group. Disabling
 the account stops all its tokens at once (enabling it restores them), and
 deleting it removes its tokens and memberships. Each token records when it was

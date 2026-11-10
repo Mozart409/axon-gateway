@@ -114,6 +114,14 @@ impl AuthManager {
         Err(AuthError::InvalidToken)
     }
 
+    /// Names of the `[[tokens]]` entries
+    pub fn token_names(&self) -> Vec<String> {
+        self.token_map
+            .values()
+            .map(|identity| identity.name.clone())
+            .collect()
+    }
+
     /// Check if auth is required (any token configured)
     pub fn auth_required(&self) -> bool {
         self.shared_token.is_some() || !self.token_map.is_empty()

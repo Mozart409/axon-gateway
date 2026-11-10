@@ -189,6 +189,8 @@ pub struct Admin<'a> {
     backends: Vec<String>,
     /// `[[auth.oidc]]` ids an `IdP` mapping may name
     providers: Vec<String>,
+    /// `[[tokens]]` names, which config groups list in `service_accounts`
+    config_accounts: Vec<String>,
 }
 
 impl<'a> Admin<'a> {
@@ -210,6 +212,7 @@ impl<'a> Admin<'a> {
             permissions,
             backends,
             providers,
+            config_accounts: Vec::new(),
         }
     }
 
@@ -232,13 +235,9 @@ impl<'a> Admin<'a> {
             .iter()
             .map(|provider| provider.id().to_owned())
             .collect();
-        Some(Self::new(
-            store,
-            &state.policy,
-            session,
-            backends,
-            providers,
-        ))
+        let mut admin = Self::new(store, &state.policy, session, backends, providers);
+        admin.config_accounts = state.auth_manager.load().token_names();
+        Some(admin)
     }
 
     fn require(&self, permission: Permission) -> Result<(), AdminError> {
@@ -845,6 +844,13 @@ impl Admin<'_> {
     ) -> Result<ServiceAccount, AdminError> {
         self.require(Permission::ServiceAccountsManage)?;
         validate_group_name(name).map_err(AdminError::Invalid)?;
+        // A config group lists service accounts by name: a database account must not
+        // take over the groups of a `[[tokens]]` entry
+        if self.config_accounts.iter().any(|account| account == name) {
+            return Err(AdminError::Conflict(
+                "a [[tokens]] entry in config.toml has this name".to_owned(),
+            ));
+        }
         let description = clean_description(description)?;
         self.store
             .create_service_account(&self.actor, name, description.as_deref())
@@ -1066,6 +1072,23 @@ mod tests {
             admin.audit(10, None).await,
             Err(AdminError::Forbidden)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_service_account_cannot_take_a_config_token_name() {
+        let Some(store) = test_store("axon_rbac_token_name").await else {
+            return;
+        };
+        let handle = PolicyHandle::new(test_config());
+        let session = test_session(&store, "root", true).await;
+        let mut admin = admin(&store, &handle, &session);
+        admin.config_accounts = vec!["legacy-ops".to_owned()];
+
+        assert!(matches!(
+            admin.create_service_account("legacy-ops", None).await,
+            Err(AdminError::Conflict(_))
+        ));
+        admin.create_service_account("db-bot", None).await.unwrap();
     }
 
     #[tokio::test]
