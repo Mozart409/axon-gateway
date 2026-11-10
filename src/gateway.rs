@@ -693,6 +693,38 @@ impl RequestRouter {
     }
 }
 
+/// Describe a namespaced tool for the tool-call audit: backend, original name
+/// and annotations. `None` when no tool has that name.
+pub struct DescribeTool {
+    pub namespaced_name: String,
+}
+
+impl Message<DescribeTool> for GatewayActor {
+    type Reply = DelegatedReply<Option<crate::registry::ToolDescription>>;
+
+    async fn handle(
+        &mut self,
+        msg: DescribeTool,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let registry = self.registry.clone();
+        let (delegated, sender) = ctx.reply_sender();
+        tokio::spawn(async move {
+            let description = registry
+                .ask(crate::registry::DescribeTool {
+                    namespaced_tool_name: msg.namespaced_name,
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(sender) = sender {
+                sender.send(description);
+            }
+        });
+        delegated
+    }
+}
+
 /// Get available toolsets
 pub struct GetToolsets;
 

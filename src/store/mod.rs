@@ -10,10 +10,12 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use thiserror::Error;
 
+mod audit;
 mod auth;
 mod break_glass;
 mod rbac;
 mod tokens;
+mod toolsets;
 mod views;
 
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
@@ -23,6 +25,7 @@ pub use tokens::{
     ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, MAX_SERVICE_TOKEN_LIFETIME,
     MAX_USER_TOKEN_LIFETIME, NewToken, PAT_PREFIX, ServiceAccount, TokenError,
 };
+pub use toolsets::{NewToolset, Toolset, ToolsetError};
 
 const MAX_CONNECTIONS: u32 = 10;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);

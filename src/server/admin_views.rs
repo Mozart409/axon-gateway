@@ -248,6 +248,12 @@ pub(super) fn render_admin_page(
                 p class="mt-3 text-sm" {
                     a href="/ui/admin/audit" class=(LINK) { "Audit log" }
                 }
+                p class="mt-3 text-sm" {
+                    a href="/ui/admin/tool-calls" class=(LINK) { "Tool calls" }
+                }
+                p class="mt-3 text-sm" {
+                    a href="/ui/admin/audit-settings" class=(LINK) { "Audit settings" }
+                }
             }
             @if overview.access.manage_users {
                 p class="mt-3 text-sm" {

@@ -7,6 +7,8 @@
 //!   `MCP_GATEWAY_CONFIG=config.toml` mcp-gateway
 
 mod admin_cli;
+mod audit;
+mod audit_admin;
 mod auth;
 mod authz;
 mod backend;
@@ -84,6 +86,31 @@ fn setup_auth(config: &Config, multi_user: bool) -> SharedAuth {
     auth_manager
 }
 
+/// Spawns the background tasks that need the database: the session and audit
+/// purges, the audit writer (returned) and the RBAC policy refresh.
+async fn start_store_tasks(
+    store: Option<&store::Store>,
+    has_oidc: bool,
+    policy: &Arc<rbac::PolicyHandle>,
+) -> Option<audit::AuditSink> {
+    if let Some(store) = store {
+        spawn_session_purge(store.clone());
+    }
+    let audit = store.map(|store| {
+        audit::spawn_audit_purge(store.clone());
+        audit::AuditSink::spawn(store.clone())
+    });
+    if let (Some(store), true) = (store, has_oidc) {
+        // Config-only policy until the database answers; the refresh task
+        // retries, and picks up changes made through other replicas.
+        if let Err(error) = policy.refresh(store).await {
+            tracing::warn!(%error, "Could not load RBAC rows from the database, using [rbac] from the config only");
+        }
+        rbac::spawn_policy_refresh(Arc::clone(policy), store.clone());
+    }
+    audit
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install color_eyre for pretty error reporting
@@ -127,17 +154,7 @@ async fn main() -> Result<()> {
     let oidc = setup_oidc(&config, &base_url)?;
     let policy = Arc::new(rbac::PolicyHandle::new(config.rbac.clone()));
 
-    if let Some(store) = store.clone() {
-        spawn_session_purge(store);
-    }
-    if let (Some(store), Some(_)) = (&store, &oidc) {
-        // Config-only policy until the database answers; the refresh task
-        // retries, and picks up changes made through other replicas.
-        if let Err(error) = policy.refresh(store).await {
-            tracing::warn!(%error, "Could not load RBAC rows from the database, using [rbac] from the config only");
-        }
-        rbac::spawn_policy_refresh(Arc::clone(&policy), store.clone());
-    }
+    let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy).await;
 
     // Initialize Prometheus metrics exporter
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -203,6 +220,7 @@ async fn main() -> Result<()> {
         store,
         oidc,
         policy,
+        audit,
     };
 
     // Run server with graceful shutdown

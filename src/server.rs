@@ -59,6 +59,9 @@ mod admin_api;
 mod admin_ui;
 mod admin_views;
 mod api;
+mod audit_api;
+mod audit_ui;
+mod audit_views;
 mod auth;
 mod break_glass;
 mod mcp;
@@ -66,6 +69,9 @@ mod session;
 mod tokens_api;
 mod tokens_ui;
 mod tokens_views;
+mod toolsets_api;
+mod toolsets_ui;
+mod toolsets_views;
 mod ui;
 mod views;
 
@@ -88,6 +94,8 @@ pub struct AppState {
     pub oidc: Option<Arc<crate::oidc::OidcProviders>>,
     /// RBAC groups and grants from `[rbac]` and the database
     pub policy: Arc<crate::rbac::PolicyHandle>,
+    /// Tool-call audit writer; `None` in standalone mode
+    pub audit: Option<crate::audit::AuditSink>,
 }
 
 impl AppState {
@@ -122,13 +130,13 @@ pub struct FlashMessage {
     pub message: String,
 }
 
-/// Create the Axum router
-pub fn create_router(state: AppState) -> Router {
+/// The state-changing dashboard actions.
+fn ui_action_routes(state: &AppState) -> Router<AppState> {
     // State-changing dashboard actions. Refuse requests a browser marks as
     // cross-site: otherwise any web page could drive them with a plain form
     // POST. In multi-user mode they also need the session's CSRF token
     // (`session::require_csrf`, behind the session guard below).
-    let ui_actions = Router::new()
+    Router::new()
         .route(
             "/ui/actions/backends/{name}/reconnect",
             post(ui::handle_ui_reconnect_backend),
@@ -148,11 +156,17 @@ pub fn create_router(state: AppState) -> Router {
         )
         .merge(admin_ui::action_routes())
         .merge(tokens_ui::action_routes())
+        .merge(audit_ui::action_routes())
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             reject_cross_site_middleware,
-        ));
+        ))
+}
+
+/// Create the Axum router
+pub fn create_router(state: AppState) -> Router {
+    let ui_actions = ui_action_routes(&state);
 
     // Every dashboard route sits behind the session guard, which does nothing
     // outside multi-user mode.
@@ -164,6 +178,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ui/partials/backends", get(ui::handle_ui_backends_partial))
         .merge(admin_ui::page_routes())
         .merge(tokens_ui::page_routes())
+        .merge(audit_ui::page_routes())
         .merge(ui_actions)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -202,6 +217,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(break_glass::routes())
         // JSON admin API
         .merge(admin_api::router(state.clone()))
+        .merge(audit_api::router(state.clone()))
         // Status endpoints
         .route("/health", get(api::health_check))
         .route("/livez", get(api::livez))
@@ -449,6 +465,7 @@ mod tests {
             policy: Arc::new(crate::rbac::PolicyHandle::new(
                 crate::policy::RbacConfig::default(),
             )),
+            audit: None,
         }
     }
 

@@ -596,10 +596,11 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 11. Phased plan
 
-Status (2026-11-10): Phases 0, 1, 2a, 2b, 3a and 3b are done and committed. Resume
-at Phase 3c. Open caveats: OIDC login is untested against a real IdP, and a
-plain-text 403 from the CSRF check can replace an admin page section (the
-htmx config swaps 4xx responses).
+Status (2026-11-10): Phases 0 to 3c are done and committed. Resume at
+Phase 4 (Phase 8, config in the database, is planned). Open caveats: OIDC
+login is untested against a real IdP, and a plain-text 403 from the CSRF
+check can replace an admin page section (the htmx config swaps 4xx
+responses).
 
 ### Phase 0 - Groundwork (no behaviour change)
 
@@ -713,9 +714,23 @@ htmx config swaps 4xx responses).
 
 ### Phase 3c - Toolsets and tool-call audit
 
-- [ ] User-defined toolsets and PAT toolset pinning.
-- [ ] Tool-call audit, with argument capture policy (annotation defaults,
-      overrides), `audit_arguments` table and `audit.read_sensitive`.
+- [x] User-defined toolsets (`/ui/toolsets`, `/api/v1/toolsets`) and PAT
+      pinning as a live link: a pinned token sees owner policy ∩ toolset ∩
+      token scope, and editing the toolset applies on the next request.
+      `/mcp/toolset/{name}` resolves the caller's own toolset first and then
+      limits calls as well as the listing (a config `[[toolsets]]` entry still
+      filters only the listing). A toolset pinned by a live token cannot be
+      deleted (409).
+- [x] Tool-call audit: `tool_calls` (metadata) and `audit_arguments` tables,
+      written by an async bounded writer (a full queue drops and counts in
+      `axon_audit_dropped_total`, never delaying a call). Capture follows the
+      annotations (`readOnlyHint` -> none, else redacted) unless a capture
+      rule overrides it (`none | redacted | full`, drop keys).
+- [x] Capture rules and retention (default 30 days arguments, 365 days
+      metadata) live in the database, managed on `/ui/admin/audit-settings`
+      and `/api/v1/audit/...` by `gateway.admin`; no config section (see
+      Phase 8). Reading arguments needs `audit.read_sensitive` and is itself
+      audited.
 
 ### Phase 4 - Spec-compliant MCP transport
 
@@ -763,8 +778,8 @@ htmx config swaps 4xx responses).
       backend, outcome}`, `axon_backend_inflight_calls{backend}` and
       `axon_backend_up{backend}`; pool and
       OIDC metrics.
-- [ ] Audit UI, retention job (metadata 1 year, arguments 30 days, both
-      configurable), per-user usage page.
+- [ ] Per-user usage page (the audit UI and retention job came with
+      Phase 3c).
 - [ ] Helm chart under `deploy/helm/axon-gateway/` (section 7).
 - [ ] Grafana dashboard and alert rules in `example/observability/`.
 - [ ] `traceparent` propagation to backends and MCP `_meta`.
@@ -780,6 +795,42 @@ htmx config swaps 4xx responses).
 - [ ] Custom roles.
 - [ ] Entra groups-overage Graph lookup (fallback only; app roles are the default, section 5).
 
+### Phase 8 - Configuration in the database (no config file)
+
+Goal (decided 2026-11-10): `config.toml` goes away. A deployment is configured
+by a few environment variables plus the database; everything else is edited
+in the admin UI and API, audited, and shared by all replicas. Standalone mode
+(no database) keeps reading the file until it is retired in a major release.
+
+- [ ] Bootstrap from environment only: `AXON_DATABASE_URL`, `AXON_BIND`,
+      `AXON_BASE_URL`, `AXON_KEK_FILE`, and one bootstrap OIDC provider
+      (`AXON_OIDC_ISSUER`, `_CLIENT_ID`, `_CLIENT_SECRET_FILE`,
+      `_ADMIN_GROUPS`). Without the provider variables the break-glass link
+      is the way in.
+- [ ] Database-managed objects, each with a table, admin page, `/api/v1`
+      endpoints, audit actions and the 30 s replica refresh (or LISTEN/NOTIFY
+      from Phase 4): backends (transport, URL or command, headers, timeouts,
+      circuit breaker; secrets envelope-encrypted, Phase 5 `crypto/`), config
+      toolsets, OIDC providers (with their admin groups and claim names),
+      gateway settings (rate limits, CORS-free defaults, idle timeout).
+      RBAC groups, grants and role bindings are already in the database.
+- [ ] Hot reload becomes "apply on save": a backend change restarts only that
+      backend actor; the file watcher is removed in database mode.
+- [ ] Migration command `axon-gateway admin import-config <config.toml>`:
+      imports backends, toolsets, `[rbac]`, `[[auth.oidc]]` and `[[tokens]]`
+      (as service accounts with fresh PATs printed once) into the database,
+      idempotent, with a dry-run. After import, config objects lose their
+      read-only `source = config` status.
+- [ ] Remove the config layer of RBAC (`Source::Config`, 409 on write) once
+      import exists; `[[rbac.groups]] service_accounts` becomes ordinary
+      database membership.
+- [ ] stdio backends stay admin-only; their command and arguments are
+      editable only with `backends.manage` and an explicit allow setting.
+- [ ] NixOS module and Helm chart move from a rendered TOML file to
+      environment variables plus a one-shot import.
+- Exit: a fresh instance starts with only environment variables, an admin
+  adds a backend in the UI, and a second replica serves it within 30 s.
+
 ### Homelab rollout (the user does all deploys)
 
 - [ ] Create a PocketID OIDC client for axon (redirect URI under the
@@ -788,8 +839,9 @@ htmx config swaps 4xx responses).
 - [ ] Postgres database and role on the database host.
 - [ ] Update the NixOS module in `infra/hosts/mcp_vm/axon-gateway/default.nix`
       (`[database]`, `[[auth.oidc]]`, env files).
-- [ ] Migrate current agents' bearer token to service-account PATs; then turn
-      the shared token into break-glass.
+- [ ] Migrate current agents' bearer token to service-account PATs before
+      switching on multi-user mode: it refuses the shared token (Phase 3b).
+      Break-glass is `axon-gateway admin login-link`.
 
 ### Versioning and docs
 

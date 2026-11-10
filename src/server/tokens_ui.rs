@@ -36,6 +36,7 @@ pub(super) fn page_routes() -> Router<AppState> {
     Router::new()
         .route("/ui/tokens", get(handle_tokens))
         .route("/ui/admin/service-accounts", get(handle_service_accounts))
+        .merge(super::toolsets_ui::page_routes())
 }
 
 /// The POST actions, to merge into the routes behind the CSRF and same-site
@@ -64,6 +65,7 @@ pub(super) fn action_routes() -> Router<AppState> {
             "/ui/actions/admin/service-accounts/{id}/tokens/{token_id}/revoke",
             post(handle_account_token_revoke),
         )
+        .merge(super::toolsets_ui::action_routes())
 }
 
 /// The create token form, read as pairs because `scope_backends` repeats
@@ -74,6 +76,7 @@ struct TokenForm {
     name: String,
     expires_in_days: Option<u32>,
     scope: TokenScope,
+    toolset_id: Option<Uuid>,
 }
 
 impl TokenForm {
@@ -98,8 +101,19 @@ impl TokenForm {
             .filter(|(name, value)| name == "scope_backends" && !value.trim().is_empty())
             .map(|(_, value)| value.clone())
             .collect();
+        let toolset_id = match first("toolset_id")
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            Some(id) => Some(
+                id.parse()
+                    .map_err(|_| AdminError::Invalid(String::from("unknown toolset")))?,
+            ),
+            None => None,
+        };
         Ok(Self {
             name: first("name").unwrap_or_default().to_owned(),
+            toolset_id,
             expires_in_days,
             scope: TokenScope {
                 backends,
@@ -118,7 +132,7 @@ fn no_store(mut response: Response) -> Response {
 }
 
 /// The backends the user is granted, which a token of theirs may be narrowed to.
-fn granted_backends(state: &AppState, session: &SessionUser) -> Vec<String> {
+pub(super) fn granted_backends(state: &AppState, session: &SessionUser) -> Vec<String> {
     let policy = state.policy.current();
     let (groups, _) = resolve(&policy, session);
     policy.effective(&groups).backends()
@@ -126,7 +140,7 @@ fn granted_backends(state: &AppState, session: &SessionUser) -> Vec<String> {
 
 /// The session and the token service, or the 404 outside multi-user mode
 /// (boxed: a `Response` is large for an error type).
-fn tokens_for(
+pub(super) fn tokens_for(
     state: &AppState,
     user: Option<Extension<SessionUser>>,
 ) -> Result<(SessionUser, MyTokens<'_>), Box<Response>> {
@@ -150,7 +164,13 @@ async fn tokens_fragment(
     match tokens.list().await {
         Ok(list) => {
             let backends = granted_backends(state, session);
-            no_store(fragment(&render_tokens_section(&list, &backends, issued)))
+            let toolsets = match tokens.toolsets().await {
+                Ok(toolsets) => toolsets,
+                Err(error) => return error_response(&error),
+            };
+            no_store(fragment(&render_tokens_section(
+                &list, &backends, &toolsets, issued,
+            )))
         }
         Err(error) => error_response(&error),
     }
@@ -165,14 +185,13 @@ pub(super) async fn handle_tokens(
         Ok(pair) => pair,
         Err(response) => return *response,
     };
-    match tokens.list().await {
-        Ok(list) => {
-            let backends = granted_backends(&state, &session);
-            Html(render_tokens_page(&state, &session, &list, &backends).into_string())
-                .into_response()
-        }
-        Err(error) => page_error(&state, &session, &error),
-    }
+    let (list, toolsets) = match (tokens.list().await, tokens.toolsets().await) {
+        (Ok(list), Ok(toolsets)) => (list, toolsets),
+        (Err(error), _) | (_, Err(error)) => return page_error(&state, &session, &error),
+    };
+    let backends = granted_backends(&state, &session);
+    Html(render_tokens_page(&state, &session, &list, &backends, &toolsets).into_string())
+        .into_response()
 }
 
 /// Handle POST /ui/actions/tokens - issue a token for the user
@@ -190,7 +209,12 @@ pub(super) async fn handle_token_create(
         Err(error) => return error_response(&error),
     };
     match tokens
-        .create(&form.name, form.expires_in_days, &form.scope)
+        .create(
+            &form.name,
+            form.expires_in_days,
+            &form.scope,
+            form.toolset_id,
+        )
         .await
     {
         Ok(issued) => tokens_fragment(&state, &session, &tokens, Some(&issued)).await,

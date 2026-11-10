@@ -352,6 +352,41 @@ impl Message<ResolveToolBackend> for RegistryActor {
     }
 }
 
+/// Look up what the tool-call audit records about a namespaced tool.
+pub struct DescribeTool {
+    pub namespaced_tool_name: String,
+}
+
+/// The backend, original name and MCP annotations of a tool.
+#[derive(Debug, Clone)]
+pub struct ToolDescription {
+    pub backend_name: String,
+    pub original_tool_name: String,
+    pub annotations: Option<serde_json::Value>,
+}
+
+impl Message<DescribeTool> for RegistryActor {
+    type Reply = Option<ToolDescription>;
+
+    async fn handle(
+        &mut self,
+        msg: DescribeTool,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let backend_name = self.tool_routing.get(&msg.namespaced_tool_name)?;
+        let backend = self.backends.get(backend_name.value())?;
+        let tool = backend
+            .tools
+            .iter()
+            .find(|t| t.namespaced_name == msg.namespaced_tool_name)?;
+        Some(ToolDescription {
+            backend_name: backend_name.clone(),
+            original_tool_name: tool.original_name.clone(),
+            annotations: tool.definition.annotations.clone(),
+        })
+    }
+}
+
 /// Get status of all backends
 pub struct GetBackendStatus;
 

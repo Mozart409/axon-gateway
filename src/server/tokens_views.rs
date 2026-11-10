@@ -18,7 +18,7 @@ use super::admin_views::{
 use crate::rbac::{TokenState, lifetime_days};
 use crate::store::{
     ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, MAX_SERVICE_TOKEN_LIFETIME,
-    MAX_USER_TOKEN_LIFETIME, PAT_PREFIX, ServiceAccount, SessionUser,
+    MAX_USER_TOKEN_LIFETIME, PAT_PREFIX, ServiceAccount, SessionUser, Toolset,
 };
 
 /// A service account with its tokens
@@ -90,8 +90,14 @@ fn state_badge(state: TokenState) -> Markup {
 /// What a token is narrowed to
 fn scope_cell(token: &ApiToken) -> Markup {
     html! {
-        @if token.scope_backends.is_empty() && token.scope_tools.is_empty() {
+        @if token.scope_backends.is_empty() && token.scope_tools.is_empty() && token.toolset_name.is_none() {
             span class=(FAINT) { "none" }
+        }
+        @if let Some(name) = &token.toolset_name {
+            div {
+                "toolset: "
+                code class=(CODE) { (name) }
+            }
         }
         @if !token.scope_backends.is_empty() {
             div {
@@ -176,8 +182,15 @@ fn render_token_table(
 }
 
 /// The form that issues a token. The backends are a multi-select (the
-/// `scope_backends` key repeats), the tool globs one comma separated field.
-fn render_token_form(action: &str, target: &str, max_days: u64, backends: &[String]) -> Markup {
+/// `scope_backends` key repeats), the tool globs one comma separated field. With
+/// `toolsets` there is a select to pin the token to one of them.
+fn render_token_form(
+    action: &str,
+    target: &str,
+    max_days: u64,
+    backends: &[String],
+    toolsets: &[Toolset],
+) -> Markup {
     html! {
         form
             class=(FORM_ROW)
@@ -213,16 +226,29 @@ fn render_token_form(action: &str, target: &str, max_days: u64, backends: &[Stri
                 "Tool globs (comma separated, optional)"
                 input class=(format!("{INPUT} w-72")) type="text" name="scope_tools" placeholder="files_read_*, prom_*";
             }
+            @if !toolsets.is_empty() {
+                label class=(LABEL) {
+                    "Toolset (optional, edits apply at once)"
+                    select class=(INPUT) name="toolset_id" {
+                        option value="" { "none" }
+                        @for toolset in toolsets {
+                            option value=(toolset.id) { (toolset.name) }
+                        }
+                    }
+                }
+            }
             button class=(BUTTON) type="submit" { "Create token" }
         }
     }
 }
 
 /// A user's own tokens and the create form, the swap target of the `tokens`
-/// actions. `backends` are the backends the user is granted.
+/// actions. `backends` are the backends the user is granted, `toolsets` the
+/// user's own toolsets a token may be pinned to.
 pub(super) fn render_tokens_section(
     tokens: &[ApiToken],
     backends: &[String],
+    toolsets: &[Toolset],
     issued: Option<&IssuedToken>,
 ) -> Markup {
     html! {
@@ -247,6 +273,7 @@ pub(super) fn render_tokens_section(
                 "#my-tokens",
                 lifetime_days(MAX_USER_TOKEN_LIFETIME),
                 backends,
+                toolsets,
             ))
         }
     }
@@ -258,6 +285,7 @@ pub(super) fn render_tokens_page(
     user: &SessionUser,
     tokens: &[ApiToken],
     backends: &[String],
+    toolsets: &[Toolset],
 ) -> Markup {
     let content = html! {
         section class=(CARD) {
@@ -267,7 +295,7 @@ pub(super) fn render_tokens_page(
             }
         }
         (render_flash_area(false))
-        (render_tokens_section(tokens, backends, None))
+        (render_tokens_section(tokens, backends, toolsets, None))
     };
     render_layout(state, user, "Tokens", &content)
 }
@@ -334,6 +362,7 @@ fn render_account(row: &AccountRow, backends: &[String]) -> Markup {
                 "#service-accounts",
                 lifetime_days(MAX_SERVICE_TOKEN_LIFETIME),
                 backends,
+                &[],
             ))
         }
     }
@@ -440,6 +469,8 @@ mod tests {
             expires_at: Utc::now() + expires_in,
             last_used_at: None,
             revoked,
+            toolset_id: None,
+            toolset_name: None,
         }
     }
 
@@ -455,14 +486,19 @@ mod tests {
         let issued = issued("laptop");
         let tokens = [issued.token.clone()];
 
-        let fresh =
-            render_tokens_section(&tokens, &[String::from("files")], Some(&issued)).into_string();
+        let fresh = render_tokens_section(&tokens, &[String::from("files")], &[], Some(&issued))
+            .into_string();
         assert!(fresh.contains(&issued.plaintext));
         assert!(fresh.contains("will not be shown again"));
 
-        let listed =
-            render_tokens_page(&test_state(), &session(), &tokens, &[String::from("files")])
-                .into_string();
+        let listed = render_tokens_page(
+            &test_state(),
+            &session(),
+            &tokens,
+            &[String::from("files")],
+            &[],
+        )
+        .into_string();
         assert!(!listed.contains(&issued.plaintext));
         assert!(!listed.contains(&"ab".repeat(32)));
         assert!(listed.contains("axon_pat_0123456789abcdef_"));
@@ -476,7 +512,7 @@ mod tests {
             token("old", false, Duration::days(-1)),
             token("gone", true, Duration::days(1)),
         ];
-        let html = render_tokens_section(&tokens, &[], None).into_string();
+        let html = render_tokens_section(&tokens, &[], &[], None).into_string();
 
         assert_eq!(html.matches("/revoke\"").count(), 1);
         assert!(html.contains(">active<"));

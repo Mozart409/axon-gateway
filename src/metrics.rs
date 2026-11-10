@@ -8,8 +8,10 @@
 //! - `axon_backend_inflight_calls` — Gauge of requests in flight per backend
 //! - `axon_requests_total` — Counter of HTTP requests by method/path
 //! - `axon_health_checks_total` — Counter of health check results
+//! - `axon_audit_dropped_total` — Counter of tool call audit events dropped (queue full)
+//! - `axon_audit_write_errors_total` — Counter of failed tool call audit batch writes
 
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, describe_counter, gauge, histogram};
 
 /// Record a tool call request
 pub fn record_tool_call(backend: &str, tool: &str) {
@@ -142,4 +144,26 @@ pub fn record_ui_sse_event(event: &str) {
 /// Record dropped SSE events.
 pub fn record_ui_sse_dropped(count: u64) {
     counter!("axon_ui_sse_dropped_total").increment(count);
+}
+
+/// Describe the audit metrics, so they show up with help text.
+pub fn describe_audit_metrics() {
+    describe_counter!(
+        "axon_audit_dropped_total",
+        "Tool call audit events dropped because the writer queue was full"
+    );
+    describe_counter!(
+        "axon_audit_write_errors_total",
+        "Tool call audit batches that could not be written to the database"
+    );
+}
+
+/// Record a tool call audit event dropped because the writer queue was full.
+pub fn record_audit_dropped() {
+    counter!("axon_audit_dropped_total").increment(1);
+}
+
+/// Record a tool call audit batch that failed to write.
+pub fn record_audit_write_error() {
+    counter!("axon_audit_write_errors_total").increment(1);
 }

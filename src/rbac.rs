@@ -22,8 +22,8 @@ use crate::policy::{
 use crate::principal::TokenScope;
 use crate::server::AppState;
 use crate::store::{
-    Actor, ApiToken, AuditRecord, DEFAULT_TOKEN_LIFETIME, IssuedToken, NewToken, ServiceAccount,
-    SessionUser, Store, StoreError, TokenError, User,
+    Actor, ApiToken, AuditRecord, DEFAULT_TOKEN_LIFETIME, IssuedToken, NewToken, NewToolset,
+    ServiceAccount, SessionUser, Store, StoreError, TokenError, Toolset, ToolsetError, User,
 };
 
 /// How often the policy is re-read from the database, so that changes made
@@ -32,6 +32,9 @@ pub const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Longest group description, in characters.
 const MAX_DESCRIPTION_CHARS: usize = 500;
+
+/// Most backends or tool globs one toolset holds.
+const MAX_TOOLSET_LIST_ENTRIES: usize = 100;
 
 /// Most backends or tool globs one token may be narrowed to.
 const MAX_SCOPE_ENTRIES: usize = 50;
@@ -121,9 +124,23 @@ impl From<TokenError> for AdminError {
             TokenError::InvalidName | TokenError::ExpiryInPast | TokenError::ExpiryTooLong(_) => {
                 Self::Invalid(error.to_string())
             }
-            TokenError::UnknownOwner => Self::NotFound,
+            TokenError::UnknownOwner | TokenError::UnknownToolset => Self::NotFound,
             TokenError::Store(error) => Self::Store(error),
             TokenError::Query(error) => Self::Store(StoreError::Query(error)),
+        }
+    }
+}
+
+impl From<ToolsetError> for AdminError {
+    fn from(error: ToolsetError) -> Self {
+        match error {
+            ToolsetError::InvalidName(_) | ToolsetError::InvalidEntries(_) => {
+                Self::Invalid(error.to_string())
+            }
+            ToolsetError::UnknownOwner => Self::NotFound,
+            ToolsetError::NameTaken | ToolsetError::Pinned => Self::Conflict(error.to_string()),
+            ToolsetError::Store(error) => Self::Store(error),
+            ToolsetError::Query(error) => Self::Store(StoreError::Query(error)),
         }
     }
 }
@@ -681,8 +698,31 @@ fn clean_scope_list(entries: &[String], what: &str) -> Result<Vec<String>, Admin
     Ok(cleaned)
 }
 
+/// Trims and deduplicates one toolset list; like a scope list, a blank entry is
+/// refused so that a toolset of blanks cannot end up unnarrowed.
+fn clean_toolset_list(entries: &[String], what: &str) -> Result<Vec<String>, AdminError> {
+    if entries.len() > MAX_TOOLSET_LIST_ENTRIES {
+        return Err(AdminError::Invalid(format!(
+            "at most {MAX_TOOLSET_LIST_ENTRIES} {what} per toolset"
+        )));
+    }
+    let mut cleaned: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.chars().count() > MAX_SCOPE_ENTRY_CHARS {
+            return Err(AdminError::Invalid(format!(
+                "each of the {what} must be 1 to {MAX_SCOPE_ENTRY_CHARS} characters"
+            )));
+        }
+        if !cleaned.iter().any(|seen| seen == entry) {
+            cleaned.push(entry.to_owned());
+        }
+    }
+    Ok(cleaned)
+}
+
 /// Issues a token for `owner_id`; the owner must already be known to be
-/// allowed to have one.
+/// allowed to have one. `toolset_id` pins it to a toolset of the owner.
 async fn issue_token(
     store: &Store,
     actor: &Actor,
@@ -690,6 +730,7 @@ async fn issue_token(
     name: &str,
     expires_in_days: Option<u32>,
     scope: &TokenScope,
+    toolset_id: Option<Uuid>,
 ) -> Result<IssuedToken, AdminError> {
     let scope_backends = clean_scope_list(&scope.backends, "backends")?;
     let scope_tools = clean_scope_list(&scope.tools, "tool patterns")?;
@@ -699,6 +740,7 @@ async fn issue_token(
         name: name.trim(),
         scope_backends: &scope_backends,
         scope_tools: &scope_tools,
+        toolset_id,
         expires_at,
     };
     Ok(store.create_token(actor, &new).await?)
@@ -767,16 +809,18 @@ impl<'a> MyTokens<'a> {
     }
 
     /// Issues a token for the caller. `expires_in_days` defaults to 30 days
-    /// and is capped by the store at 90.
+    /// and is capped by the store at 90. `toolset_id` pins it to one of the
+    /// caller's toolsets.
     ///
     /// # Errors
     /// Invalid for a bad name, scope or expiry, or an expiry beyond the
-    /// maximum; a store error.
+    /// maximum; not found for a toolset that is not the caller's; a store error.
     pub async fn create(
         &self,
         name: &str,
         expires_in_days: Option<u32>,
         scope: &TokenScope,
+        toolset_id: Option<Uuid>,
     ) -> Result<IssuedToken, AdminError> {
         issue_token(
             self.store,
@@ -785,8 +829,97 @@ impl<'a> MyTokens<'a> {
             name,
             expires_in_days,
             scope,
+            toolset_id,
         )
         .await
+    }
+
+    /// The caller's toolsets, by name.
+    ///
+    /// # Errors
+    /// A store error.
+    pub async fn toolsets(&self) -> Result<Vec<Toolset>, AdminError> {
+        Ok(self.store.list_toolsets(self.owner_id).await?)
+    }
+
+    /// One of the caller's toolsets.
+    ///
+    /// # Errors
+    /// Not found for an unknown id or someone else's toolset; a store error.
+    pub async fn toolset(&self, id: Uuid) -> Result<Toolset, AdminError> {
+        self.store
+            .toolset(self.owner_id, id)
+            .await?
+            .ok_or(AdminError::NotFound)
+    }
+
+    /// Creates a toolset for the caller. `scope` holds its tool globs and backends.
+    ///
+    /// # Errors
+    /// Invalid for a bad name or list; conflict when the name is taken; a store error.
+    pub async fn create_toolset(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        scope: &TokenScope,
+    ) -> Result<Toolset, AdminError> {
+        let description = clean_description(description)?;
+        let tools = clean_toolset_list(&scope.tools, "tool patterns")?;
+        let backends = clean_toolset_list(&scope.backends, "backends")?;
+        let new = NewToolset {
+            name: name.trim(),
+            description: description.as_deref(),
+            tools: &tools,
+            backends: &backends,
+        };
+        Ok(self
+            .store
+            .create_toolset(&self.actor, self.owner_id, &new)
+            .await?)
+    }
+
+    /// Replaces name, description and lists of one of the caller's toolsets; the
+    /// tokens pinned to it follow at once.
+    ///
+    /// # Errors
+    /// Invalid for a bad name or list; conflict when the name is taken; not found
+    /// for an unknown id or someone else's toolset; a store error.
+    pub async fn update_toolset(
+        &self,
+        id: Uuid,
+        name: &str,
+        description: Option<&str>,
+        scope: &TokenScope,
+    ) -> Result<Toolset, AdminError> {
+        let description = clean_description(description)?;
+        let tools = clean_toolset_list(&scope.tools, "tool patterns")?;
+        let backends = clean_toolset_list(&scope.backends, "backends")?;
+        let new = NewToolset {
+            name: name.trim(),
+            description: description.as_deref(),
+            tools: &tools,
+            backends: &backends,
+        };
+        self.store
+            .update_toolset(&self.actor, self.owner_id, id, &new)
+            .await?
+            .ok_or(AdminError::NotFound)
+    }
+
+    /// Deletes one of the caller's toolsets.
+    ///
+    /// # Errors
+    /// Conflict while a token that is still valid is pinned to it; not found for an
+    /// unknown id or someone else's toolset; a store error.
+    pub async fn delete_toolset(&self, id: Uuid) -> Result<(), AdminError> {
+        if !self
+            .store
+            .delete_toolset(&self.actor, self.owner_id, id)
+            .await?
+        {
+            return Err(AdminError::NotFound);
+        }
+        Ok(())
     }
 
     /// Revokes one of the caller's tokens.
@@ -912,7 +1045,16 @@ impl Admin<'_> {
         scope: &TokenScope,
     ) -> Result<IssuedToken, AdminError> {
         self.account(id).await?;
-        issue_token(self.store, &self.actor, id, name, expires_in_days, scope).await
+        issue_token(
+            self.store,
+            &self.actor,
+            id,
+            name,
+            expires_in_days,
+            scope,
+            None,
+        )
+        .await
     }
 
     /// Revokes a token of a service account.

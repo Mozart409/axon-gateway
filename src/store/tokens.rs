@@ -17,6 +17,8 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::principal::TokenScope;
+
 use super::auth::User;
 use super::rbac::{Actor, audit};
 use super::{Store, StoreError};
@@ -57,6 +59,9 @@ pub enum TokenError {
     #[error("the token owner does not exist")]
     UnknownOwner,
 
+    #[error("the toolset does not exist or belongs to someone else")]
+    UnknownToolset,
+
     #[error(transparent)]
     Store(#[from] StoreError),
 
@@ -89,6 +94,10 @@ pub struct ApiToken {
     pub expires_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked: bool,
+    /// The user toolset the token is pinned to, a live link
+    pub toolset_id: Option<Uuid>,
+    /// Name of the pinned toolset
+    pub toolset_name: Option<String>,
 }
 
 /// What to issue a token for
@@ -98,6 +107,8 @@ pub struct NewToken<'a> {
     pub name: &'a str,
     pub scope_backends: &'a [String],
     pub scope_tools: &'a [String],
+    /// A toolset of the owner to pin the token to
+    pub toolset_id: Option<Uuid>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -122,6 +133,8 @@ pub struct TokenPrincipal {
     pub token: ApiToken,
     pub owner: User,
     pub is_service_account: bool,
+    /// Tools and backends of the pinned toolset as they are now, `None` when not pinned
+    pub toolset: Option<TokenScope>,
 }
 
 #[derive(FromRow)]
@@ -131,6 +144,10 @@ struct TokenAuthRow {
     name: String,
     scope_backends: Vec<String>,
     scope_tools: Vec<String>,
+    toolset_id: Option<Uuid>,
+    toolset_name: Option<String>,
+    toolset_tools: Option<Vec<String>>,
+    toolset_backends: Option<Vec<String>>,
     token_created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     last_used_at: Option<DateTime<Utc>>,
@@ -352,12 +369,31 @@ impl Store {
             return Err(TokenError::ExpiryTooLong(ceiling.as_secs() / 86_400));
         }
 
+        if let Some(toolset_id) = new.toolset_id {
+            let owned: Option<(Uuid,)> = sqlx::query_as(
+                "select id from user_toolsets where id = $1 and owner_id = $2 for share",
+            )
+            .bind(toolset_id)
+            .bind(new.owner_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if owned.is_none() {
+                return Err(TokenError::UnknownToolset);
+            }
+        }
+
         let token: ApiToken = sqlx::query_as(
-            "insert into api_tokens \
-                 (public_id, secret_hash, owner_id, name, scope_backends, scope_tools, expires_at) \
-             values ($1, $2, $3, $4, $5, $6, $7) \
-             returning id, public_id, owner_id, name, scope_backends, scope_tools, \
-                       created_at, expires_at, last_used_at, revoked_at is not null as revoked",
+            "with t as ( \
+                 insert into api_tokens \
+                     (public_id, secret_hash, owner_id, name, scope_backends, scope_tools, \
+                      toolset_id, expires_at) \
+                 values ($1, $2, $3, $4, $5, $6, $8, $7) \
+                 returning * \
+             ) \
+             select t.id, t.public_id, t.owner_id, t.name, t.scope_backends, t.scope_tools, \
+                    t.created_at, t.expires_at, t.last_used_at, t.revoked_at is not null as revoked, \
+                    t.toolset_id, s.name as toolset_name \
+             from t left join user_toolsets s on s.id = t.toolset_id",
         )
         .bind(&public_id)
         .bind(hash_secret(&secret))
@@ -366,6 +402,7 @@ impl Store {
         .bind(new.scope_backends)
         .bind(new.scope_tools)
         .bind(new.expires_at)
+        .bind(new.toolset_id)
         .fetch_one(&mut *tx)
         .await?;
         audit(
@@ -378,6 +415,7 @@ impl Store {
                 "name": new.name,
                 "scope_backends": new.scope_backends,
                 "scope_tools": new.scope_tools,
+                "toolset_id": new.toolset_id,
                 "expires_at": new.expires_at,
             }),
         )
@@ -396,9 +434,11 @@ impl Store {
     /// Fails when the query fails.
     pub async fn list_tokens(&self, owner_id: Uuid) -> Result<Vec<ApiToken>, StoreError> {
         Ok(sqlx::query_as(
-            "select id, public_id, owner_id, name, scope_backends, scope_tools, \
-                    created_at, expires_at, last_used_at, revoked_at is not null as revoked \
-             from api_tokens where owner_id = $1 order by created_at desc, id",
+            "select t.id, t.public_id, t.owner_id, t.name, t.scope_backends, t.scope_tools, \
+                    t.created_at, t.expires_at, t.last_used_at, t.revoked_at is not null as revoked, \
+                    t.toolset_id, s.name as toolset_name \
+             from api_tokens t left join user_toolsets s on s.id = t.toolset_id \
+             where t.owner_id = $1 order by t.created_at desc, t.id",
         )
         .bind(owner_id)
         .fetch_all(&self.pool)
@@ -459,10 +499,13 @@ impl Store {
         };
         let row: Option<TokenAuthRow> = sqlx::query_as(
             "select t.id as token_id, t.public_id, t.name, t.scope_backends, t.scope_tools, \
+                    s.id as toolset_id, s.name as toolset_name, s.tools as toolset_tools, \
+                    s.backends as toolset_backends, \
                     t.created_at as token_created_at, t.expires_at, t.last_used_at, t.secret_hash, \
                     u.id as owner_id, u.issuer, u.subject, u.email, u.display_name, \
                     u.groups, u.is_admin, u.kind \
              from api_tokens t join users u on u.id = t.owner_id \
+                  left join user_toolsets s on s.id = t.toolset_id \
              where t.public_id = $1 \
                and t.revoked_at is null \
                and t.expires_at > now() \
@@ -497,6 +540,10 @@ impl Store {
 
         Ok(Some(TokenPrincipal {
             is_service_account: row.kind == "service",
+            toolset: row
+                .toolset_tools
+                .zip(row.toolset_backends)
+                .map(|(tools, backends)| TokenScope { backends, tools }),
             token: ApiToken {
                 id: row.token_id,
                 public_id: row.public_id,
@@ -508,6 +555,8 @@ impl Store {
                 expires_at: row.expires_at,
                 last_used_at: row.last_used_at,
                 revoked: false,
+                toolset_id: row.toolset_id,
+                toolset_name: row.toolset_name,
             },
             owner: User {
                 id: row.owner_id,
@@ -572,6 +621,7 @@ mod tests {
                     name: "laptop",
                     scope_backends: &[],
                     scope_tools: &[],
+                    toolset_id: None,
                     expires_at,
                 },
             )
@@ -585,6 +635,7 @@ mod tests {
             name,
             scope_backends: &[],
             scope_tools: &[],
+            toolset_id: None,
             expires_at,
         }
     }
@@ -611,6 +662,8 @@ mod tests {
                 expires_at: Utc::now(),
                 last_used_at: None,
                 revoked: false,
+                toolset_id: None,
+                toolset_name: None,
             },
             plaintext: "axon_pat_plaintext-secret".to_string(),
         };
@@ -658,6 +711,7 @@ mod tests {
                     name: "laptop",
                     scope_backends: &["forgejo".to_string()],
                     scope_tools: &scope_tools,
+                    toolset_id: None,
                     expires_at: days(30),
                 },
             )

@@ -180,7 +180,7 @@ async fn authenticate_pat(
         .clone()
         .or_else(|| owner.display_name.clone())
         .unwrap_or_else(|| owner.id.to_string());
-    Ok(Caller::Principal(PrincipalPolicy::new(
+    let mut caller = PrincipalPolicy::new(
         format!("{owner_label} / {}", principal.token.name),
         policy.effective(&groups),
         opt_outs,
@@ -188,7 +188,12 @@ async fn authenticate_pat(
             backends: principal.token.scope_backends,
             tools: principal.token.scope_tools,
         },
-    )))
+    )
+    .with_identity(Some(owner.id), Some(principal.token.id));
+    if let Some(toolset) = principal.toolset {
+        caller = caller.with_toolset(toolset);
+    }
+    Ok(Caller::Principal(caller))
 }
 
 async fn opt_outs(store: &Store, user_id: Uuid) -> Result<OptOuts, Box<Response>> {

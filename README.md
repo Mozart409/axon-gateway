@@ -558,6 +558,113 @@ Creating the link (`break_glass.link_created`) and using it
 on `/ui/admin/users`. `--config` defaults to `AXON_GATEWAY_CONFIG`, then
 `config.toml`.
 
+## Tool-call audit
+
+In multi-user mode every `tools/call` made by a user or service account
+principal is recorded. Legacy `[[tokens]]` callers outside multi-user mode and
+the `auth_token` are not.
+
+**What is recorded.** One row per call: the time, the user, the principal
+label, the token id and its kind (`pat`, or `config_token` for a config
+`[[tokens]]` principal), the backend, the original tool name, the outcome, the
+JSON-RPC error code and message, the duration, the trace id, the client IP and
+the `User-Agent` (cut at 200 characters). The outcome is `ok`, `error` (a
+JSON-RPC error, which includes a tool the principal may not call: it is
+recorded under its real backend and name with code `-32601`) or `tool_error`
+(the tool answered with `isError`). Tool results are never stored, and neither
+are arguments in the log output.
+
+**Arguments** are kept apart from the row and expire sooner. What is stored
+depends on the capture mode:
+
+- the default follows the tool's MCP annotations: `readOnlyHint: true` stores
+  no arguments, anything else (an unannotated tool counts as potentially
+  destructive) stores them redacted,
+- `redacted` masks the value of every key containing `password`, `passwd`,
+  `secret`, `token`, `authorization`, `api_key`, `apikey`, `cookie`,
+  `credential` or `private_key` (case-insensitive, at any depth) with
+  `[redacted]`,
+- `full` keeps every value, `none` keeps nothing,
+- in every mode a string longer than 2 KiB is truncated with a
+  `[truncated]` marker.
+
+**Capture rules** override the default per backend (or `*` for all) and tool
+glob. A rule has a mode (`none` | `redacted` | `full`) and optional drop keys
+that are removed at any depth in `redacted` and `full` mode. The most specific
+matching rule wins: an exact backend over `*`, then an exact tool name over a
+glob, then the longer pattern, then the newer rule. A rule change applies to
+the next call of the process that made it; another replica picks it up within
+30 seconds.
+
+**Retention** defaults to 30 days for arguments and 365 days for the call
+rows. Admins change both on `/ui/admin/audit-settings` (1 to 3650 days); the
+purge runs hourly.
+
+**Permissions.** `audit.read` (role `auditor`) lists calls, rules and settings.
+Reading stored arguments needs `audit.read_sensitive`, and every read is itself
+audited as `audit.arguments_read`. Changing rules and settings needs
+`gateway.admin`. The `admin` role has all three.
+
+| Endpoint                                  | Method       | Needs                  |
+| ----------------------------------------- | ------------ | ---------------------- |
+| `/api/v1/tool-calls`                      | GET          | `audit.read`           |
+| `/api/v1/tool-calls/{id}`                 | GET          | `audit.read`           |
+| `/api/v1/tool-calls/{id}/arguments`       | POST         | `audit.read_sensitive` |
+| `/api/v1/audit/settings`                  | GET, PUT     | `audit.read`, `gateway.admin` to change |
+| `/api/v1/audit/capture-rules`             | GET, POST    | `audit.read`, `gateway.admin` to create |
+| `/api/v1/audit/capture-rules/{id}`        | DELETE       | `gateway.admin`        |
+
+`GET /api/v1/tool-calls` takes the filters `user`, `backend`, `tool` and
+`outcome`, plus `before` and `limit` (up to 200) to page; `next_before` in the
+answer is the `before` of the next page. A rule is
+`{"backend": "files", "tool_pattern": "read_*", "mode": "redacted", "drop_keys": ["body"]}`;
+settings are
+`{"arguments_retention_days": 30, "metadata_retention_days": 365}`. Like the
+other write routes they need the session's `X-CSRF-Token`. The pages are
+`/ui/admin/tool-calls` and `/ui/admin/audit-settings`.
+
+Two metrics watch the writer, which batches events and never blocks a call:
+`axon_audit_dropped_total` counts events dropped because the queue was full,
+and `axon_audit_write_errors_total` counts batches the database refused.
+
+**Data protection.** A call log ties a person to what they did, so it is
+personal data (GDPR) and, where staff use the gateway, a means to monitor
+their behaviour or performance: in Germany that needs the works council's
+agreement (BetrVG section 87(1) no. 6). The defaults store metadata and
+redacted arguments for a short time. Settle purpose, access and retention
+with the data protection officer and the works council before enabling `full`,
+and keep the retention as short as the purpose allows.
+
+## User toolsets
+
+A user keeps their own named toolsets, apart from the config ones above, on
+`/ui/toolsets` or through the API (a dashboard session, and the `X-CSRF-Token`
+for writes). A toolset is a name, a description and two narrowings: `tools`
+(globs over the namespaced tool name) and `backends` (exact names); an empty
+list does not narrow.
+
+| Endpoint                | Method | Description                                    |
+| ----------------------- | ------ | ---------------------------------------------- |
+| `/api/v1/toolsets`      | GET    | List your toolsets                             |
+| `/api/v1/toolsets`      | POST   | Create one: `{"name", "description", "tools", "backends"}` |
+| `/api/v1/toolsets/{id}` | GET    | One toolset                                    |
+| `/api/v1/toolsets/{id}` | PATCH  | Change the fields present in the body          |
+| `/api/v1/toolsets/{id}` | DELETE | Delete it; 409 while a valid token is pinned to it |
+
+Only your own toolsets exist for you: someone else's id is a 404.
+
+- **Pinning.** Create a token with `"toolset_id"` (`POST /api/v1/tokens`) to pin
+  it. The pin is a live link, not a copy: the token may use what the owner's
+  policy allows, inside the toolset, inside the token's own scope
+  (policy ∩ toolset ∩ scope), and an edit to the toolset applies to the token
+  at once. A service account token cannot be pinned.
+- **Endpoint.** `/mcp/toolset/{name}` resolves a toolset of the caller's own
+  with that name first and treats it like a pinned one: it narrows both the
+  tool list and the calls. Without such a toolset it serves the config toolset
+  of that name, which only filters the list.
+- **Deleting** a toolset that a still-valid token is pinned to answers 409.
+  Revoke or re-pin the token first.
+
 ## Tracing
 
 Logs go to stdout (`AXON_LOG_JSON=1` for JSON, `RUST_LOG` to filter). Set
@@ -579,6 +686,8 @@ Prometheus metrics are exposed at `/metrics`:
 - `axon_health_checks_total` - Health check counter
 - `axon_resource_reads_total` - Resource read counter
 - `axon_prompt_gets_total` - Prompt get counter
+- `axon_audit_dropped_total` - Tool-call audit events dropped on a full queue
+- `axon_audit_write_errors_total` - Tool-call audit batches the database refused
 
 ## Environment Variable References in Config
 

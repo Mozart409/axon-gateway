@@ -44,6 +44,7 @@ pub(super) fn routes() -> Router<AppState> {
             "/api/v1/service-accounts/{id}/tokens/{token_id}",
             delete(handle_revoke_account_token),
         )
+        .merge(super::toolsets_api::routes())
 }
 
 /// What a token looks like with its secret left out
@@ -55,6 +56,8 @@ fn token_json(token: &ApiToken) -> Value {
         "prefix": format!("{PAT_PREFIX}{}_", token.public_id),
         "scope_backends": token.scope_backends,
         "scope_tools": token.scope_tools,
+        "toolset_id": token.toolset_id,
+        "toolset_name": token.toolset_name,
         "created_at": token.created_at.to_rfc3339(),
         "expires_at": token.expires_at.to_rfc3339(),
         "last_used_at": token.last_used_at.map(|at| at.to_rfc3339()),
@@ -93,6 +96,8 @@ struct CreateTokenBody {
     /// Tool globs on the namespaced tool name; empty or absent means no narrowing
     #[serde(default)]
     scope_tools: Vec<String>,
+    /// One of the caller's toolsets to pin the token to; users' tokens only
+    toolset_id: Option<Uuid>,
 }
 
 impl CreateTokenBody {
@@ -125,7 +130,12 @@ async fn handle_create_token(
     ApiJson(body): ApiJson<CreateTokenBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let issued = my_tokens(&state, &session)?
-        .create(&body.name, body.expires_in_days, &body.scope())
+        .create(
+            &body.name,
+            body.expires_in_days,
+            &body.scope(),
+            body.toolset_id,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(issued_json(&issued))))
 }
@@ -225,6 +235,12 @@ async fn handle_create_account_token(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(body): ApiJson<CreateTokenBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    if body.toolset_id.is_some() {
+        return Err(AdminError::Invalid(
+            "a service account token cannot be pinned to a toolset".to_owned(),
+        )
+        .into());
+    }
     let issued = admin(&state, &session)
         .await?
         .issue_service_account_token(id, &body.name, body.expires_in_days, &body.scope())

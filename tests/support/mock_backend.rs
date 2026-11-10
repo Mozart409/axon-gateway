@@ -19,6 +19,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -164,6 +165,13 @@ impl MockBackendBuilder {
     /// Add a tool that succeeds (echoes its arguments).
     pub fn tool(mut self, name: &str) -> Self {
         self.tools.push(make_tool(name));
+        self
+    }
+
+    /// Add a tool that succeeds and is annotated `readOnlyHint: true`.
+    pub fn read_only_tool(mut self, name: &str) -> Self {
+        self.tools
+            .push(make_tool(name).with_annotations(ToolAnnotations::new().read_only(true)));
         self
     }
 

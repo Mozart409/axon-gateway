@@ -5,6 +5,8 @@
 //! presented. [`PrincipalPolicy::permits`] is the single check for `tools/list` and
 //! `tools/call`, so a tool that is hidden behaves exactly like one that does not exist.
 
+use uuid::Uuid;
+
 use crate::authz::tool_matches_pattern;
 use crate::policy::{EffectivePolicy, OptOuts, ToolRef};
 
@@ -38,6 +40,10 @@ pub struct PrincipalPolicy {
     effective: EffectivePolicy,
     opt_outs: OptOuts,
     scope: TokenScope,
+    /// The user toolset a token is pinned to, read live; narrows like `scope`
+    toolset: Option<TokenScope>,
+    owner_id: Option<Uuid>,
+    token_id: Option<Uuid>,
 }
 
 impl PrincipalPolicy {
@@ -53,7 +59,35 @@ impl PrincipalPolicy {
             effective,
             opt_outs,
             scope,
+            toolset: None,
+            owner_id: None,
+            token_id: None,
         }
+    }
+
+    /// Narrow further by a user toolset: a tool must pass the token scope and the toolset
+    #[must_use]
+    pub fn with_toolset(mut self, toolset: TokenScope) -> Self {
+        self.toolset = Some(toolset);
+        self
+    }
+
+    /// Record who the caller is: the owning user and, for a PAT, the token
+    #[must_use]
+    pub fn with_identity(mut self, owner_id: Option<Uuid>, token_id: Option<Uuid>) -> Self {
+        self.owner_id = owner_id;
+        self.token_id = token_id;
+        self
+    }
+
+    /// The owning user; `None` for a config `[[tokens]]` principal
+    pub fn owner_id(&self) -> Option<Uuid> {
+        self.owner_id
+    }
+
+    /// The personal access token presented; `None` for a config `[[tokens]]` principal
+    pub fn token_id(&self) -> Option<Uuid> {
+        self.token_id
     }
 
     /// Owner email, or service account name and token name
@@ -64,6 +98,10 @@ impl PrincipalPolicy {
     /// Backend usable at all: granted to the principal and inside the token scope
     pub fn backend_permitted(&self, backend: &str) -> bool {
         self.scope.allows_backend(backend)
+            && self
+                .toolset
+                .as_ref()
+                .is_none_or(|toolset| toolset.allows_backend(backend))
             && self
                 .effective
                 .backends()
@@ -78,6 +116,9 @@ impl PrincipalPolicy {
     pub fn permits(&self, tool: ToolRef<'_>, namespaced: &str) -> bool {
         self.scope.allows_backend(tool.backend)
             && self.scope.allows_tool(namespaced)
+            && self.toolset.as_ref().is_none_or(|toolset| {
+                toolset.allows_backend(tool.backend) && toolset.allows_tool(namespaced)
+            })
             && self.effective.visible(tool, &self.opt_outs)
     }
 }
@@ -230,6 +271,48 @@ mod tests {
         let by_glob = principal(&["dev"], OptOuts::default(), scope(&[], &["forgejo_get_*"]));
         assert!(!by_glob.permits(tool("forgejo", "whoami"), "forgejo_whoami"));
         assert!(by_glob.permits(tool("forgejo", "get_repo"), "forgejo_get_repo"));
+    }
+
+    #[test]
+    fn toolset_intersects_with_the_token_scope() {
+        let policy = principal(&["it", "dev"], OptOuts::default(), scope(&[], &["prom_*"]))
+            .with_toolset(scope(&[], &["prom_query*", "forgejo_get_repo"]));
+        assert!(policy.permits(tool("prom", "query"), "prom_query"));
+        // in the token scope, outside the toolset
+        assert!(!policy.permits(tool("prom", "series"), "prom_series"));
+        // in the toolset, outside the token scope
+        assert!(!policy.permits(tool("forgejo", "get_repo"), "forgejo_get_repo"));
+    }
+
+    #[test]
+    fn toolset_backends_narrow_and_never_widen() {
+        let policy = principal(&["it", "dev"], OptOuts::default(), TokenScope::default())
+            .with_toolset(scope(&["forgejo", "loki"], &[]));
+        assert!(policy.backend_permitted("forgejo"));
+        assert!(!policy.backend_permitted("prom"));
+        assert!(!policy.permits(tool("prom", "query"), "prom_query"));
+        assert!(policy.permits(tool("forgejo", "get_repo"), "forgejo_get_repo"));
+        // not granted, so the toolset cannot add it
+        assert!(!policy.backend_permitted("loki"));
+    }
+
+    #[test]
+    fn empty_toolset_does_not_narrow() {
+        let policy = principal(&["it"], OptOuts::default(), TokenScope::default())
+            .with_toolset(TokenScope::default());
+        assert!(policy.permits(tool("prom", "query"), "prom_query"));
+        assert!(policy.backend_permitted("prom"));
+    }
+
+    #[test]
+    fn identity_defaults_to_none_and_is_set_by_the_builder() {
+        let policy = principal(&["it"], OptOuts::default(), TokenScope::default());
+        assert_eq!(policy.owner_id(), None);
+        assert_eq!(policy.token_id(), None);
+        let (owner, token) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let policy = policy.with_identity(Some(owner), Some(token));
+        assert_eq!(policy.owner_id(), Some(owner));
+        assert_eq!(policy.token_id(), Some(token));
     }
 
     #[test]

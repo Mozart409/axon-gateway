@@ -235,6 +235,20 @@ pub fn record_response_status(span: &Span, status: StatusCode) {
     span.record("http.response.status_code", i64::from(status.as_u16()));
 }
 
+/// The trace id of the current span as 32 hex digits, `None` when there is no
+/// valid `OpenTelemetry` context (no `OTel` layer installed).
+#[must_use]
+pub fn current_trace_id() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt;
+
+    let context = Span::current().context();
+    let span = context.span();
+    let span_context = span.span_context();
+    span_context
+        .is_valid()
+        .then(|| span_context.trace_id().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use opentelemetry::trace::{TraceContextExt, TraceId};
