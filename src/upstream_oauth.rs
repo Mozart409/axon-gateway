@@ -7,9 +7,11 @@
 //! is in `store::upstream_oauth`; sealing is here, with an AAD that binds each
 //! secret to its row.
 //!
-//! Every request goes through [`Fetcher`]: DNS-pinned and policy-checked when an
-//! [`EgressPolicy`] is given, no redirects, 10 s, response bodies capped at 64 KiB.
-//! Errors carry the server's `error` and `error_description`, never a token.
+//! Every request goes through [`Fetcher`]: a URL on the backend's own origin is
+//! trusted, any other (the issuer and endpoints the backend names) is checked by
+//! the [`EgressPolicy`] and DNS-pinned, or refused without one. No redirects,
+//! 10 s, response bodies capped at 64 KiB. Errors carry the server's `error` and
+//! a truncated `error_description`, never other body content or a token.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -156,10 +158,22 @@ impl fmt::Debug for TokenResponse {
     }
 }
 
+/// Which URLs a [`Fetcher`] may reach
+#[derive(Debug, Clone)]
+enum Scope<'a> {
+    /// Every http(s) URL; for endpoints that come from admin configuration
+    Unrestricted,
+    /// URLs on the backend's origin; any other origin goes through the policy
+    Backend {
+        origin: String,
+        policy: Option<&'a EgressPolicy>,
+    },
+}
+
 /// Sends requests to backends and their authorization servers
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Fetcher<'a> {
-    policy: Option<&'a EgressPolicy>,
+    scope: Scope<'a>,
 }
 
 struct Reply {
@@ -168,18 +182,52 @@ struct Reply {
 }
 
 impl<'a> Fetcher<'a> {
-    /// With a policy every URL is checked and the connection pinned to the
-    /// checked address; without, a plain client that follows no redirects.
+    /// For the upstream OAuth flow of a catalog backend. The URLs it discovers
+    /// (issuer, metadata, token and registration endpoints) are named by the
+    /// backend, so only the backend's own origin (scheme, host and port) is
+    /// trusted. Any other origin is checked by `policy` and the connection
+    /// pinned to the checked address; without a policy it is refused.
+    ///
+    /// # Errors
+    /// [`UpstreamOauthError::Url`] when `backend_url` is not an http(s) URL.
+    pub fn for_backend(
+        backend_url: &str,
+        policy: Option<&'a EgressPolicy>,
+    ) -> Result<Self, UpstreamOauthError> {
+        let backend = parse_http_url(backend_url)?;
+        Ok(Self {
+            scope: Scope::Backend {
+                origin: origin_of(&backend),
+                policy,
+            },
+        })
+    }
+
+    /// No egress restriction, no redirects. Only for the configured
+    /// `[[auth.oidc]]` provider's endpoints: they come from admin config, not
+    /// from a backend.
     #[must_use]
-    pub fn new(policy: Option<&'a EgressPolicy>) -> Self {
-        Self { policy }
+    pub fn trusted() -> Self {
+        Self {
+            scope: Scope::Unrestricted,
+        }
     }
 
     async fn client(&self, url: &str) -> Result<reqwest::Client, UpstreamOauthError> {
-        if let Some(policy) = self.policy {
+        let parsed = parse_http_url(url)?;
+        let foreign = match &self.scope {
+            Scope::Unrestricted => None,
+            Scope::Backend { origin, policy } => (origin_of(&parsed) != *origin).then_some(*policy),
+        };
+        if let Some(policy) = foreign {
+            let Some(policy) = policy else {
+                return Err(UpstreamOauthError::Metadata(format!(
+                    "the authorization server at {} is not on the backend's host and no egress policy allows it",
+                    origin_of(&parsed)
+                )));
+            };
             return Ok(policy.check_url(url).await?.client(HTTP_TIMEOUT)?);
         }
-        parse_http_url(url)?;
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(HTTP_TIMEOUT)
@@ -401,7 +449,8 @@ async fn get_document<T: DeserializeOwned>(
     }
     serde_json::from_slice(&reply.body)
         .map(Fetched::Found)
-        .map_err(|e| UpstreamOauthError::Metadata(format!("invalid {what} at {url}: {e}")))
+        // No `{e}`: a serde error can quote values of the body.
+        .map_err(|_| UpstreamOauthError::Metadata(format!("invalid {what} at {}", clip(url))))
 }
 
 /// Checks a metadata document against the issuer it was asked for: the issuer
@@ -415,8 +464,8 @@ pub fn check_metadata(
 ) -> Result<(), UpstreamOauthError> {
     if metadata.issuer != issuer {
         return Err(UpstreamOauthError::IssuerMismatch {
-            expected: issuer.to_owned(),
-            got: metadata.issuer.clone(),
+            expected: clip(issuer),
+            got: clip(&metadata.issuer),
         });
     }
     if metadata
@@ -427,6 +476,23 @@ pub fn check_metadata(
         return Err(UpstreamOauthError::NoS256);
     }
     Ok(())
+}
+
+/// The authorization endpoint is only handed to the user's browser, never
+/// requested by the gateway, so it needs no egress check: any `http` or
+/// `https` URL with a host will do, nothing else (no `javascript:` or `data:`).
+///
+/// # Errors
+/// [`UpstreamOauthError::Metadata`] for any other scheme or an unparsable URL.
+pub fn check_authorization_endpoint(endpoint: &str) -> Result<(), UpstreamOauthError> {
+    let url = Url::parse(endpoint).ok().filter(|url| {
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|h| !h.is_empty())
+    });
+    url.map(|_| ()).ok_or_else(|| {
+        UpstreamOauthError::Metadata(String::from(
+            "the authorization endpoint must be an http or https URL",
+        ))
+    })
 }
 
 /// Finds the authorization server of a backend. `resource_metadata_url` is the
@@ -488,10 +554,12 @@ pub async fn discover(
     }
     let metadata = metadata.ok_or_else(|| {
         UpstreamOauthError::Metadata(format!(
-            "no authorization server metadata found for {issuer}"
+            "no authorization server metadata found for {}",
+            clip(&issuer)
         ))
     })?;
     check_metadata(&issuer, &metadata)?;
+    check_authorization_endpoint(&metadata.authorization_endpoint)?;
     Ok(Discovery {
         issuer,
         metadata,
@@ -594,7 +662,7 @@ pub async fn register_client(
         return Err(refused(&reply));
     }
     let registration: Registration = serde_json::from_slice(&reply.body)
-        .map_err(|e| UpstreamOauthError::BadResponse(format!("registration: {e}")))?;
+        .map_err(|_| UpstreamOauthError::BadResponse(String::from("registration: not a client")))?;
     if registration.client_id.is_empty() {
         return Err(UpstreamOauthError::BadResponse(String::from(
             "registration: no client_id",
@@ -884,6 +952,12 @@ fn on_behalf_of_form(client_id: &str, client_secret: &str, assertion: &str, scop
     ]
 }
 
+/// At most [`MAX_DESCRIPTION_CHARS`] characters of text a server supplied, for
+/// an error message
+fn clip(text: &str) -> String {
+    text.chars().take(MAX_DESCRIPTION_CHARS).collect()
+}
+
 /// An OAuth error answer, or a plain failure status
 fn refused(reply: &Reply) -> UpstreamOauthError {
     #[derive(Deserialize)]
@@ -899,11 +973,8 @@ fn refused(reply: &Reply) -> UpstreamOauthError {
             error,
             error_description,
         }) if !error.is_empty() => {
-            let description: String = error_description
-                .unwrap_or_default()
-                .chars()
-                .take(MAX_DESCRIPTION_CHARS)
-                .collect();
+            let error = clip(&error);
+            let description = clip(&error_description.unwrap_or_default());
             let message = if description.is_empty() {
                 error.clone()
             } else {
@@ -944,8 +1015,9 @@ pub fn parse_token_response(
         #[serde(default)]
         scope: Option<String>,
     }
-    let raw: Raw = serde_json::from_slice(body)
-        .map_err(|e| UpstreamOauthError::BadResponse(format!("token response: {e}")))?;
+    let raw: Raw = serde_json::from_slice(body).map_err(|_| {
+        UpstreamOauthError::BadResponse(String::from("token response: not a token"))
+    })?;
     if raw.access_token.is_empty() {
         return Err(UpstreamOauthError::BadResponse(String::from(
             "token response: empty access_token",
@@ -1729,5 +1801,107 @@ mod tests {
             "shh"
         );
         assert!(open_client_secret(&keyring, "wiki", "https://other", &sealed).is_err());
+    }
+
+    const BACKEND: &str = "https://mcp.example.com/mcp";
+
+    #[tokio::test]
+    async fn same_origin_needs_no_policy() {
+        let fetcher = Fetcher::for_backend(BACKEND, None).unwrap();
+        for url in [
+            "https://mcp.example.com/token",
+            "https://mcp.example.com:443/register",
+        ] {
+            assert!(fetcher.client(url).await.is_ok(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_origin_without_a_policy_is_refused() {
+        let fetcher = Fetcher::for_backend(BACKEND, None).unwrap();
+        for url in [
+            "https://as.example.com/token",
+            "http://mcp.example.com/token",
+            "https://mcp.example.com:8443/token",
+        ] {
+            let error = fetcher.client(url).await.unwrap_err();
+            assert!(
+                matches!(&error, UpstreamOauthError::Metadata(m) if m.contains("no egress policy")),
+                "{url}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn other_origin_goes_through_the_policy() {
+        let deny = EgressPolicy::new(&[], &[]).unwrap();
+        let fetcher = Fetcher::for_backend(BACKEND, Some(&deny)).unwrap();
+        for url in ["http://127.0.0.1:9/token", "http://169.254.169.254/latest"] {
+            let error = fetcher.client(url).await.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    UpstreamOauthError::Egress(EgressError::Denied { .. })
+                ),
+                "{url}: {error}"
+            );
+        }
+        let allow = EgressPolicy::new(&[String::from("127.0.0.1/32")], &[]).unwrap();
+        let fetcher = Fetcher::for_backend(BACKEND, Some(&allow)).unwrap();
+        assert!(fetcher.client("http://127.0.0.1:9/token").await.is_ok());
+        assert!(fetcher.client("http://169.254.169.254/").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_fetcher_reaches_any_origin() {
+        assert!(
+            Fetcher::trusted()
+                .client("http://127.0.0.1:9/token")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn authorization_endpoint_is_an_http_url() {
+        for ok in [
+            "https://as.example.com/authorize",
+            "http://localhost:8080/authorize",
+            "http://other-host/authorize",
+        ] {
+            check_authorization_endpoint(ok).unwrap();
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "file:///etc/passwd",
+            "/authorize",
+        ] {
+            assert!(check_authorization_endpoint(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn refused_keeps_only_the_error_and_a_clipped_description() {
+        let long = "x".repeat(500);
+        let reply = Reply {
+            status: StatusCode::BAD_REQUEST,
+            body: serde_json::to_vec(
+                &json!({"error": "invalid_grant", "error_description": long, "secret": "hunter2"}),
+            )
+            .unwrap(),
+        };
+        let UpstreamOauthError::Refused { code, message, .. } = refused(&reply) else {
+            panic!("not refused");
+        };
+        assert_eq!(code, "invalid_grant");
+        assert!(!message.contains("hunter2"));
+        assert_eq!(message.chars().count(), "invalid_grant ()".len() + 200);
+        let reply = Reply {
+            status: StatusCode::BAD_GATEWAY,
+            body: b"<html>internal page</html>".to_vec(),
+        };
+        let error = refused(&reply).to_string();
+        assert!(!error.contains("internal page"), "{error}");
     }
 }

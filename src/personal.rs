@@ -715,10 +715,12 @@ impl PersonalHub {
             CatalogAuth::OAuth { client, .. } => client.clone(),
             CatalogAuth::Fields | CatalogAuth::Passthrough(_) => None,
         };
-        // Catalog entries are admin-defined and connect without an egress policy
-        let http = Fetcher::new(None);
         let upstream =
             |error: upstream_oauth::UpstreamOauthError| ConnectError::Upstream(error.to_string());
+        // The backend URL is admin-defined, but the issuer and endpoints
+        // discovered from it are not: off the backend's origin they need the
+        // egress policy.
+        let http = Fetcher::for_backend(&item.url, Some(self.egress.as_ref())).map_err(upstream)?;
         let discovery = upstream_oauth::discover(&http, &item.url, None)
             .await
             .map_err(upstream)?;
@@ -862,8 +864,10 @@ impl PersonalHub {
             .await;
         let method = TokenAuthMethod::parse(&request.token_auth_method)
             .unwrap_or_else(|| TokenAuthMethod::choose(&client, None));
+        let http = Fetcher::for_backend(&item.url, Some(self.egress.as_ref()))
+            .map_err(|error| ConnectError::Exchange(error.to_string()))?;
         let response = upstream_oauth::exchange_code(
-            &Fetcher::new(None),
+            &http,
             &request.token_endpoint,
             method,
             &client,
@@ -1313,16 +1317,23 @@ impl PersonalHub {
             .await;
         let method = TokenAuthMethod::parse(&row.token_auth_method)
             .unwrap_or_else(|| TokenAuthMethod::choose(&client, None));
-        let refreshed = upstream_oauth::refresh_tokens(
-            &Fetcher::new(None),
-            &row.token_endpoint,
-            method,
-            &client,
-            refresh_token,
-            None,
-            Some(&item.url),
-        )
-        .await;
+        // The stored token endpoint came from the backend's metadata: it gets
+        // the same origin-or-policy rule as at connect time.
+        let refreshed = match Fetcher::for_backend(&item.url, Some(self.egress.as_ref())) {
+            Ok(http) => {
+                upstream_oauth::refresh_tokens(
+                    &http,
+                    &row.token_endpoint,
+                    method,
+                    &client,
+                    refresh_token,
+                    None,
+                    Some(&item.url),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         match refreshed {
             Ok(response) => {
                 let secret = match upstream_oauth::seal_tokens(
@@ -1482,7 +1493,9 @@ impl PersonalHub {
             }
         };
         let app = provider.app_credentials();
-        let http = Fetcher::new(None);
+        // The token endpoint is the configured `[[auth.oidc]]` provider's, not a
+        // backend's, so it is not egress-restricted
+        let http = Fetcher::trusted();
         let exchanged = match config.grant {
             PassthroughGrant::TokenExchange => {
                 upstream_oauth::token_exchange(
@@ -1564,7 +1577,8 @@ impl PersonalHub {
         let scopes = provider.scopes();
         let scope = (!scopes.is_empty()).then(|| scopes.join(" "));
         let refreshed = upstream_oauth::refresh_idp_token(
-            &Fetcher::new(None),
+            // The configured `[[auth.oidc]]` provider's endpoint, not a backend's
+            &Fetcher::trusted(),
             &TokenEndpoint {
                 url: &token_endpoint,
                 auth_methods: auth_methods.as_deref(),
