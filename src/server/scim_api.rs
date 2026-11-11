@@ -70,6 +70,7 @@ impl From<ScimStoreError> for Failure {
             ScimStoreError::Conflict(message) => Self(ScimError::uniqueness(message)),
             ScimStoreError::NotFound => Self(not_found()),
             ScimStoreError::Invalid(message) => Self(ScimError::invalid_value(message)),
+            ScimStoreError::Patch(error) => Self(error),
             ScimStoreError::Store(error) => error.into(),
         }
     }
@@ -403,17 +404,12 @@ async fn handle_patch_user(
     body: Bytes,
 ) -> ScimResult<Response> {
     let id = parse_id(&id)?;
-    let store = store(&state)?;
-    let existing = store
-        .get_scim_user(&ctx.provider, id)
-        .await?
-        .ok_or_else(|| Failure(not_found()))?;
     let operations = scim::parse_patch(&parse_body(&body)?)?;
-    let mut attrs = existing.attrs();
-    scim::apply_user_patch(&mut attrs, &operations)?;
     let rule = link_rule(&state, &ctx.provider).await;
-    let user = store
-        .replace_scim_user(&ctx.provider, &rule, id, &attrs)
+    let user = store(&state)?
+        .patch_scim_user(&ctx.provider, &rule, id, |attrs| {
+            scim::apply_user_patch(attrs, &operations)
+        })
         .await?;
     Ok(scim_response(
         StatusCode::OK,

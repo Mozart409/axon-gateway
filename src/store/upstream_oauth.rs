@@ -9,11 +9,13 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::personal::SealedColumns;
-use super::{Store, StoreError};
+use super::rbac::audit;
+use super::{Actor, Store, StoreError};
 
 /// How long an authorization request waits for the redirect back
 const REQUEST_TTL: Duration = Duration::from_mins(10);
@@ -424,22 +426,87 @@ impl Store {
         Ok(rows.into_iter().map(UpstreamToken::from).collect())
     }
 
-    /// Deletes the tokens of `user_id` for `backend`. `false` when there are none.
+    /// Connects `token.user_id` to `token.backend` on the user's behalf and
+    /// records `oauth.connect` in the audit log, in one transaction.
     ///
     /// # Errors
-    /// Fails when the query fails.
-    pub async fn delete_upstream_token(
+    /// Fails when a query fails (an unknown user included).
+    pub async fn connect_upstream_token(
         &self,
+        actor: &Actor,
+        token: &NewUpstreamToken<'_>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // Delete first: the notify trigger fires on insert and delete only, so
+        // a reconnect makes the other replicas drop the old connection
+        sqlx::query("delete from upstream_oauth_tokens where user_id = $1 and backend = $2")
+            .bind(token.user_id)
+            .bind(token.backend)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "insert into upstream_oauth_tokens \
+             (user_id, backend, issuer, client_id, token_endpoint, scope, token_auth_method, \
+              secret_kek_id, secret_dek, secret_data, expires_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(token.user_id)
+        .bind(token.backend)
+        .bind(token.issuer)
+        .bind(token.client_id)
+        .bind(token.token_endpoint)
+        .bind(token.scope)
+        .bind(token.token_auth_method)
+        .bind(&token.secret.kek_id)
+        .bind(&token.secret.dek)
+        .bind(&token.secret.data)
+        .bind(token.expires_at)
+        .execute(&mut *tx)
+        .await?;
+        audit(
+            &mut tx,
+            actor,
+            "oauth.connect",
+            &format!("backend:{}", token.backend),
+            json!({ "issuer": token.issuer, "scope": token.scope }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Disconnects `user_id` from `backend` and records `oauth.disconnect` in
+    /// the audit log, in one transaction. `false` (and no audit row) when there
+    /// were no tokens.
+    ///
+    /// # Errors
+    /// Fails when a query fails.
+    pub async fn disconnect_upstream_token(
+        &self,
+        actor: &Actor,
         user_id: Uuid,
         backend: &str,
     ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
         let result =
             sqlx::query("delete from upstream_oauth_tokens where user_id = $1 and backend = $2")
                 .bind(user_id)
                 .bind(backend)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        audit(
+            &mut tx,
+            actor,
+            "oauth.disconnect",
+            &format!("backend:{backend}"),
+            json!({}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Records why a refresh failed (cut to 500 characters). Does not notify

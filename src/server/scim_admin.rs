@@ -119,9 +119,16 @@ fn authorize<'a>(
     session: &SessionUser,
 ) -> Result<(&'a Store, &'a crate::oidc::OidcProviders), AdminError> {
     let (store, providers) = state.multi_user().ok_or(AdminError::NotFound)?;
-    let (_, permissions) = resolve(&state.policy.current(), session);
+    let policy = state.policy.current();
+    let (_, permissions) = resolve(&policy, session);
+    // A SCIM token can put any user into any SCIM group, and those names feed the
+    // IdP group mappings, so the minter must hold what every bound role grants.
     let allowed = permissions.is_admin()
-        || (permissions.has(Permission::UsersManage) && permissions.has(Permission::GroupsManage));
+        || (permissions.has(Permission::UsersManage)
+            && permissions.has(Permission::GroupsManage)
+            && permissions
+                .missing(&policy.bound_group_permissions())
+                .is_empty());
     if allowed {
         Ok((store, providers))
     } else {

@@ -673,8 +673,8 @@ are `{"error": "..."}` with 400 (invalid input, bad JSON), 403, 404, 409 or 503
 | `/api/v1/me`                                  | GET           | a session                   |
 | `/api/v1/groups`                              | GET, POST     | reads `groups.manage`, `roles.manage` or `audit.read`; writes `groups.manage` |
 | `/api/v1/groups/{name}`                       | GET, PATCH, DELETE | reads as above; writes `groups.manage` |
-| `/api/v1/groups/{name}/idp-mappings`          | POST, DELETE  | `groups.manage`             |
-| `/api/v1/groups/{name}/members/{user_id}`     | PUT, DELETE   | `groups.manage`             |
+| `/api/v1/groups/{name}/idp-mappings`          | POST, DELETE  | `groups.manage`; adding also every permission of the roles bound to the group |
+| `/api/v1/groups/{name}/members/{user_id}`     | PUT, DELETE   | `groups.manage`; adding also every permission of the roles bound to the group |
 | `/api/v1/grants`                              | GET, POST     | reads `groups.manage`, `roles.manage` or `audit.read`; writes `groups.manage` |
 | `/api/v1/grants/{id}`                         | DELETE        | `groups.manage`             |
 | `/api/v1/role-bindings`                       | GET, POST     | reads `groups.manage`, `roles.manage` or `audit.read`; writes `roles.manage` and the role's permissions |
@@ -826,7 +826,9 @@ for a provider is
 ```
 
 **Token.** Every SCIM request carries a bearer token that belongs to one
-provider. An admin with `users.manage` and `groups.manage` creates it on
+provider. An admin, or a user with `users.manage`, `groups.manage` and every
+permission any role bound to a group carries (a SCIM token reaches every
+group through the IdP mappings), creates it on
 `/ui/admin/scim` or with `POST /api/v1/admin/scim/{provider}/token` (session and
 CSRF token like the rest of `/api/v1`; answers 201 with `{"token", "base_url"}`).
 The token (`axon_scim_...`) is shown once and only its hash is stored. Creating
@@ -1040,7 +1042,8 @@ lasts 10 minutes and is single use; an authorization server that returns `iss`
 is checked against the one the gateway started with. The tokens are refreshed
 shortly before they expire; if a refresh fails the catalog shows "Reconnect
 needed" with the reason, and **Disconnect** removes them. Connecting again
-replaces the old connection on every replica. `base_url` must be the gateway's
+replaces the old connection on every replica. Both are audited
+(`oauth.connect`, `oauth.disconnect`, target `backend:<name>`). `base_url` must be the gateway's
 public URL, since the redirect URI and the metadata document are built from it.
 
 **Identity passthrough (`credential_mode = "passthrough"`).** The user signs in
@@ -1068,6 +1071,7 @@ credential_mode = "passthrough"
 grant = "entra_obo"                  # or "token_exchange" (RFC 8693)
 provider = "entra"                   # id of the [[auth.oidc]] provider
 scope = "api://reports/.default"     # required for entra_obo
+# assertion_scope = "api://axon/.default"  # entra_obo: the gateway's own API
 # audience = "reports"               # token exchange `audience`
 # resource = "https://reports.example.com"   # token exchange `resource`
 ```
@@ -1081,9 +1085,14 @@ set. The subject token it starts from is the user's identity provider token:
   above; the provider needs `accept_access_tokens = true`), or else
 - the refresh token the provider gave at the dashboard login, which the
   gateway keeps sealed. The provider's `scopes` must include `offline_access`
-  for it to give one, and for Entra OBO a scope of the gateway's own API, so
-  that the token's audience is the gateway. Users who signed in before the
-  change sign in again once.
+  for it to give one. For `entra_obo` the gateway refreshes it with the login
+  scopes plus `assertion_scope` (default `api://<client_id>/.default`, Entra's
+  default Application ID URI of the gateway's app registration), so that the
+  token's audience is the gateway and not Microsoft Graph; set
+  `assertion_scope` when the app has another Application ID URI. Users who
+  signed in before the change sign in again once. Serve `token_exchange` and
+  `entra_obo` backends from different providers: both share the cached
+  subject token of a provider.
 
 A user with neither (no recent request with a JWT, no stored refresh token)
 gets no tools of that backend until they sign in again.

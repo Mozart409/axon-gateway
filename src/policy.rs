@@ -1050,6 +1050,32 @@ impl Policy {
         self.role_bindings.clone()
     }
 
+    /// The union of what the roles bound to a group allow, in [`Permission::ALL`]
+    /// order. A role that no longer exists contributes nothing.
+    pub fn group_permissions(&self, group: &str) -> Vec<Permission> {
+        self.bound_permissions(|name| name == group)
+    }
+
+    /// The union of what the roles bound to any group allow: what a member of
+    /// the most privileged group can do.
+    pub fn bound_group_permissions(&self) -> Vec<Permission> {
+        self.bound_permissions(|_| true)
+    }
+
+    fn bound_permissions(&self, group: impl Fn(&str) -> bool) -> Vec<Permission> {
+        self.role_bindings
+            .iter()
+            .filter_map(|binding| match &binding.subject {
+                RoleSubject::Group(name) if group(name) => self.permissions_of(&binding.role),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Users that are members of a database group, sorted
     pub fn members_of(&self, group: &str) -> Vec<Uuid> {
         self.memberships
@@ -2300,6 +2326,53 @@ mod tests {
             Some(vec![Permission::AuditRead])
         );
         assert_eq!(policy.role_permissions("nope"), None);
+    }
+
+    #[test]
+    fn group_permissions_are_the_union_of_the_bound_roles() {
+        let config = RbacConfig {
+            groups: vec![
+                group("sec", &[("entra", "id-sec")]),
+                group("ops", &[("entra", "id-ops")]),
+                group("plain", &[("entra", "id-plain")]),
+            ],
+            role_bindings: vec![
+                RoleBindingConfig {
+                    role: "log-reader".to_string(),
+                    group: "sec".to_string(),
+                },
+                RoleBindingConfig {
+                    role: "auditor".to_string(),
+                    group: "sec".to_string(),
+                },
+                RoleBindingConfig {
+                    role: "backend-admin".to_string(),
+                    group: "ops".to_string(),
+                },
+            ],
+            roles: vec![role_config("log-reader", &["audit.read"])],
+            ..RbacConfig::default()
+        };
+        assert_eq!(config.validate(&[], &["entra"]), Ok(()));
+        let policy = Policy::from_config(&config);
+
+        let mut sec = policy.role_permissions("log-reader").unwrap();
+        sec.extend(policy.role_permissions("auditor").unwrap());
+        sec.sort();
+        sec.dedup();
+        assert_eq!(policy.group_permissions("sec"), sec);
+        assert_eq!(
+            policy.group_permissions("ops"),
+            policy.role_permissions("backend-admin").unwrap()
+        );
+        assert_eq!(policy.group_permissions("plain"), vec![]);
+        assert_eq!(policy.group_permissions("nope"), vec![]);
+
+        let mut all = sec;
+        all.extend(policy.group_permissions("ops"));
+        all.sort();
+        all.dedup();
+        assert_eq!(policy.bound_group_permissions(), all);
     }
 
     #[test]

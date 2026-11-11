@@ -132,11 +132,16 @@ impl Harness {
 
     /// A complete login as the user the mock provider is set to.
     async fn login_as(&self, subject: &str, email: &str) -> Session {
+        self.login_with_groups(subject, email, &[]).await
+    }
+
+    /// [`Harness::login_as`] with a groups claim.
+    async fn login_with_groups(&self, subject: &str, email: &str, groups: &[&str]) -> Session {
         self.idp.set_user(json!({
             "sub": subject,
             "email": email,
             "name": subject,
-            "groups": [],
+            "groups": groups,
         }));
         let resp = self
             .client
@@ -257,6 +262,20 @@ impl Harness {
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(location(&resp), "/ui/catalog");
         authorize_url
+    }
+
+    /// The audit rows (newest first) with `action`, read as an admin of the
+    /// `admins` group.
+    async fn audit_rows(&self, admin: &Session, action: &str) -> Vec<Value> {
+        let (status, body) = self.send(Method::GET, "/api/v1/audit", admin, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no entries in {body}"))
+            .iter()
+            .filter(|entry| entry["action"] == action)
+            .cloned()
+            .collect()
     }
 
     /// `GET /api/v1/me/connections`.
@@ -469,11 +488,16 @@ fn assert_called(body: &Value) {
 async fn connecting_through_dynamic_registration_gives_the_user_their_tools() {
     let upstream = MockUpstream::start().await;
     let backend = protected_backend(&upstream).await;
-    let Some(h) = Harness::start("axon_upstream_dcr", "", &[], |builder| {
-        builder
-            .raw_backend(&oauth_entry("wiki", &backend.url()))
-            .rbac(&grants(&["wiki"]))
-    })
+    let Some(h) = Harness::start(
+        "axon_upstream_dcr",
+        "admin_groups = [\"admins\"]",
+        &[],
+        |builder| {
+            builder
+                .raw_backend(&oauth_entry("wiki", &backend.url()))
+                .rbac(&grants(&["wiki"]))
+        },
+    )
     .await
     else {
         return;
@@ -525,6 +549,16 @@ async fn connecting_through_dynamic_registration_gives_the_user_their_tools() {
     assert_eq!(connections[0]["backend"], "wiki");
     assert_eq!(connections[0]["issuer"], upstream.issuer());
     assert!(connections[0]["last_error"].is_null(), "{connections:?}");
+
+    // The connection is in the audit log, with who made it.
+    let root = h
+        .login_with_groups("root", "root@example.com", &["admins"])
+        .await;
+    let connected = h.audit_rows(&root, "oauth.connect").await;
+    assert_eq!(connected.len(), 1, "{connected:?}");
+    assert_eq!(connected[0]["target"], "backend:wiki");
+    assert_eq!(connected[0]["actor"], "alice@example.com");
+    assert_eq!(connected[0]["details"]["issuer"], upstream.issuer());
 
     // Alice's tools include the backend's, prefixed, and calls reach it with
     // her upstream access token.
@@ -739,11 +773,16 @@ async fn the_callback_refuses_foreign_unknown_and_mismatched_requests() {
 async fn disconnecting_removes_the_tools_and_the_connection() {
     let upstream = MockUpstream::start().await;
     let backend = protected_backend(&upstream).await;
-    let Some(h) = Harness::start("axon_upstream_disconnect", "", &[], |builder| {
-        builder
-            .raw_backend(&oauth_entry("wiki", &backend.url()))
-            .rbac(&grants(&["wiki"]))
-    })
+    let Some(h) = Harness::start(
+        "axon_upstream_disconnect",
+        "admin_groups = [\"admins\"]",
+        &[],
+        |builder| {
+            builder
+                .raw_backend(&oauth_entry("wiki", &backend.url()))
+                .rbac(&grants(&["wiki"]))
+        },
+    )
     .await
     else {
         return;
@@ -760,6 +799,13 @@ async fn disconnecting_removes_the_tools_and_the_connection() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert!(h.wait_for_tool(&alice_pat, "wiki_echo", false).await);
     assert_eq!(h.connections(&alice).await, [] as [serde_json::Value; 0]);
+    let root = h
+        .login_with_groups("root", "root@example.com", &["admins"])
+        .await;
+    let disconnected = h.audit_rows(&root, "oauth.disconnect").await;
+    assert_eq!(disconnected.len(), 1, "{disconnected:?}");
+    assert_eq!(disconnected[0]["target"], "backend:wiki");
+    assert_eq!(disconnected[0]["actor"], "alice@example.com");
 
     // And through the API: connect again, then DELETE.
     let (status, body) = h
@@ -788,11 +834,13 @@ async fn disconnecting_removes_the_tools_and_the_connection() {
     assert!(h.wait_for_tool(&alice_pat, "wiki_echo", false).await);
     assert_eq!(h.connections(&alice).await, [] as [serde_json::Value; 0]);
 
-    // Nothing left to remove.
+    // Nothing left to remove, and nothing more in the audit log.
     let (status, body) = h
         .send(Method::DELETE, "/api/v1/me/connections/wiki", &alice, None)
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(h.audit_rows(&root, "oauth.disconnect").await.len(), 2);
+    assert_eq!(h.audit_rows(&root, "oauth.connect").await.len(), 2);
 }
 
 #[tokio::test]
@@ -883,6 +931,15 @@ async fn entra_on_behalf_of_uses_the_refresh_token_kept_at_login() {
         .expect("a jwt-bearer grant");
     assert!(refresh < obo, "{forms:?}");
     assert!(forms[refresh]["refresh_token"].starts_with("refresh_"));
+    // The assertion must be for the gateway's own API, not whatever the login
+    // scopes alone give (Microsoft Graph on Entra).
+    assert!(
+        forms[refresh]["scope"]
+            .split(' ')
+            .any(|scope| scope == "api://axon-test/.default"),
+        "{:?}",
+        forms[refresh]
+    );
 
     let form = &forms[obo];
     assert_eq!(form["requested_token_use"], "on_behalf_of");
@@ -896,4 +953,42 @@ async fn entra_on_behalf_of_uses_the_refresh_token_kept_at_login() {
         seen.iter().any(|token| token.starts_with("exchanged_")),
         "{seen:?}"
     );
+}
+
+#[tokio::test]
+async fn entra_on_behalf_of_asks_for_the_configured_assertion_scope() {
+    let backend = exchange_backend().await;
+    let Some(h) = Harness::start(
+        "axon_upstream_obo_assertion",
+        "client_secret_env = \"AXON_TEST_ENTRA_SECRET\"\nscopes = [\"openid\", \"User.Read\"]",
+        &[("AXON_TEST_ENTRA_SECRET", "entra-secret-value")],
+        |builder| {
+            builder
+                .raw_backend(&passthrough_entry(
+                    "papi",
+                    &backend.url(),
+                    "grant = \"entra_obo\"\nprovider = \"mock\"\nscope = \"api://backend/.default\"\nassertion_scope = \"api://custom/.default\"",
+                ))
+                .rbac(&grants(&["papi"]))
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    h.idp.set_refresh_tokens(true);
+    h.idp.set_token_exchange(true);
+    let alice = h.login_as("alice", "alice@example.com").await;
+    let alice_pat = h.create_pat(&alice).await;
+
+    assert!(h.wait_for_tool(&alice_pat, "papi_echo", true).await);
+    assert_called(&h.call(&alice_pat, "papi_echo", json!({})).await);
+
+    // The login scopes plus the configured assertion scope, not the default one.
+    let refreshes = h.idp.token_forms_for("refresh_token");
+    let scope = refreshes.first().expect("a refresh_token grant")["scope"].clone();
+    let scopes: Vec<&str> = scope.split(' ').collect();
+    assert!(scopes.contains(&"User.Read"), "{scope}");
+    assert!(scopes.contains(&"api://custom/.default"), "{scope}");
+    assert!(!scopes.contains(&"api://axon-test/.default"), "{scope}");
 }

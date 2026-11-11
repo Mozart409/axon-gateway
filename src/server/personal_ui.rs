@@ -137,7 +137,7 @@ fn headers_of(pairs: &[(String, String)]) -> Result<BTreeMap<String, String>, Ad
     Ok(headers)
 }
 
-/// The credential field rows of the catalog create form; rows without a name
+/// The credential field rows of the catalog create and edit forms; rows without a name
 /// and a header are the empty ones of the form and are dropped. The prefix is
 /// kept as typed, because it often ends in a space.
 fn fields_of(pairs: &[(String, String)]) -> Vec<CredentialField> {
@@ -489,17 +489,28 @@ async fn handle_entry_update(
         Ok(session) => session,
         Err(response) => return *response,
     };
+    // The edit form always sends the credential field rows and the OAuth
+    // inputs, whatever Sign-in is. The API rejects OAuth settings on a fields
+    // entry and needs the fields when switching to it, so only the half that
+    // matches the submitted `auth` goes into the patch: the field rows for
+    // `fields` (the stored OAuth settings stay in the row, unused), the OAuth
+    // inputs for `oauth` (which takes no fields)
+    let fields = first(&pairs, "auth") == Some("fields");
     let patch = CatalogPatch {
         description: first(&pairs, "description").map(str::to_owned),
         url: first(&pairs, "url").map(str::to_owned),
         enabled: first(&pairs, "enabled").and_then(|enabled| enabled.parse().ok()),
         auth: first(&pairs, "auth").map(str::to_owned),
-        // The edit form always sends them: empty clears the client id and the
-        // scopes, the secret is kept unless one is typed or cleared
-        oauth_client_id: first(&pairs, "oauth_client_id").map(str::to_owned),
-        oauth_scopes: first(&pairs, "oauth_scopes").map(split_scopes),
-        oauth_client_secret: secret_of(&pairs),
-        ..CatalogPatch::default()
+        credential_fields: fields.then(|| fields_of(&pairs)),
+        // Empty clears the client id and the scopes, the secret is kept unless
+        // one is typed or cleared
+        oauth_client_id: first(&pairs, "oauth_client_id")
+            .filter(|_| !fields)
+            .map(str::to_owned),
+        oauth_scopes: first(&pairs, "oauth_scopes")
+            .filter(|_| !fields)
+            .map(split_scopes),
+        oauth_client_secret: secret_of(&pairs).filter(|_| !fields),
     };
     if let Err(error) = update_catalog_entry(&state, &session, &name, patch).await {
         return action_error(&error);

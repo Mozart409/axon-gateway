@@ -497,6 +497,83 @@ async fn a_roles_manager_cannot_hand_out_permissions_they_lack() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_groups_manager_cannot_reach_permissions_through_a_group() {
+    let Some(h) = Harness::start("axon_custom_roles_group_escalation").await else {
+        return;
+    };
+    let admin = h.login_as("root", "root@example.com", &["admins"]).await;
+    let erin = h.login_as("erin", "erin@example.com", &[]).await;
+    let erin_id = user_id(&h, &admin, "erin@example.com").await;
+
+    // erin may manage groups, and nothing else.
+    h.create_role(&admin, "group-admin", &["groups.manage"])
+        .await;
+    let (status, body) = h.bind(&admin, "group-admin", "user_id", &erin_id).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // `power` carries users.manage, `same` only what erin holds, `plain` nothing.
+    h.create_role(&admin, "user-admin", &["users.manage"]).await;
+    for group in ["power", "same", "plain"] {
+        let (status, body) = h
+            .send(
+                Method::POST,
+                "/api/v1/groups",
+                &admin,
+                Some(json!({ "name": group })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = h.bind(&admin, "user-admin", "group", "power").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = h.bind(&admin, "group-admin", "group", "same").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Joining the powerful group, directly or by a claim value, is refused.
+    let (status, body) = h
+        .send(
+            Method::PUT,
+            &format!("/api/v1/groups/power/members/{erin_id}"),
+            &erin,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = h
+        .send(
+            Method::POST,
+            "/api/v1/groups/power/idp-mappings",
+            &erin,
+            Some(json!({ "provider": "mock", "value": "erin-claim" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A group of permissions erin holds, or of none, is fine.
+    for group in ["same", "plain"] {
+        let (status, body) = h
+            .send(
+                Method::PUT,
+                &format!("/api/v1/groups/{group}/members/{erin_id}"),
+                &erin,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{group}: {body}");
+        let (status, body) = h
+            .send(
+                Method::POST,
+                &format!("/api/v1/groups/{group}/idp-mappings"),
+                &erin,
+                Some(json!({ "provider": "mock", "value": format!("{group}-claim") })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{group}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn deleting_a_bound_role_needs_force_and_removes_the_access() {
     let Some(h) = Harness::start("axon_custom_roles_delete").await else {
         return;

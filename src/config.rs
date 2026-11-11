@@ -464,6 +464,11 @@ pub struct PassthroughConfig {
     /// Token exchange `resource`
     #[serde(default)]
     pub resource: Option<String>,
+    /// Entra on-behalf-of: the scope the assertion token is requested for.
+    /// Defaults to `api://<provider client_id>/.default`, the gateway's own API
+    /// under its default Application ID URI; set it for a custom URI.
+    #[serde(default)]
+    pub assertion_scope: Option<String>,
 }
 
 /// One credential a user enters for a `per_user` backend. The gateway sends
@@ -906,6 +911,13 @@ impl Config {
             || blank(passthrough.resource.as_deref())
         {
             return Err("passthrough.audience, scope and resource must not be empty".into());
+        }
+        if blank(passthrough.assertion_scope.as_deref()) {
+            return Err("passthrough.assertion_scope must not be empty".into());
+        }
+        if passthrough.grant != PassthroughGrant::EntraObo && passthrough.assertion_scope.is_some()
+        {
+            return Err("passthrough.assertion_scope is only for the entra_obo grant".into());
         }
         if passthrough.grant == PassthroughGrant::EntraObo {
             if passthrough.scope.is_none() {
@@ -2404,6 +2416,7 @@ name = "same"
                     audience: Some("api://wiki".into()),
                     scope: Some("read".into()),
                     resource: Some("https://wiki.example.com".into()),
+                    assertion_scope: None,
                 })
             );
             config.validate().expect("should be valid");
@@ -2443,6 +2456,35 @@ name = "same"
                 OIDC_PUBLIC,
             );
             assert!(reason(&config).contains("client secret"));
+        }
+
+        #[test]
+        fn the_assertion_scope_is_only_for_entra_obo() {
+            let config = passthrough(
+                "grant = \"entra_obo\"\nprovider = \"entra\"\nscope = \"api://wiki/.default\"\nassertion_scope = \"api://gateway/.default\"",
+                OIDC,
+            );
+            let passthrough_table = config.backends[0].passthrough.as_ref().expect("table");
+            assert_eq!(
+                passthrough_table.assertion_scope.as_deref(),
+                Some("api://gateway/.default")
+            );
+            config.validate().expect("should be valid");
+
+            let config = passthrough(
+                "grant = \"token_exchange\"\nprovider = \"entra\"\nassertion_scope = \"api://gateway/.default\"",
+                OIDC,
+            );
+            assert!(reason(&config).contains("assertion_scope"));
+        }
+
+        #[test]
+        fn an_empty_assertion_scope_is_rejected() {
+            let config = passthrough(
+                "grant = \"entra_obo\"\nprovider = \"entra\"\nscope = \"api://wiki/.default\"\nassertion_scope = \"\"",
+                OIDC,
+            );
+            assert!(reason(&config).contains("assertion_scope must not be empty"));
         }
 
         #[test]

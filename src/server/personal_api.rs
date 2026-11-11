@@ -37,9 +37,9 @@ use crate::personal::{
 use crate::policy::{Permission, Permissions};
 use crate::rbac::{AdminError, resolve};
 use crate::store::{
-    AdminPersonalBackend, CatalogAuthMode, CatalogEntry, CatalogEntryUpdate, NewCatalogEntry,
-    NewPersonalBackend, PersonalBackend, PersonalBackendUpdate, PersonalError, SealedColumns,
-    SecretUpdate, SessionUser, Store, StoreError, UserCredential,
+    Actor, AdminPersonalBackend, CatalogAuthMode, CatalogEntry, CatalogEntryUpdate,
+    NewCatalogEntry, NewPersonalBackend, PersonalBackend, PersonalBackendUpdate, PersonalError,
+    SealedColumns, SecretUpdate, SessionUser, Store, StoreError, UserCredential,
 };
 
 /// Headers rmcp sets itself, which a user must not override
@@ -923,7 +923,7 @@ pub(super) async fn finish_connection(
     let ctx = Ctx::new(state, session)?;
     let (entry, return_to) = ctx
         .hub
-        .finish_connect(ctx.user(), request_state, code, iss)
+        .finish_connect(&actor(session), ctx.user(), request_state, code, iss)
         .await?;
     tracing::info!(user = %ctx.user(), %entry, "OAuth connection made");
     Ok((entry, return_to))
@@ -936,7 +936,11 @@ pub(super) async fn delete_connection(
     entry: &str,
 ) -> Outcome<()> {
     let ctx = Ctx::new(state, session)?;
-    if !ctx.hub.disconnect(ctx.user(), entry).await? {
+    if !ctx
+        .hub
+        .disconnect(&actor(session), ctx.user(), entry)
+        .await?
+    {
         return Err(not_found());
     }
     tracing::info!(user = %ctx.user(), %entry, "OAuth connection removed");
@@ -1149,6 +1153,14 @@ pub(super) async fn delete_catalog_entry(
     tracing::info!(user = %ctx.user(), %name, "Catalog entry deleted");
     ctx.reload_catalog().await;
     Ok(())
+}
+
+/// The caller as the audit log names them
+fn actor(session: &SessionUser) -> Actor {
+    Actor {
+        user_id: Some(session.user.id),
+        label: actor_label(session),
+    }
 }
 
 /// Email, else display name, else subject: how the catalog names its creator

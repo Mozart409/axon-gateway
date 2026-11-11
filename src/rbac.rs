@@ -601,8 +601,9 @@ impl<'a> Admin<'a> {
     /// Maps an `IdP` claim value of a configured provider to a database group.
     ///
     /// # Errors
-    /// Forbidden without `groups.manage`, invalid for an unknown provider or
-    /// an empty value, conflict for a config group or an existing mapping.
+    /// Forbidden without `groups.manage` or without every permission of the
+    /// roles bound to the group, invalid for an unknown provider or an empty
+    /// value, conflict for a config group or an existing mapping.
     pub async fn add_idp_mapping(
         &self,
         group: &str,
@@ -611,6 +612,7 @@ impl<'a> Admin<'a> {
     ) -> Result<(), AdminError> {
         self.require(Permission::GroupsManage)?;
         self.local_group(group)?;
+        self.require_holds(&self.policy.current().group_permissions(group))?;
         if !self.providers.iter().any(|id| id == provider) {
             return Err(AdminError::Invalid(format!(
                 "unknown OIDC provider {provider:?}"
@@ -657,11 +659,13 @@ impl<'a> Admin<'a> {
     /// Adds a user to a database group.
     ///
     /// # Errors
-    /// Forbidden without `groups.manage`, not found for an unknown group or
-    /// user, conflict for a config group or an existing member.
+    /// Forbidden without `groups.manage` or without every permission of the
+    /// roles bound to the group, not found for an unknown group or user,
+    /// conflict for a config group or an existing member.
     pub async fn add_member(&self, group: &str, user_id: Uuid) -> Result<(), AdminError> {
         self.require(Permission::GroupsManage)?;
         self.local_group(group)?;
+        self.require_holds(&self.policy.current().group_permissions(group))?;
         if !self.store.add_member(&self.actor, group, user_id).await? {
             // The group exists, so either the user is already in or unknown.
             if self.policy.current().members_of(group).contains(&user_id) {

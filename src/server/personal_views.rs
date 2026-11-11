@@ -447,6 +447,12 @@ fn render_entry_admin(view: &CatalogView) -> Markup {
                         option value="false" selected[!item.enabled] { "disabled" }
                     }
                 }
+                p class=(MUTED) {
+                    "The credential fields apply when Sign-in is \"credential fields\". "
+                    "Users' stored values are kept by field name, so a renamed field is a new one they enter again. "
+                    "Empty rows are ignored."
+                }
+                (field_rows(&item.credential_fields))
                 (oauth_inputs(oauth, Some(&settings)))
                 button class=(BUTTON_SMALL) type="submit" { "Save entry" }
             }
@@ -628,11 +634,22 @@ fn render_entry(view: &CatalogView) -> Markup {
     }
 }
 
-/// Empty rows of a credential field: name, label, header and prefix; the keys repeat
-fn field_rows() -> Markup {
+/// Rows of a credential field: name, label, header and prefix; the keys
+/// repeat. One row per `existing` field, prefilled, then empty rows up to
+/// `FIELD_ROWS` rows in all (and never fewer than one empty row).
+fn field_rows(existing: &[CredentialField]) -> Markup {
+    let empty = FIELD_ROWS.saturating_sub(existing.len()).max(1);
     html! {
         div class="flex flex-col gap-2" {
-            @for _ in 0..FIELD_ROWS {
+            @for field in existing {
+                div class="flex flex-wrap gap-2" {
+                    input class=(format!("{INPUT} w-36")) type="text" name="field_name" placeholder="name: token" maxlength="64" value=(field.name);
+                    input class=(format!("{INPUT} w-40")) type="text" name="field_label" placeholder="label: API token" value=(field.label.as_deref().unwrap_or_default());
+                    input class=(format!("{INPUT} w-44")) type="text" name="field_header" placeholder="header: Authorization" value=(field.header);
+                    input class=(format!("{INPUT} w-36")) type="text" name="field_prefix" placeholder="prefix: Bearer " value=(field.prefix.as_deref().unwrap_or_default());
+                }
+            }
+            @for _ in 0..empty {
                 div class="flex flex-wrap gap-2" {
                     input class=(format!("{INPUT} w-36")) type="text" name="field_name" placeholder="name: token" maxlength="64";
                     input class=(format!("{INPUT} w-40")) type="text" name="field_label" placeholder="label: API token";
@@ -670,7 +687,7 @@ fn render_catalog_create() -> Markup {
                         input class=(format!("{INPUT} w-96")) type="url" name="url" required;
                     }
                 }
-                (field_rows())
+                (field_rows(&[]))
                 div class=(FORM_ROW) {
                     (oauth_inputs(false, None))
                 }
@@ -1081,6 +1098,26 @@ mod tests {
     }
 
     #[test]
+    fn field_rows_prefill_the_existing_fields_and_end_with_an_empty_row() {
+        let none = field_rows(&[]).into_string();
+        assert_eq!(none.matches("name=\"field_name\"").count(), FIELD_ROWS);
+
+        let two = [field("token", Some("API token")), field("org", None)];
+        let html = field_rows(&two).into_string();
+        assert_eq!(html.matches("name=\"field_name\"").count(), FIELD_ROWS);
+        assert!(html.contains("value=\"token\""));
+        assert!(html.contains("value=\"API token\""));
+        assert!(html.contains("value=\"Bearer \""));
+        assert!(html.contains("value=\"org\""));
+
+        let many: Vec<CredentialField> = (0..FIELD_ROWS + 2)
+            .map(|index| field(&format!("f{index}"), None))
+            .collect();
+        let html = field_rows(&many).into_string();
+        assert_eq!(html.matches("name=\"field_name\"").count(), FIELD_ROWS + 3);
+    }
+
+    #[test]
     fn descriptions_are_escaped() {
         let entries = [view(
             item("shared", CatalogSource::Config, true),
@@ -1182,6 +1219,7 @@ mod tests {
                 audience: None,
                 scope: None,
                 resource: None,
+                assertion_scope: None,
             }),
             ..item("internal", CatalogSource::Config, true)
         };

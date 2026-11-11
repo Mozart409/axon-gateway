@@ -712,6 +712,125 @@ async fn a_scim_user_that_is_pushed_after_the_login_links_to_it() {
 }
 
 #[tokio::test]
+async fn concurrent_patches_of_one_user_all_land() {
+    let Some(h) = Harness::start("axon_scim_patch_race").await else {
+        return;
+    };
+    let admin = h.login_as("root", "root@example.com", &["admins"]).await;
+    let token = h.scim_token(&admin).await;
+    let user = h
+        .scim_user(&token, json!({ "userName": "erin@example.com" }))
+        .await;
+
+    let path = format!("/Users/{user}");
+    let patches = (0..10).map(|n| {
+        h.scim(
+            Method::PATCH,
+            &path,
+            &token,
+            Some(json!({
+                "schemas": [PATCH_OP],
+                "Operations": [{
+                    "op": "add",
+                    "path": "emails",
+                    "value": [{ "value": format!("u{n}@example.com") }],
+                }],
+            })),
+        )
+    });
+    for (status, body) in futures::future::join_all(patches).await {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let (status, body) = h
+        .scim(Method::GET, &format!("/Users/{user}"), &token, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut emails: Vec<&str> = body["emails"]
+        .as_array()
+        .expect("emails")
+        .iter()
+        .map(|email| email["value"].as_str().unwrap())
+        .collect();
+    emails.sort_unstable();
+    let mut expected: Vec<String> = (0..10).map(|n| format!("u{n}@example.com")).collect();
+    expected.sort_unstable();
+    assert_eq!(emails, expected, "{body}");
+}
+
+#[tokio::test]
+async fn concurrent_group_additions_of_one_user_all_land() {
+    let Some(h) = Harness::start("axon_scim_group_race").await else {
+        return;
+    };
+    let admin = h.login_as("root", "root@example.com", &["admins"]).await;
+    let token = h.scim_token(&admin).await;
+
+    // One gateway group per SCIM group, each mapped to its displayName.
+    let mut scim_groups = Vec::new();
+    for n in 0..6 {
+        let name = format!("team{n}");
+        let (status, body) = h
+            .send(
+                Method::POST,
+                "/api/v1/groups",
+                &admin,
+                Some(json!({ "name": name })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = h
+            .send(
+                Method::POST,
+                &format!("/api/v1/groups/{name}/idp-mappings"),
+                &admin,
+                Some(json!({ "provider": "mock", "value": format!("Team {n}") })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, group) = h
+            .scim(
+                Method::POST,
+                "/Groups",
+                &token,
+                Some(json!({ "displayName": format!("Team {n}") })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{group}");
+        scim_groups.push(group["id"].as_str().unwrap().to_string());
+    }
+
+    let frank = h.login_as("frank-sub", "frank@example.com", &[]).await;
+    let user = h
+        .scim_user(&token, json!({ "userName": "frank@example.com" }))
+        .await;
+
+    let paths: Vec<String> = scim_groups
+        .iter()
+        .map(|group| format!("/Groups/{group}"))
+        .collect();
+    let additions = paths.iter().map(|path| {
+        h.scim(
+            Method::PATCH,
+            path,
+            &token,
+            Some(json!({
+                "Operations": [{ "op": "Add", "path": "members", "value": [{ "value": user }] }],
+            })),
+        )
+    });
+    for (status, body) in futures::future::join_all(additions).await {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let mut expected = vec!["authenticated".to_string()];
+    expected.extend((0..6).map(|n| format!("team{n}")));
+    let mut groups = h.groups_of(&frank).await;
+    groups.sort_unstable();
+    assert_eq!(groups, expected);
+}
+
+#[tokio::test]
 async fn active_false_disables_the_user_and_active_true_enables_them_again() {
     let Some(h) = Harness::start("axon_scim_active").await else {
         return;

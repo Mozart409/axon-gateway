@@ -21,6 +21,8 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::scim::ScimError;
+
 use super::auth::set_user_disabled_in;
 use super::rbac::{Actor, audit};
 use super::tokens::{TOKEN_TOUCH_INTERVAL, hash_secret, random_hex};
@@ -228,6 +230,10 @@ pub enum ScimStoreError {
     #[error("{0}")]
     Invalid(String),
 
+    /// The caller's patch did not apply to the user as stored
+    #[error("{}", .0.detail)]
+    Patch(ScimError),
+
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -277,12 +283,56 @@ async fn audit_scim(
     audit(conn, &scim_actor(provider), action, target, details).await
 }
 
+/// Writes every writable attribute of a SCIM user and finishes the write
+async fn write_user(
+    conn: &mut PgConnection,
+    provider: &str,
+    rule: &LinkRule,
+    id: Uuid,
+    attrs: &UserAttrs,
+) -> Result<ScimUser, ScimStoreError> {
+    let user: Option<ScimUser> = sqlx::query_as(concat!(
+        "update scim_users set user_name = $3, external_id = $4, display_name = $5, \
+             given_name = $6, family_name = $7, name_formatted = $8, emails = $9, \
+             active = $10, updated_at = now() \
+         where provider = $1 and id = $2 returning ",
+        user_columns!()
+    ))
+    .bind(provider)
+    .bind(id)
+    .bind(&attrs.user_name)
+    .bind(&attrs.external_id)
+    .bind(&attrs.display_name)
+    .bind(&attrs.given_name)
+    .bind(&attrs.family_name)
+    .bind(&attrs.name_formatted)
+    .bind(emails_value(&attrs.emails))
+    .bind(attrs.active)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|error| conflict_or(error, user_name_taken(&attrs.user_name)))?;
+    let Some(user) = user else {
+        return Err(ScimStoreError::NotFound);
+    };
+    Ok(finish_user(conn, rule, user, "scim.user.update").await?)
+}
+
 /// Rewrites `users.groups` of the logins linked to these SCIM users from their
 /// group memberships and tells the replicas about each of them.
 async fn refresh_groups(conn: &mut PgConnection, scim_user_ids: &[Uuid]) -> Result<(), StoreError> {
     if scim_user_ids.is_empty() {
         return Ok(());
     }
+    // Lock the logins first, in a statement of their own: under READ COMMITTED
+    // the update below then takes its snapshot after the lock, so it sees the
+    // memberships a concurrent transaction committed while this one waited.
+    sqlx::query(
+        "select u.id from users u join scim_users s on s.user_id = u.id \
+         where s.id = any($1) order by u.id for no key update of u",
+    )
+    .bind(scim_user_ids)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query(
         "with updated as ( \
              update users u set \
@@ -744,30 +794,42 @@ impl Store {
         attrs: &UserAttrs,
     ) -> Result<ScimUser, ScimStoreError> {
         let mut tx = self.pool.begin().await?;
-        let user: Option<ScimUser> = sqlx::query_as(concat!(
-            "update scim_users set user_name = $3, external_id = $4, display_name = $5, \
-                 given_name = $6, family_name = $7, name_formatted = $8, emails = $9, \
-                 active = $10, updated_at = now() \
-             where provider = $1 and id = $2 returning ",
-            user_columns!()
+        let user = write_user(&mut tx, provider, rule, id, attrs).await?;
+        tx.commit().await?;
+        Ok(user)
+    }
+
+    /// Applies `apply` to the current attributes of a SCIM user and stores the
+    /// result (PATCH). The row is locked first, so concurrent patches of one
+    /// user run one after the other and none loses its change.
+    ///
+    /// # Errors
+    /// Not found for an unknown id, the patch error when `apply` fails,
+    /// conflict for a `userName` another user of the provider has; otherwise
+    /// when the transaction fails.
+    pub async fn patch_scim_user(
+        &self,
+        provider: &str,
+        rule: &LinkRule,
+        id: Uuid,
+        apply: impl FnOnce(&mut UserAttrs) -> Result<(), ScimError>,
+    ) -> Result<ScimUser, ScimStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<ScimUser> = sqlx::query_as(concat!(
+            "select ",
+            user_columns!(),
+            " from scim_users where provider = $1 and id = $2 for no key update"
         ))
         .bind(provider)
         .bind(id)
-        .bind(&attrs.user_name)
-        .bind(&attrs.external_id)
-        .bind(&attrs.display_name)
-        .bind(&attrs.given_name)
-        .bind(&attrs.family_name)
-        .bind(&attrs.name_formatted)
-        .bind(emails_value(&attrs.emails))
-        .bind(attrs.active)
         .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| conflict_or(error, user_name_taken(&attrs.user_name)))?;
-        let Some(user) = user else {
+        .await?;
+        let Some(current) = current else {
             return Err(ScimStoreError::NotFound);
         };
-        let user = finish_user(&mut tx, rule, user, "scim.user.update").await?;
+        let mut attrs = current.attrs();
+        apply(&mut attrs).map_err(ScimStoreError::Patch)?;
+        let user = write_user(&mut tx, provider, rule, id, &attrs).await?;
         tx.commit().await?;
         Ok(user)
     }
@@ -840,7 +902,7 @@ impl Store {
     pub async fn delete_scim_user(&self, provider: &str, id: Uuid) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
-            "select user_name, user_id from scim_users where provider = $1 and id = $2 for update",
+            "select user_name, user_id from scim_users where provider = $1 and id = $2 for no key update",
         )
         .bind(provider)
         .bind(id)

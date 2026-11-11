@@ -38,7 +38,7 @@ use crate::egress::EgressPolicy;
 use crate::oidc::{OidcProviders, Provider};
 use crate::registry::{RegisterBackend, RegistryActor};
 use crate::store::{
-    CatalogAuthMode, CatalogEntry, NewUpstreamRequest, NewUpstreamToken, PersonalBackend,
+    Actor, CatalogAuthMode, CatalogEntry, NewUpstreamRequest, NewUpstreamToken, PersonalBackend,
     SealedColumns, Store, StoreError, UpstreamToken, UserCredential,
 };
 use crate::types::BackendState;
@@ -839,6 +839,7 @@ impl PersonalHub {
     /// check or the code exchange fails, or the tokens cannot be stored.
     pub async fn finish_connect(
         &self,
+        actor: &Actor,
         user: Uuid,
         state: &str,
         code: &str,
@@ -883,21 +884,21 @@ impl PersonalHub {
 
         let secret =
             upstream_oauth::seal_tokens(&self.keyring, user, &item.name, &response.tokens)?;
-        // Delete first: the notify trigger fires on insert and delete only, so
-        // a reconnect makes the other replicas drop the old connection
-        self.store.delete_upstream_token(user, &item.name).await?;
         self.store
-            .upsert_upstream_token(&NewUpstreamToken {
-                user_id: user,
-                backend: &item.name,
-                issuer: &request.issuer,
-                client_id: &request.client_id,
-                token_endpoint: &request.token_endpoint,
-                scope: response.scope.as_deref(),
-                token_auth_method: method.as_str(),
-                secret: &secret,
-                expires_at: response.expires_at,
-            })
+            .connect_upstream_token(
+                actor,
+                &NewUpstreamToken {
+                    user_id: user,
+                    backend: &item.name,
+                    issuer: &request.issuer,
+                    client_id: &request.client_id,
+                    token_endpoint: &request.token_endpoint,
+                    scope: response.scope.as_deref(),
+                    token_auth_method: method.as_str(),
+                    secret: &secret,
+                    expires_at: response.expires_at,
+                },
+            )
             .await?;
         self.invalidate(user).await;
         Ok((request.backend, request.return_to))
@@ -908,8 +909,16 @@ impl PersonalHub {
     ///
     /// # Errors
     /// Fails when the query fails.
-    pub async fn disconnect(&self, user: Uuid, backend: &str) -> Result<bool, StoreError> {
-        let removed = self.store.delete_upstream_token(user, backend).await?;
+    pub async fn disconnect(
+        &self,
+        actor: &Actor,
+        user: Uuid,
+        backend: &str,
+    ) -> Result<bool, StoreError> {
+        let removed = self
+            .store
+            .disconnect_upstream_token(actor, user, backend)
+            .await?;
         self.invalidate(user).await;
         Ok(removed)
     }
@@ -1480,7 +1489,17 @@ impl PersonalHub {
             tracing::warn!(backend = %item.name, provider = %config.provider, "the passthrough provider is not configured");
             return SpecOutcome::Skip;
         };
-        let subject = match self.subject_token(user, provider).await {
+        // OBO needs an assertion issued for the gateway's own API; a token for
+        // the login scopes alone is Microsoft Graph's on Entra
+        let assertion_scope = (config.grant == PassthroughGrant::EntraObo).then(|| {
+            config.assertion_scope.clone().unwrap_or_else(|| {
+                format!("api://{}/.default", provider.app_credentials().client_id)
+            })
+        });
+        let subject = match self
+            .subject_token(user, provider, assertion_scope.as_deref())
+            .await
+        {
             Subject::Token(token) => token,
             Subject::Missing => return SpecOutcome::NeedsSubject,
             Subject::Failed => return SpecOutcome::Retry,
@@ -1537,8 +1556,14 @@ impl PersonalHub {
 
     /// An access token of the identity provider to start a passthrough grant
     /// from: the newest JWT seen on a request, else one refreshed with the
-    /// refresh token stored at login
-    async fn subject_token(&self, user: Uuid, provider: &Provider) -> Subject {
+    /// refresh token stored at login. `extra_scope` is requested on top of the
+    /// login scopes (Entra on-behalf-of: the gateway's own API).
+    async fn subject_token(
+        &self,
+        user: Uuid,
+        provider: &Provider,
+        extra_scope: Option<&str>,
+    ) -> Subject {
         let known = self
             .subjects
             .lock()
@@ -1574,7 +1599,8 @@ impl PersonalHub {
                 return Subject::Failed;
             }
         };
-        let scopes = provider.scopes();
+        let mut scopes = provider.scopes();
+        scopes.extend(extra_scope.map(str::to_owned));
         let scope = (!scopes.is_empty()).then(|| scopes.join(" "));
         let refreshed = upstream_oauth::refresh_idp_token(
             // The configured `[[auth.oidc]]` provider's endpoint, not a backend's
@@ -2075,6 +2101,7 @@ mod tests {
             audience: Some(String::from("api://wiki")),
             scope: None,
             resource: None,
+            assertion_scope: None,
         }
     }
 
