@@ -1,0 +1,28 @@
+axon-gateway {{ .Values.image.tag | default .Chart.AppVersion }} is deployed as {{ include "axon-gateway.fullname" . }}.
+
+Reach it in the cluster:
+  http://{{ include "axon-gateway.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+{{- if .Values.httpRoute.enabled }}
+{{- range .Values.httpRoute.hostnames }}
+  https://{{ . }}{{ $.Values.httpRoute.path }}
+{{- end }}
+{{- else }}
+
+Try it locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "axon-gateway.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/readyz
+{{- end }}
+
+Config changes (values `config`) hot-reload without a restart; the kubelet may
+take up to a minute to refresh the mounted file. Changes to Secrets or `env`
+need: kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "axon-gateway.fullname" . }}
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.existingSecret) }}
+
+Warning: {{ .Values.replicaCount }} replicas need a shared database. Set
+existingSecret (with AXON_DATABASE_URL) and a [database] section in `config`.
+{{- end }}
+{{- if not .Values.kek.existingSecret }}
+
+Note: kek.existingSecret is unset. Personal backends and catalog credentials
+need AXON_KEK_FILE or AXON_KEK.
+{{- end }}

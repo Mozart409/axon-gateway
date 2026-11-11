@@ -1,0 +1,163 @@
+# Default values for the axon-gateway chart.
+
+# Replicas share sessions, rate limits and policy through the database, so no
+# session affinity is needed. Several replicas need a [database] section in
+# `config`; without one, sessions live in each process and you must run 1.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/mozart409/axon-gateway
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# The whole config.toml, rendered into a ConfigMap and mounted read-only at
+# /etc/axon/config.toml (AXON_GATEWAY_CONFIG points there). `${VAR}` references
+# are resolved from the container environment when the file is loaded, so put
+# secrets in `existingSecret` / `env`, never here.
+#
+# No checksum annotation covers this ConfigMap on purpose: the gateway watches
+# the file and hot-reloads it, so editing `config` does not restart the pods
+# (the kubelet takes up to a minute to refresh the mounted file). Keep
+# `[gateway] allow_stdio` off: a process spawned inside the pod is not a
+# boundary you want on Kubernetes.
+config: |
+  [gateway]
+  bind = "0.0.0.0:8080"
+  base_url = "https://axon.example.com"
+  allow_stdio = false
+
+  # [database]
+  # url_env = "AXON_DATABASE_URL"
+
+  # [[backends]]
+  # name = "docs"
+  # url = "https://mcp.example.com/mcp"
+  # transport = "http"
+  # enabled = true
+
+# Name of an existing Secret whose keys all become environment variables
+# (AXON_DATABASE_URL, OIDC client secrets, backend tokens, ...). The Secret is
+# read at start; after changing it run `kubectl rollout restart`.
+existingSecret: ""
+
+# Extra environment (list of EnvVar) and envFrom (list of EnvFromSource).
+# OTLP tracing uses the standard OTEL_* variables, for example
+#   - name: OTEL_EXPORTER_OTLP_ENDPOINT
+#     value: http://otel-collector.observability.svc:4317
+env: []
+envFrom: []
+
+# RUST_LOG filter and JSON log lines (AXON_LOG_JSON=1).
+logLevel: info
+logJson: true
+
+# Key-encryption key for personal backends and catalog credentials. The Secret
+# key is mounted as a file and AXON_KEK_FILE points at it. Format: one line per
+# KEK, `[id:]secret`, a secret of at least 32 characters.
+kek:
+  existingSecret: ""
+  key: kek
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# The image runs as nonroot (65532) and only reads /app and its config.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# SSE streams are long-lived. On shutdown the pod first sits in preStop (so the
+# endpoint is removed from Services and the Gateway), then gets SIGTERM and
+# finishes in-flight calls; the grace period must exceed both.
+preStopSleepSeconds: 10
+terminationGracePeriodSeconds: 60
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# Created only when replicaCount > 1 (minAvailable 1 by default).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Gateway API route (gateway.networking.k8s.io/v1). There is no Ingress.
+httpRoute:
+  enabled: false
+  annotations: {}
+  # Required when enabled, for example:
+  #   - name: public-gateway
+  #     namespace: gateway-system
+  #     sectionName: https
+  parentRefs: []
+  hostnames: []
+  path: /
+  # Optional, for long SSE streams: { request: 0s } disables the request timeout
+  # on implementations that support it.
+  timeouts: {}
+
+# Needs the Prometheus Operator CRDs.
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  labels: {}
+  interval: 30s
+  scrapeTimeout: 10s
+
+# Alert rules from files/prometheus-rules.yaml (same as
+# example/observability/prometheus-rules.yaml).
+prometheusRule:
+  enabled: false
+  namespace: ""
+  labels: {}
+  # Scrape job used by AxonGatewayDown. The ServiceMonitor job is the Service
+  # name, which is the default here.
+  job: ""
+
+# ConfigMap labelled grafana_dashboard=1 for the Grafana sidecar, from
+# files/grafana-dashboard.json.
+grafanaDashboard:
+  enabled: false
+  namespace: ""
+  # Sets the grafana_folder annotation (sidecar folder-from-annotation setups).
+  folder: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Example: spread replicas over nodes.
+#   - maxSkew: 1
+#     topologyKey: kubernetes.io/hostname
+#     whenUnsatisfiable: ScheduleAnyway
+#     labelSelector:
+#       matchLabels:
+#         app.kubernetes.io/name: axon-gateway
+topologySpreadConstraints: []

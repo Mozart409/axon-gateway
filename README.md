@@ -119,6 +119,46 @@ argument (both example files already do this).
 > networking and a caching resolver on the host, that is `--dns=127.0.0.1`.
 > Without a pin, restart the container after changing the host's DNS.
 
+## Kubernetes (Helm)
+
+The chart is in [`deploy/helm/axon-gateway`](deploy/helm/axon-gateway). The
+gateway config is raw TOML in the `config` value; secrets are not part of it.
+`existingSecret` names a Secret whose keys all become environment variables
+(`AXON_DATABASE_URL`, client secrets, backend tokens), `env` and `envFrom` add
+more, and `kek.existingSecret` mounts the key-encryption key as a file for
+`AXON_KEK_FILE`. Roll the pods after changing a Secret. Exposure is a Gateway
+API `HTTPRoute` (there is no Ingress). A `ServiceMonitor`, a `PrometheusRule`
+and a Grafana dashboard ConfigMap are optional, and all off by default:
+
+```yaml
+config: |
+  [gateway]
+  base_url = "https://axon.example.com"
+  [database]
+  url_env = "AXON_DATABASE_URL"
+existingSecret: axon-gateway-env
+httpRoute:
+  enabled: true
+  parentRefs: [{name: public-gateway}]
+  hostnames: [axon.example.com]
+serviceMonitor: {enabled: true}
+prometheusRule: {enabled: true}
+grafanaDashboard: {enabled: true}
+```
+
+```bash
+helm install axon deploy/helm/axon-gateway -f my-values.yaml
+
+# check a change to the chart or the rules
+helm lint deploy/helm/axon-gateway
+helm template axon deploy/helm/axon-gateway -f deploy/helm/axon-gateway/ci/all-on-values.yaml \
+  | kubeconform -strict -summary -ignore-missing-schemas
+promtool check rules example/observability/prometheus-rules.yaml
+```
+
+Outside Kubernetes, [`example/observability/`](example/observability/)
+has the same dashboard JSON and Prometheus rules.
+
 ## API Endpoints
 
 | Endpoint                                | Method | Description                                         |
@@ -733,6 +773,23 @@ redacted arguments for a short time. Settle purpose, access and retention
 with the data protection officer and the works council before enabling `full`,
 and keep the retention as short as the purpose allows.
 
+## Usage
+
+The usage pages show tool-call activity from the [tool-call audit](#tool-call-audit):
+totals with p50 and p95 latency, calls per day, calls per backend and the ten
+most called tools. The window is `days`, 1 to 90 (default 30), in whole UTC
+days; any other value is refused with 400.
+
+| UI page                      | JSON                                |
+| ---------------------------- | ----------------------------------- |
+| `GET /ui/me/usage`           | `GET /api/v1/me/usage?days=`        |
+| `GET /ui/admin/usage`        | `GET /api/v1/admin/usage?days=`     |
+| `GET /ui/admin/usage/{user_id}` | `GET /api/v1/admin/usage/{user_id}?days=` |
+
+The first row is the signed-in user's own usage; the admin rows list users by
+calls and show one user. The admin views need the `audit.read` permission. The
+numbers come from the audit, so they are empty when the audit is off.
+
 ## User toolsets
 
 A user keeps their own named toolsets, apart from the config ones above, on
@@ -886,6 +943,12 @@ Logs go to stdout (`AXON_LOG_JSON=1` for JSON, `RUST_LOG` to filter). Set
 `OTEL_TRACES_SAMPLER`). Every HTTP request gets a server span, and an incoming
 W3C `traceparent` header becomes its parent.
 
+The gateway forwards the current trace context to backends in the `_meta` of
+the MCP request (`traceparent`, and `tracestate` when there is one) for
+`tools/call`, `resources/read` and `prompts/get`, so a backend's spans join the
+caller's trace. It does not set an HTTP `traceparent` header on backend
+requests.
+
 ## Metrics
 
 Prometheus metrics are exposed at `/metrics`:
@@ -894,13 +957,31 @@ Prometheus metrics are exposed at `/metrics`:
 - `axon_tool_call_duration_seconds` - Tool call latency histogram
 - `axon_tool_call_errors_total` - Tool call error counter
 - `axon_backend_connections{backend,state}` - Backend connection state gauge (1 for the current state)
-- `axon_http_requests_total` - HTTP request counter
+- `axon_requests_total` - HTTP request counter
 - `axon_health_checks_total` - Health check counter
 - `axon_resource_reads_total` - Resource read counter
 - `axon_prompt_gets_total` - Prompt get counter
 - `axon_backend_up` - Gauge per backend, 1 when the last connect or health probe succeeded
 - `axon_audit_dropped_total` - Tool-call audit events dropped on a full queue
 - `axon_audit_write_errors_total` - Tool-call audit batches the database refused
+- `axon_mcp_requests_total{method,principal_type}` - MCP requests by `Mcp-Method`; `principal_type` is `pat`, `service`, `legacy_token` or `open`
+- `axon_user_tool_calls_total{user,backend,outcome}` - Tool calls per user; `outcome` is `ok`, `error` or `denied`, `backend` is `personal` for personal backends; only callers with an owner user are counted
+- `axon_authn_total{method,result}` - Authentication attempts; `method` is `pat`, `service_token`, `legacy_token`, `session`, `break_glass` or `open`; `result` is `ok`, `invalid`, `expired`, `disabled` or `rate_limited`
+- `axon_authz_denied_total{reason}` - Denied calls; `reason` is `tool`, `backend`, `quota` or `rate_limit`
+- `axon_backend_inflight_calls{backend}` - Tool calls in flight per backend
+- `axon_oidc_requests_total{provider,op,result}` and `axon_oidc_request_duration_seconds{provider,op}` - Requests to the identity provider; `op` is `discovery`, `jwks` or `token`, `result` is `ok` or `error`
+- `axon_oidc_provider_up{provider}` - 1 when the last request to the provider succeeded
+
+Sampled every 30 s, per replica:
+
+- `axon_active_sessions{kind}` - Sessions, `kind` is `mcp` or `ui`
+- `axon_tokens_active{kind}` - Tokens neither revoked nor expired, `kind` is `pat` or `service`
+- `axon_db_pool_connections{state}` and `axon_db_pool_max` - Database pool, `state` is `idle` or `used`
+- `axon_db_up` - 1 when the database answers
+- `axon_user_backends{state}` - Per-user backends by state (`connected`, `idle`, `failed`, `other`)
+
+The `user` label of `axon_user_tool_calls_total` is the user's UUID, so its
+cardinality is bounded by the number of users.
 
 The `idle` value of the backend state gauge counts backends closed by the idle
 timeout. Personal and catalog connections are not labelled in metrics.

@@ -317,6 +317,41 @@ async fn slot_tools(slot: &UserSlot) -> Vec<(NamespacedTool, UserBackendKind)> {
         .collect()
 }
 
+/// The `backend` label of a user's call to a backend of its own slot: a catalog
+/// entry by name, a personal backend as `personal` (its name is user chosen).
+fn user_backend_label(kind: UserBackendKind, backend_name: &str) -> &str {
+    match kind {
+        UserBackendKind::Personal { .. } => "personal",
+        UserBackendKind::Catalog => backend_name,
+    }
+}
+
+/// `ok` or `error` for the answer to a tool call: a JSON-RPC error or a tool
+/// result with `isError`.
+fn call_outcome(response: &JsonRpcResponse) -> &'static str {
+    let tool_error = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("isError"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if response.error.is_some() || tool_error {
+        "error"
+    } else {
+        "ok"
+    }
+}
+
+/// Count a tool call per user for `axon_user_tool_calls_total`; callers without
+/// an owner user (legacy token, open, config service account) are not counted.
+fn record_user_call(caller: &Caller, backend: &str, outcome: &str) {
+    if let Caller::Principal(policy) = caller
+        && let Some(user) = policy.owner_id()
+    {
+        crate::metrics::record_user_tool_call(user, backend, outcome);
+    }
+}
+
 /// Forwards a tool call to its backend actor and records the call metrics
 /// (`metrics` is off for personal backends, whose names are user chosen).
 async fn call_backend(
@@ -338,6 +373,7 @@ async fn call_backend(
             tool_name: original_tool_name.to_string(),
             arguments,
             relay,
+            trace: crate::telemetry::current_trace_context(),
         })
         .await
     {
@@ -412,17 +448,28 @@ impl RequestRouter {
             && let Some(user) = policy.owner_id()
             && !hub.admit_call(user).await
         {
+            crate::metrics::record_authz_denied("quota");
+            record_user_call(
+                caller,
+                user_backend_label(kind, &tool.backend_name),
+                "denied",
+            );
             return JsonRpcResponse::error(id, -32000, "per-user call quota exceeded".to_string());
         }
 
         let Some(backend) = scope.slot.backends.get(&tool.backend_name) else {
+            record_user_call(
+                caller,
+                user_backend_label(kind, &tool.backend_name),
+                "error",
+            );
             return JsonRpcResponse::error(
                 id,
                 -32000,
                 format!("Backend '{}' not available", tool.backend_name),
             );
         };
-        call_backend(
+        let response = call_backend(
             backend,
             &tool.backend_name,
             &tool.original_name,
@@ -431,7 +478,13 @@ impl RequestRouter {
             relay,
             kind == UserBackendKind::Catalog,
         )
-        .await
+        .await;
+        record_user_call(
+            caller,
+            user_backend_label(kind, &tool.backend_name),
+            call_outcome(&response),
+        );
+        response
     }
 
     /// Backends the caller may access.
@@ -591,16 +644,20 @@ impl RequestRouter {
                                 .tool_callable(caller, &backend_name, &original_tool_name)
                                 .await
                         {
+                            crate::metrics::record_authz_denied("tool");
+                            record_user_call(caller, &backend_name, "denied");
                             return unknown_tool(request.id.clone(), &tool_name);
                         }
 
                         // Check backend permission
                         if let Some(message) = caller.backend_denial(&backend_name) {
+                            crate::metrics::record_authz_denied("backend");
+                            record_user_call(caller, &backend_name, "denied");
                             return JsonRpcResponse::error(request.id.clone(), -32000, message);
                         }
 
                         // Get the backend actor
-                        if let Some(backend) = self.backends.get(&backend_name) {
+                        let response = if let Some(backend) = self.backends.get(&backend_name) {
                             call_backend(
                                 backend,
                                 &backend_name,
@@ -617,7 +674,9 @@ impl RequestRouter {
                                 -32000,
                                 format!("Backend '{backend_name}' not available"),
                             )
-                        }
+                        };
+                        record_user_call(caller, &backend_name, call_outcome(&response));
+                        response
                     }
                     None => {
                         Self::call_personal(
@@ -684,6 +743,7 @@ impl RequestRouter {
                         match backend
                             .ask(ReadResource {
                                 uri: original_uri.to_string(),
+                                trace: crate::telemetry::current_trace_context(),
                             })
                             .await
                         {
@@ -764,6 +824,7 @@ impl RequestRouter {
                             .ask(GetPrompt {
                                 name: original_name.to_string(),
                                 arguments,
+                                trace: crate::telemetry::current_trace_context(),
                             })
                             .await
                         {

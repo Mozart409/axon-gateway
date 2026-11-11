@@ -221,13 +221,13 @@ impl Discovery {
     /// fetch, so concurrent logins wait for one fetch instead of each running
     /// their own, and a failed fetch counts as a try, so a provider whose keys
     /// endpoint is down is not asked again on every login.
-    async fn refresh_keys(&self, http: &reqwest::Client) -> Result<(), String> {
+    async fn refresh_keys(&self, provider: &str, http: &reqwest::Client) -> Result<(), String> {
         let mut keys = self.keys.write().await;
         if keys.fetched.elapsed() < JWKS_REFETCH_INTERVAL {
             return Ok(());
         }
         keys.fetched = Instant::now();
-        let set = get_json(http, &self.jwks_uri)
+        let set = observed(provider, "jwks", get_json(http, &self.jwks_uri))
             .await
             .map_err(|error| format!("could not fetch the signing keys again: {error}"))?;
         keys.set = set;
@@ -411,7 +411,8 @@ impl Provider {
             "{}/.well-known/openid-configuration",
             self.issuer.trim_end_matches('/')
         );
-        let metadata: ProviderMetadata = get_json(&self.http, &url).await?;
+        let metadata: ProviderMetadata =
+            observed(&self.id, "discovery", get_json(&self.http, &url)).await?;
         // The provider must name itself exactly as configured (OIDC Discovery
         // 4.3); its ID tokens carry the same string in `iss`.
         if metadata.issuer != self.issuer {
@@ -427,7 +428,7 @@ impl Provider {
                 metadata.id_token_signing_alg_values_supported
             ));
         }
-        let set = get_json(&self.http, &metadata.jwks_uri).await?;
+        let set = observed(&self.id, "jwks", get_json(&self.http, &metadata.jwks_uri)).await?;
         let mut client: OidcClient = oauth2::Client::new(self.client_id.clone())
             .set_auth_uri(
                 AuthUrl::new(metadata.authorization_endpoint)
@@ -500,13 +501,17 @@ impl Provider {
         // The closure owns a clone of the client, so the future oauth2 builds
         // from it borrows nothing and stays `Send` for axum.
         let http = |request| send(self.http.clone(), request);
-        let response = discovery
-            .client
-            .exchange_code(AuthorizationCode::new(code.to_owned()))
-            .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier.to_owned()))
-            .request_async(&http)
-            .await
-            .map_err(|error| self.error(format!("the code exchange failed: {error}")))?;
+        let response = observed(
+            &self.id,
+            "token",
+            discovery
+                .client
+                .exchange_code(AuthorizationCode::new(code.to_owned()))
+                .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier.to_owned()))
+                .request_async(&http),
+        )
+        .await
+        .map_err(|error| self.error(format!("the code exchange failed: {error}")))?;
         let id_token = response
             .extra_fields()
             .id_token
@@ -538,7 +543,7 @@ impl Provider {
             return first.map_err(|error| OidcError::Rejected(error.to_string()));
         }
         discovery
-            .refresh_keys(&self.http)
+            .refresh_keys(&self.id, &self.http)
             .await
             .map_err(|error| self.error(error))?;
         verify_id_token(token, &discovery.keys.read().await.set, &expected, now)
@@ -606,6 +611,24 @@ impl Provider {
         }
         Some(url.into())
     }
+}
+
+/// Runs one request to the provider `provider` and records it in the OIDC
+/// metrics under `op` (`discovery`, `token`, `userinfo` or `jwks`).
+async fn observed<T, E>(
+    provider: &str,
+    op: &str,
+    request: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let started = Instant::now();
+    let result = request.await;
+    crate::metrics::record_oidc_request(
+        provider,
+        op,
+        result.is_ok(),
+        started.elapsed().as_secs_f64(),
+    );
+    result
 }
 
 /// Sends one of oauth2's requests through `http`.

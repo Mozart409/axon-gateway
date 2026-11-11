@@ -137,12 +137,14 @@ async fn redeem(
     match store.redeem_break_glass_code(&form.code).await {
         Ok(Some(session)) => {
             tracing::warn!(user_id = %session.user_id, "break-glass admin login");
+            crate::metrics::record_authn("break_glass", "ok");
             let max_age = i64::try_from(BREAK_GLASS_SESSION_MAX_AGE.as_secs()).unwrap_or(i64::MAX);
             let jar = jar.add(host_cookie(SESSION_COOKIE, session.token, max_age));
             (jar, Redirect::to(LANDING)).into_response()
         }
         Ok(None) => {
             tracing::warn!("a break-glass login was refused: unknown, used or expired code");
+            crate::metrics::record_authn("break_glass", "invalid");
             link_expired(&state)
         }
         Err(error) => {

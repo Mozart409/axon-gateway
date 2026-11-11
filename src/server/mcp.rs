@@ -128,7 +128,7 @@ pub(super) async fn authenticate_mcp(
         .get("mcp-method")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    crate::metrics::record_mcp_request(mcp_method);
+    crate::metrics::record_mcp_request(mcp_method, crate::metrics::principal_type(&caller));
     log_principal(&caller, mcp_method, client_ip.as_deref());
 
     let toolset = path_params

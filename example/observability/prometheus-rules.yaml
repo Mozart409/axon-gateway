@@ -1,0 +1,82 @@
+# Prometheus alert rules for axon-gateway (plain rule-file format).
+#
+# Check:   promtool check rules prometheus-rules.yaml
+# Load:    list this file under `rule_files:` in prometheus.yml.
+# Helm:    deploy/helm/axon-gateway/files/prometheus-rules.yaml is a copy of this
+#          file (`just axon-deploy-check` verifies they match); the chart
+#          rewrites `job="axon-gateway"` to the scrape job of the release.
+#
+# Gauges that every replica reports are aggregated with max, so one healthy
+# replica is enough to keep an alert quiet (a backend is "up" if any replica
+# reaches it).
+groups:
+  - name: axon-gateway
+    rules:
+      - alert: AxonGatewayDown
+        expr: (up{job="axon-gateway"} == 0) or absent(up{job="axon-gateway"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "axon-gateway {{ $labels.instance }} is down"
+          description: "Prometheus could not scrape axon-gateway (job axon-gateway) for 5 minutes, or the job has no targets at all."
+
+      - alert: AxonSharedBackendDown
+        expr: max by (backend) (axon_backend_up) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shared backend {{ $labels.backend }} is unreachable"
+          description: "No gateway replica could connect to or health-probe backend {{ $labels.backend }} for 5 minutes."
+
+      - alert: AxonToolCallErrorRate
+        expr: |
+          (
+            sum by (backend) (rate(axon_tool_call_errors_total[10m]))
+            /
+            sum by (backend) (rate(axon_tool_calls_total[10m]))
+          ) > 0.1
+          and
+          sum by (backend) (rate(axon_tool_calls_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 10% of tool calls to {{ $labels.backend }} fail"
+          description: "{{ $value | humanizePercentage }} of tool calls to backend {{ $labels.backend }} failed over the last 10 minutes (at least 0.05 calls/s)."
+
+      - alert: AxonAuthFailureSpike
+        expr: sum(rate(axon_authn_total{result!="ok"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Authentication failures above 1/s"
+          description: "The gateway has rejected {{ $value | humanize }} authentication attempts per second for 10 minutes. Check for a misconfigured client or a credential-stuffing attempt."
+
+      - alert: AxonDatabaseDown
+        expr: max(axon_db_up) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "axon-gateway cannot reach its database"
+          description: "Every gateway replica reports its database as unreachable for 2 minutes. Readiness fails and users, tokens and shared sessions are unavailable."
+
+      - alert: AxonOidcProviderUnreachable
+        expr: max by (provider) (axon_oidc_provider_up) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OIDC provider {{ $labels.provider }} is unreachable"
+          description: "No gateway replica could reach OIDC provider {{ $labels.provider }} for 10 minutes. Browser and bearer logins through it fail."
+
+      - alert: AxonAuditDropping
+        expr: increase(axon_audit_dropped_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "axon-gateway {{ $labels.instance }} is dropping audit events"
+          description: "The tool-call audit queue was full and dropped {{ $value | humanize }} events in the last 15 minutes. The database may be slow or down."

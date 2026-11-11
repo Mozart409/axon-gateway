@@ -19,7 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::backend::{BackendActor, BackendOptions, OutcomeHook, http_transport};
+use crate::backend::{BackendActor, BackendOptions, GetBackendInfo, OutcomeHook, http_transport};
 use crate::changes::{ChangeBus, ChangeScope};
 use crate::config::{
     BackendConfig, Config, CredentialField, PersonalBackendsConfig, TransportType,
@@ -30,6 +30,7 @@ use crate::registry::{RegisterBackend, RegistryActor};
 use crate::store::{
     CatalogEntry, PersonalBackend, SealedColumns, Store, StoreError, UserCredential,
 };
+use crate::types::BackendState;
 
 /// Prefixes nobody may take for a personal backend
 const RESERVED_PREFIXES: &[&str] = &[
@@ -385,6 +386,27 @@ impl PersonalHub {
             stop_slot(&slot).await;
         }
         self.changes.publish(ChangeScope::User(user));
+    }
+
+    /// The connection state of every backend this replica holds for users. A
+    /// backend that does not answer is left out.
+    pub async fn backend_states(&self) -> Vec<BackendState> {
+        let slots: Vec<Arc<UserSlot>> = self
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(|entry| entry.slot.clone())
+            .collect();
+        let mut states = Vec::new();
+        for slot in slots {
+            for backend in slot.backends.values() {
+                if let Ok(info) = backend.ask(GetBackendInfo).await {
+                    states.push(info.state);
+                }
+            }
+        }
+        states
     }
 
     /// Drops every slot and tells all clients once.

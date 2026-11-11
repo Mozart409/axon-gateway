@@ -1,0 +1,150 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "axon-gateway.fullname" . }}
+  labels:
+    {{- include "axon-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "axon-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "axon-gateway.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- /*
+        No checksum/config annotation on purpose: the gateway watches the
+        mounted config file and hot-reloads it, so a config change must not
+        roll the pods. Secrets and env are only read at start, so changing
+        them needs `kubectl rollout restart`.
+      */}}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "axon-gateway.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: axon-gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: AXON_GATEWAY_CONFIG
+              value: /etc/axon/config.toml
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            {{- if .Values.logJson }}
+            - name: AXON_LOG_JSON
+              value: "1"
+            {{- end }}
+            {{- if .Values.kek.existingSecret }}
+            - name: AXON_KEK_FILE
+              value: /etc/axon-kek/{{ .Values.kek.key }}
+            {{- end }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.existingSecret .Values.envFrom }}
+          envFrom:
+            {{- if .Values.existingSecret }}
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+            {{- end }}
+            {{- with .Values.envFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ .Values.preStopSleepSeconds | quote }}]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/axon
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.kek.existingSecret }}
+            - name: kek
+              mountPath: /etc/axon-kek
+              readOnly: true
+            {{- end }}
+      volumes:
+        # The whole ConfigMap is mounted as a directory (no subPath), so the
+        # kubelet's atomic `..data` symlink swap reaches the hot-reload watcher.
+        - name: config
+          configMap:
+            name: {{ include "axon-gateway.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.kek.existingSecret }}
+        - name: kek
+          secret:
+            secretName: {{ .Values.kek.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.kek.key }}
+                path: {{ .Values.kek.key }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

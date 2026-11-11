@@ -38,6 +38,7 @@ pub(super) fn page_routes() -> Router<AppState> {
         .route("/ui/admin/tool-calls", get(handle_calls))
         .route("/ui/admin/tool-calls/{id}", get(handle_call))
         .route("/ui/admin/audit-settings", get(handle_settings))
+        .merge(super::usage_ui::page_routes())
 }
 
 /// The POST actions, to merge into the routes behind the CSRF and same-site

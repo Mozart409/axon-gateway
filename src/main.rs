@@ -58,6 +58,8 @@ use crate::server::AppState;
 
 /// How often expired dashboard sessions and login flows are deleted.
 const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+/// How often the sampler refreshes the gauges that are read from the database and the pool
+const METRICS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The legacy token auth. In multi-user mode `[[tokens]]` are config service accounts
 /// under RBAC and the shared token is refused.
@@ -210,7 +212,11 @@ async fn main() -> Result<()> {
     let metrics_handle = prometheus_builder
         .install_recorder()
         .wrap_err("failed to install Prometheus metrics recorder")?;
+    crate::metrics::describe_user_metrics();
     tracing::info!("Prometheus metrics available at /metrics");
+    if let Some(store) = &store {
+        spawn_metrics_sampler(store.clone(), personal.clone());
+    }
 
     let auth_manager = setup_auth(&config, store.is_some() && oidc.is_some());
 
@@ -379,6 +385,41 @@ fn spawn_purges(store: &store::Store) {
             }
         },
     );
+}
+
+/// Spawns the task that refreshes this replica's sampled gauges: sessions,
+/// tokens, the database pool, the database probe and the per-user backends.
+fn spawn_metrics_sampler(store: store::Store, personal: Option<Arc<PersonalHub>>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(METRICS_SAMPLE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            sample_metrics(&store, personal.as_deref()).await;
+        }
+    });
+}
+
+/// One tick of the sampler.
+async fn sample_metrics(store: &store::Store, personal: Option<&PersonalHub>) {
+    let up = store.ping().await.is_ok();
+    crate::metrics::record_db_up(up);
+    let pool = store.pool_stats();
+    crate::metrics::record_db_pool(pool.idle, pool.used, pool.max);
+    if up {
+        match store.sample_counts().await {
+            Ok(counts) => {
+                crate::metrics::record_active_sessions("mcp", counts.mcp_sessions);
+                crate::metrics::record_active_sessions("ui", counts.ui_sessions);
+                crate::metrics::record_tokens_active("pat", counts.pat_tokens);
+                crate::metrics::record_tokens_active("service", counts.service_tokens);
+            }
+            Err(error) => tracing::warn!(%error, "Failed to sample session and token counts"),
+        }
+    }
+    if let Some(hub) = personal {
+        crate::metrics::record_user_backend_states(&hub.backend_states().await);
+    }
 }
 
 #[expect(

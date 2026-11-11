@@ -108,34 +108,56 @@ pub(super) async fn authenticate(
     let auth_manager = state.auth_manager.load();
     if !auth_manager.auth_required() {
         return if state.multi_user().is_some() {
+            crate::metrics::record_authn("pat", "invalid");
             Err(Box::new(unauthorized()))
         } else {
+            crate::metrics::record_authn("open", "ok");
             Ok(Caller::Open)
         };
     }
 
     if provided_token.is_empty() {
+        crate::metrics::record_authn("legacy_token", "invalid");
         return Err(Box::new(unauthorized()));
     }
 
     if let Some((store, _)) = state.multi_user() {
         // Multi-user mode counts in Postgres, so the replicas share one limit
-        return match auth_manager.identify(provided_token) {
-            Ok(Some(identity)) => {
-                let limit = auth_manager.effective_limit(identity.rate_limit_per_minute);
-                within_rate_limit(store, &format!("config:{}", identity.name), limit).await?;
-                Ok(config_account(&identity, state))
-            }
-            // The shared token has no identity to put under RBAC
-            Ok(None) | Err(_) => Err(Box::new(unauthorized())),
+        // The shared token has no identity to put under RBAC
+        let Ok(Some(identity)) = auth_manager.identify(provided_token) else {
+            crate::metrics::record_authn("service_token", "invalid");
+            return Err(Box::new(unauthorized()));
         };
+        let limit = auth_manager.effective_limit(identity.rate_limit_per_minute);
+        within_rate_limit(
+            store,
+            "service_token",
+            &format!("config:{}", identity.name),
+            limit,
+        )
+        .await?;
+        crate::metrics::record_authn("service_token", "ok");
+        return Ok(config_account(&identity, state));
     }
 
     match auth_manager.validate_token(provided_token) {
-        Ok(Some(identity)) => Ok(Caller::Token(identity)),
-        Ok(None) => Ok(Caller::Open),
-        Err(AuthError::RateLimited { .. }) => Err(Box::new(too_many_requests())),
-        Err(_) => Err(Box::new(unauthorized())),
+        Ok(Some(identity)) => {
+            crate::metrics::record_authn("legacy_token", "ok");
+            Ok(Caller::Token(identity))
+        }
+        Ok(None) => {
+            crate::metrics::record_authn("legacy_token", "ok");
+            Ok(Caller::Open)
+        }
+        Err(AuthError::RateLimited { .. }) => {
+            crate::metrics::record_authn("legacy_token", "rate_limited");
+            crate::metrics::record_authz_denied("rate_limit");
+            Err(Box::new(too_many_requests()))
+        }
+        Err(_) => {
+            crate::metrics::record_authn("legacy_token", "invalid");
+            Err(Box::new(unauthorized()))
+        }
     }
 }
 
@@ -144,15 +166,25 @@ fn too_many_requests() -> Response {
 }
 
 /// Count a request in the shared Postgres window under `key`: 429 when the limit
-/// (requests per minute, 0 = unlimited) is used up. A store error lets the request
-/// through: the limit protects the backends, it is not an access check.
-async fn within_rate_limit(store: &Store, key: &str, limit: u32) -> Result<(), Box<Response>> {
+/// (requests per minute, 0 = unlimited) is used up, counted as `method` in
+/// `axon_authn_total`. A store error lets the request through: the limit protects
+/// the backends, it is not an access check.
+async fn within_rate_limit(
+    store: &Store,
+    method: &str,
+    key: &str,
+    limit: u32,
+) -> Result<(), Box<Response>> {
     if limit == 0 {
         return Ok(());
     }
     match store.hit_rate_limit(key, limit).await {
         Ok(true) => Ok(()),
-        Ok(false) => Err(Box::new(too_many_requests())),
+        Ok(false) => {
+            crate::metrics::record_authn(method, "rate_limited");
+            crate::metrics::record_authz_denied("rate_limit");
+            Err(Box::new(too_many_requests()))
+        }
         Err(error) => {
             tracing::warn!(%error, key, "Rate limit check failed, letting the request through");
             Ok(())
@@ -188,15 +220,26 @@ async fn authenticate_pat(
     };
     let principal = match store.authenticate_token(token, client_ip).await {
         Ok(Some(principal)) => principal,
-        Ok(None) => return Err(Box::new(unauthorized())),
+        Ok(None) => {
+            crate::metrics::record_authn("pat", "invalid");
+            return Err(Box::new(unauthorized()));
+        }
         Err(error) => return Err(Box::new(unavailable(&error))),
+    };
+    let method = if principal.is_service_account {
+        "service_token"
+    } else {
+        "pat"
     };
     within_rate_limit(
         store,
+        method,
         &format!("pat:{}", principal.token.id),
         state.auth_manager.load().effective_limit(0),
     )
     .await?;
+
+    crate::metrics::record_authn(method, "ok");
 
     let owner = &principal.owner;
     let policy = state.policy.current();

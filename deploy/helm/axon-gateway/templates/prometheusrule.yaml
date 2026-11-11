@@ -1,0 +1,25 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- /*
+  The rules are files/prometheus-rules.yaml, a copy of
+  example/observability/prometheus-rules.yaml. Its job matcher
+  (job="axon-gateway") is rewritten to the job the ServiceMonitor produces
+  (the Service name) unless prometheusRule.job overrides it.
+*/}}
+{{- $job := default (include "axon-gateway.fullname" .) .Values.prometheusRule.job }}
+{{- $rules := .Files.Get "files/prometheus-rules.yaml" | replace `job="axon-gateway"` (printf `job="%s"` $job) | fromYaml }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "axon-gateway.fullname" . }}
+  {{- with .Values.prometheusRule.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "axon-gateway.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    {{- toYaml $rules.groups | nindent 4 }}
+{{- end }}

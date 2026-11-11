@@ -252,6 +252,9 @@ pub(super) fn render_admin_page(
                     a href="/ui/admin/tool-calls" class=(LINK) { "Tool calls" }
                 }
                 p class="mt-3 text-sm" {
+                    a href="/ui/admin/usage" class=(LINK) { "Usage" }
+                }
+                p class="mt-3 text-sm" {
                     a href="/ui/admin/audit-settings" class=(LINK) { "Audit settings" }
                 }
             }

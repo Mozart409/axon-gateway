@@ -302,6 +302,12 @@ pub(super) fn render_user_bar(state: &AppState, user: &SessionUser) -> Markup {
             {
                 "Toolsets"
             }
+            a
+                class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
+                href="/ui/me/usage"
+            {
+                "My usage"
+            }
             @if state.personal.is_some() {
                 a
                     class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"

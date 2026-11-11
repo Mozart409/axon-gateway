@@ -15,8 +15,11 @@
 //!   the default is parent-based always-on
 //!
 //! Incoming W3C `traceparent` headers parent the request span, see
-//! [`http_request_span`]. A failing exporter never fails startup: the gateway
+//! [`http_request_span`]. Backend calls carry the current span's context on to
+//! the backend, see [`current_trace_context`]. A failing exporter never fails startup: the gateway
 //! logs a warning and runs without export.
+
+use std::collections::HashMap;
 
 use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -249,6 +252,42 @@ pub fn current_trace_id() -> Option<String> {
         .then(|| span_context.trace_id().to_string())
 }
 
+/// The W3C trace context of a span, as it is sent to a backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceContext {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
+}
+
+/// The W3C trace context of the current span, for a request that leaves the
+/// gateway. `None` when the span has no valid `OpenTelemetry` context (no `OTel`
+/// layer installed, or the span is disabled).
+///
+/// It is read from the span the caller is in, so take it on the task that
+/// handles the client's request: it does not survive a hop through an actor
+/// mailbox or a spawned task.
+#[must_use]
+pub fn current_trace_context() -> Option<TraceContext> {
+    use opentelemetry::trace::TraceContextExt;
+
+    let context = Span::current().context();
+    if !context.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = HashMap::new();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut carrier);
+    });
+    let traceparent = carrier.remove("traceparent")?;
+    let tracestate = carrier
+        .remove("tracestate")
+        .filter(|state| !state.is_empty());
+    Some(TraceContext {
+        traceparent,
+        tracestate,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use opentelemetry::trace::{TraceContextExt, TraceId};
@@ -330,5 +369,44 @@ mod tests {
         global::set_text_map_propagator(TraceContextPropagator::new());
         let context = extract_parent_context(request(Some("garbage")).headers());
         assert!(!context.span().span_context().is_valid());
+    }
+
+    #[test]
+    fn trace_context_is_none_without_an_otel_layer() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        let subscriber = tracing_subscriber::registry();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("call");
+            let _guard = span.enter();
+            assert_eq!(current_trace_context(), None);
+        });
+    }
+
+    #[test]
+    fn trace_context_carries_the_current_span() {
+        with_otel_subscriber(|| {
+            let span = http_request_span(&request(Some(TRACEPARENT)), "req-4");
+            let _guard = span.enter();
+            let context = current_trace_context().unwrap();
+            // Same trace as the caller's, but the gateway's own span id
+            assert!(context.traceparent.starts_with(&format!("00-{TRACE_ID}-")));
+            assert!(!context.traceparent.contains("00f067aa0c3b4e8e"));
+            assert_eq!(context.tracestate, None);
+        });
+    }
+
+    #[test]
+    fn trace_context_keeps_the_tracestate() {
+        with_otel_subscriber(|| {
+            let mut builder = Request::builder().method("GET").uri("/");
+            builder = builder
+                .header("traceparent", TRACEPARENT)
+                .header("tracestate", "vendor=value");
+            let request = builder.body(()).unwrap();
+            let span = http_request_span(&request, "req-5");
+            let _guard = span.enter();
+            let context = current_trace_context().unwrap();
+            assert_eq!(context.tracestate.as_deref(), Some("vendor=value"));
+        });
     }
 }

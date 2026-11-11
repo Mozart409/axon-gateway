@@ -1,0 +1,66 @@
+# Every optional feature on, for `helm template` in `just axon-deploy-check`.
+replicaCount: 3
+
+config: |
+  [gateway]
+  bind = "0.0.0.0:8080"
+  base_url = "https://axon.example.com"
+
+  [database]
+  url_env = "AXON_DATABASE_URL"
+
+  [[backends]]
+  name = "docs"
+  url = "https://mcp.example.com/mcp"
+  transport = "http"
+  enabled = true
+
+existingSecret: axon-gateway-env
+
+env:
+  - name: RUST_LOG
+    value: info
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability.svc:4317
+
+envFrom:
+  - secretRef:
+      name: axon-gateway-extra
+
+kek:
+  existingSecret: axon-gateway-kek
+  key: kek
+
+serviceAccount:
+  create: true
+  annotations:
+    example.com/owner: platform
+
+podAnnotations:
+  example.com/scrape: "true"
+
+podDisruptionBudget:
+  enabled: true
+
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: public-gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - axon.example.com
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+
+prometheusRule:
+  enabled: true
+  labels:
+    release: prometheus
+
+grafanaDashboard:
+  enabled: true
+  folder: Axon

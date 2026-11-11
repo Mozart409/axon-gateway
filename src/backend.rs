@@ -23,7 +23,8 @@ use rmcp::handler::client::progress::{ProgressDispatcher, ProgressSubscriber};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
     ClientCapabilities, ClientConfig, ClientRequest, GetPromptRequestParams, Implementation,
-    ProgressNotificationParam, ReadResourceRequestParams, RequestId, ServerResult,
+    ProgressNotificationParam, ReadResourceRequestParams, RequestId, RequestParamsMeta,
+    ServerResult,
 };
 use rmcp::service::{
     NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
@@ -39,6 +40,7 @@ use crate::config::{BackendConfig, TransportType};
 use crate::egress::EgressPolicy;
 use crate::registry::{RegistryActor, UpdateBackend};
 use crate::relay::CallRelay;
+use crate::telemetry::TraceContext;
 use crate::types::{BackendState, PromptDefinition, ResourceDefinition, ToolDefinition};
 
 /// Maximum backoff duration for reconnection attempts
@@ -273,6 +275,25 @@ async fn next_progress(subscriber: &mut Option<ProgressSubscriber>) -> ProgressN
         return notification;
     }
     std::future::pending().await
+}
+
+/// Put the gateway's trace context into the `_meta` of a request to a backend
+/// (`traceparent`, and `tracestate` when there is one), so the backend's spans
+/// join the gateway's trace. The gateway's context replaces one already in
+/// `_meta`, the gateway's span being the child of the client's; the rest of
+/// `_meta` is left alone.
+fn inject_trace_context(params: &mut impl RequestParamsMeta, trace: Option<&TraceContext>) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let meta = &mut params.meta_or_default().0;
+    meta.set_traceparent(trace.traceparent.as_str());
+    match &trace.tracestate {
+        Some(state) => meta.set_tracestate(state.as_str()),
+        None => {
+            meta.0.remove("tracestate");
+        }
+    }
 }
 
 /// Call a tool on `peer` on behalf of a client: forward the backend's progress
@@ -1258,6 +1279,9 @@ pub struct CallTool {
     pub arguments: serde_json::Value,
     /// The client's progress and cancellation; `None` for calls without a client
     pub relay: Option<CallRelay>,
+    /// The caller's trace context, taken where the client's request is handled: the
+    /// backend actor runs outside the caller's span
+    pub trace: Option<TraceContext>,
 }
 
 impl Message<CallTool> for BackendActor {
@@ -1284,6 +1308,7 @@ impl Message<CallTool> for BackendActor {
             if let Some(args) = msg.arguments.as_object().cloned() {
                 params = params.with_arguments(args);
             }
+            inject_trace_context(&mut params, msg.trace.as_ref());
 
             async move {
                 match msg.relay {
@@ -1303,6 +1328,8 @@ impl Message<CallTool> for BackendActor {
 #[derive(Clone)]
 pub struct ReadResource {
     pub uri: String,
+    /// The caller's trace context, see [`CallTool::trace`]
+    pub trace: Option<TraceContext>,
 }
 
 impl Message<ReadResource> for BackendActor {
@@ -1322,10 +1349,10 @@ impl Message<ReadResource> for BackendActor {
         self.spawn_call(ctx, labels, move |peer| {
             tracing::info!("Backend '{}' reading resource '{}'", backend, msg.uri);
 
-            async move {
-                peer.read_resource(ReadResourceRequestParams::new(msg.uri))
-                    .await
-            }
+            let mut params = ReadResourceRequestParams::new(msg.uri);
+            inject_trace_context(&mut params, msg.trace.as_ref());
+
+            async move { peer.read_resource(params).await }
         })
         .await
     }
@@ -1336,6 +1363,8 @@ impl Message<ReadResource> for BackendActor {
 pub struct GetPrompt {
     pub name: String,
     pub arguments: Option<std::collections::HashMap<String, String>>,
+    /// The caller's trace context, see [`CallTool::trace`]
+    pub trace: Option<TraceContext>,
 }
 
 impl Message<GetPrompt> for BackendActor {
@@ -1371,6 +1400,7 @@ impl Message<GetPrompt> for BackendActor {
             if let Some(args) = args_map {
                 params = params.with_arguments(args);
             }
+            inject_trace_context(&mut params, msg.trace.as_ref());
 
             async move { peer.get_prompt(params).await }
         })
@@ -1946,6 +1976,67 @@ mod tests {
                 .collect();
 
             assert!(filtered.is_empty());
+        }
+    }
+
+    mod trace_context {
+        use super::*;
+
+        const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0c3b4e8e-01";
+
+        fn trace(tracestate: Option<&str>) -> TraceContext {
+            TraceContext {
+                traceparent: TRACEPARENT.to_string(),
+                tracestate: tracestate.map(str::to_string),
+            }
+        }
+
+        #[test]
+        fn sets_traceparent_and_tracestate() {
+            let mut params = ReadResourceRequestParams::new("file:///a");
+
+            inject_trace_context(&mut params, Some(&trace(Some("vendor=value"))));
+
+            assert_eq!(params.traceparent(), Some(TRACEPARENT));
+            assert_eq!(params.tracestate(), Some("vendor=value"));
+        }
+
+        #[test]
+        fn keeps_existing_meta_keys() {
+            let mut params = CallToolRequestParams::new("tool");
+            params
+                .meta_or_default()
+                .0
+                .0
+                .insert("custom".to_string(), serde_json::json!(7));
+
+            inject_trace_context(&mut params, Some(&trace(None)));
+
+            let meta = params.meta().unwrap();
+            assert_eq!(meta.0.0.get("custom"), Some(&serde_json::json!(7)));
+            assert_eq!(meta.get_traceparent(), Some(TRACEPARENT));
+            assert_eq!(meta.get_tracestate(), None);
+        }
+
+        #[test]
+        fn replaces_a_context_the_request_already_has() {
+            let mut params = GetPromptRequestParams::new("prompt");
+            params.set_traceparent("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00");
+            params.set_tracestate("stale=1");
+
+            inject_trace_context(&mut params, Some(&trace(None)));
+
+            assert_eq!(params.traceparent(), Some(TRACEPARENT));
+            assert_eq!(params.tracestate(), None);
+        }
+
+        #[test]
+        fn without_a_context_the_request_is_unchanged() {
+            let mut params = CallToolRequestParams::new("tool");
+
+            inject_trace_context(&mut params, None);
+
+            assert!(params.meta().is_none());
         }
     }
 }

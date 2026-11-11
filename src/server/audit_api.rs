@@ -49,6 +49,7 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             "/api/v1/audit/capture-rules/{id}",
             delete(handle_delete_rule),
         )
+        .merge(super::usage_api::routes())
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

@@ -78,6 +78,9 @@ mod toolsets_api;
 mod toolsets_ui;
 mod toolsets_views;
 mod ui;
+mod usage_api;
+mod usage_ui;
+mod usage_views;
 mod views;
 
 /// Shared state for the HTTP server

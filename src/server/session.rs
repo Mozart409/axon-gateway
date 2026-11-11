@@ -168,7 +168,7 @@ pub(super) async fn require_session(
                 request.extensions_mut().insert(user);
                 return next.run(request).await;
             }
-            Ok(None) => {}
+            Ok(None) => crate::metrics::record_authn("session", "invalid"),
             Err(error) => {
                 tracing::warn!(%error, "could not look up a dashboard session");
                 return (
@@ -327,6 +327,7 @@ pub(super) async fn callback(
 
     if let Some(error) = &query.error {
         tracing::info!(%error, "the identity provider refused a dashboard login");
+        crate::metrics::record_authn("session", "invalid");
         return (
             jar,
             error_page(
@@ -352,6 +353,7 @@ pub(super) async fn callback(
     };
     if !state_matches(login_state.as_deref(), &returned_state) {
         tracing::warn!("a login callback did not match the browser that started it");
+        crate::metrics::record_authn("session", "invalid");
         return (jar, login_expired(&state)).into_response();
     }
 
@@ -375,7 +377,10 @@ async fn finish_login(
 ) -> Result<(String, String), Box<Response>> {
     let flow = match store.take_oidc_flow(returned_state).await {
         Ok(Some(flow)) => flow,
-        Ok(None) => return Err(Box::new(login_expired(state))),
+        Ok(None) => {
+            crate::metrics::record_authn("session", "expired");
+            return Err(Box::new(login_expired(state)));
+        }
         Err(error) => {
             tracing::warn!(%error, "could not load a dashboard login");
             return Err(Box::new(database_unavailable(state)));
@@ -383,6 +388,7 @@ async fn finish_login(
     };
     let Some(provider) = providers.get(&flow.provider_id) else {
         tracing::warn!(provider = %flow.provider_id, "a login names a provider that is gone");
+        crate::metrics::record_authn("session", "expired");
         return Err(Box::new(login_expired(state)));
     };
 
@@ -393,6 +399,7 @@ async fn finish_login(
         Ok(login) => login,
         Err(OidcError::EmailDomainNotAllowed) => {
             tracing::info!(provider = %flow.provider_id, "a login was refused: email domain not allowed");
+            crate::metrics::record_authn("session", "invalid");
             return Err(Box::new(error_page(
                 state,
                 StatusCode::FORBIDDEN,
@@ -402,6 +409,7 @@ async fn finish_login(
         }
         Err(error) => {
             tracing::warn!(%error, provider = %flow.provider_id, "a dashboard login failed at the provider");
+            crate::metrics::record_authn("session", "invalid");
             return Err(Box::new(error_page(
                 state,
                 StatusCode::BAD_REQUEST,
@@ -431,6 +439,7 @@ async fn finish_login(
     })?;
     if disabled {
         tracing::info!(user_id = %user.id, "a login was refused: the user is disabled");
+        crate::metrics::record_authn("session", "disabled");
         return Err(Box::new(error_page(
             state,
             StatusCode::FORBIDDEN,
@@ -446,6 +455,7 @@ async fn finish_login(
             Box::new(database_unavailable(state))
         })?;
 
+    crate::metrics::record_authn("session", "ok");
     tracing::info!(
         user_id = %user.id,
         provider = %flow.provider_id,

@@ -1,0 +1,19 @@
+{{- if .Values.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "axon-gateway.fullname" . }}-dashboard
+  {{- with .Values.grafanaDashboard.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "axon-gateway.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  {{- if .Values.grafanaDashboard.folder }}
+  annotations:
+    grafana_folder: {{ .Values.grafanaDashboard.folder | quote }}
+  {{- end }}
+data:
+  axon-gateway.json: |
+    {{- .Files.Get "files/grafana-dashboard.json" | nindent 4 }}
+{{- end }}

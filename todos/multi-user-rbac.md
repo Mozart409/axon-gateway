@@ -808,15 +808,18 @@ Decisions (2026-11-11):
 
 ### Phase 6 - Observability completion
 
-- [ ] New metrics (section 8), including `axon_user_tool_calls_total{user,
+- [x] New metrics (section 8), including `axon_user_tool_calls_total{user,
       backend, outcome}`, `axon_backend_inflight_calls{backend}` and
       `axon_backend_up{backend}`; pool and
       OIDC metrics.
-- [ ] Per-user usage page (the audit UI and retention job came with
+- [x] Per-user usage page (the audit UI and retention job came with
       Phase 3c).
-- [ ] Helm chart under `deploy/helm/axon-gateway/` (section 7).
-- [ ] Grafana dashboard and alert rules in `example/observability/`.
-- [ ] `traceparent` propagation to backends and MCP `_meta`.
+- [x] Helm chart under `deploy/helm/axon-gateway/` (section 7).
+- [x] Grafana dashboard and alert rules in `example/observability/`.
+- [x] `traceparent` propagation to backends and MCP `_meta`.
+- Notes: `principal_type` on `axon_mcp_requests_total` labels a service
+  account's token as `pat` when it has an owner user (heuristic, a principal
+  has no service flag); config service accounts are `service`.
 - Exit: dashboards and alerts load against a running instance.
 
 ### Phase 7 - Enterprise auth

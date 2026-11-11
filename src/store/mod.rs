@@ -16,8 +16,10 @@ mod break_glass;
 mod personal;
 mod rbac;
 mod replica;
+mod stats;
 mod tokens;
 mod toolsets;
+mod usage;
 mod views;
 
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
@@ -33,6 +35,11 @@ pub use tokens::{
     MAX_USER_TOKEN_LIFETIME, NewToken, PAT_PREFIX, ServiceAccount, TokenError,
 };
 pub use toolsets::{NewToolset, Toolset, ToolsetError};
+#[cfg(test)]
+pub use usage::{BackendUsage, ToolUsage, UsageTotals};
+pub use usage::{
+    DEFAULT_USAGE_DAYS, DailyUsage, MAX_USAGE_DAYS, UsageReport, UsageUser, UserUsageRow,
+};
 
 const MAX_CONNECTIONS: u32 = 10;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
