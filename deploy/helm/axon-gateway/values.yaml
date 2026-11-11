@@ -55,17 +55,25 @@ oidc:
 # One-shot import of a config.toml into the database (database mode only): a
 # pre-install,pre-upgrade hook Job runs
 #   axon-gateway admin import-config /config/config.toml
-# on the text below. Off by default.
+# (always with --no-tokens). Off by default.
 #   - The file wins: every install and upgrade with this on overwrites what was
 #     changed in the dashboard. Turn it off after the first run.
-#   - New service-account tokens (from `[[tokens]]`) are printed once, on the
-#     Job's log (`kubectl logs job/<release>-axon-gateway-import`, tab
-#     separated name and token). The Job is deleted a day after it finishes.
+#   - The file may hold secrets, so it lives in a Secret (mounted 0400), never
+#     a ConfigMap. Give it inline as `config` (the chart renders the Secret) or
+#     keep it out of the values with `existingSecret`; exactly one of the two.
+#   - `[[tokens]]` entries become service accounts WITHOUT a token, so no token
+#     reaches a pod log. Issue tokens in the dashboard (Admin -> Service
+#     accounts) or via the API afterwards.
+#   - The Job and the rendered Secret are deleted when the Job succeeds; a
+#     failed Job is kept for an hour (`kubectl logs
+#     job/<release>-axon-gateway-import`).
 #   - `${VAR}` references resolve from existingSecret / env / envFrom.
 import:
   enabled: false
   dryRun: false         # report only, write nothing
-  config: ""
+  config: ""            # the config.toml text; or existingSecret
+  existingSecret: ""    # name of a Secret that holds the config.toml
+  existingSecretKey: config.toml
 
 # Standalone mode (database.enabled false): the whole config.toml, rendered
 # into a ConfigMap and mounted read-only at

@@ -56,22 +56,26 @@ database mode with the file as `import.config` and `import.enabled=true`:
 ```sh
 helm upgrade axon ./rust/axon-gateway/deploy/helm/axon-gateway -f values.yaml \
   --set import.enabled=true --set-file import.config=old-config.toml
-kubectl logs job/<release>-axon-gateway-import
+kubectl logs job/<release>-axon-gateway-import   # only while the Job exists
 ```
 
-A `pre-install,pre-upgrade` hook Job (with a hook ConfigMap holding the file)
-runs `axon-gateway admin import-config /config/config.toml` with the database
-URL and the KEK. Things to know:
+A `pre-install,pre-upgrade` hook Job runs
+`axon-gateway admin import-config /config/config.toml --no-tokens` with the
+database URL and the KEK. The file may hold secrets, so it is mounted (0400)
+from a Secret: with `import.config` the chart renders a hook Secret, and
+`import.existingSecret` (key `import.existingSecretKey`, default `config.toml`)
+names one you manage instead. Set exactly one of the two. Things to know:
 
 - It is **off by default** and meant to run once. The file wins, so every
   install or upgrade with it on overwrites what was changed in the dashboard
   since. Turn it off after the first run.
 - `import.dryRun=true` only reports what would change.
-- A `[[tokens]]` entry becomes a service account with a new token. The tokens
-  are printed to the Job's log **once** (`name`, a tab, the token; the summary
-  and warnings are on the same log's stderr). Read them there. The Job is
-  deleted a day after it finishes, and an existing account never gets a second
-  token. They expire after 365 days.
+- A `[[tokens]]` entry becomes a service account **without a token**: the Job
+  always runs with `--no-tokens`, so no token lands in a pod log. Issue one in
+  the dashboard (Admin → Service accounts) or via the API. (Running the CLI by
+  hand prints new tokens once on stdout, unless you pass `--no-tokens`.)
+- The Job and the hook Secret are deleted when the Job succeeds. A failed Job
+  is kept for an hour so its log can be read.
 - `${VAR}` references in the file resolve from `existingSecret`, `env` and
   `envFrom`, which the Job gets too.
 - Keys that are environment-only in database mode (`bind`, `base_url`,
@@ -151,7 +155,9 @@ The dashboard has a `DS_PROMETHEUS` data source variable plus `job` and
 | `oidc.clientSecret.existingSecret`, `.key` | `""`, `client-secret` | Secret mounted as a file for `AXON_OIDC_CLIENT_SECRET_FILE` |
 | `import.enabled` | `false` | Hook Job running `admin import-config` on `import.config` (database mode) |
 | `import.dryRun` | `false` | Report only |
-| `import.config` | `""` | The `config.toml` text to import; required with `import.enabled` |
+| `import.config` | `""` | The `config.toml` text to import, rendered into a hook Secret; set this or `import.existingSecret` |
+| `import.existingSecret` | `""` | Name of a Secret holding the `config.toml` to import (instead of `import.config`) |
+| `import.existingSecretKey` | `config.toml` | Key of that Secret that holds the file |
 | `config` | minimal example | Standalone: the `config.toml` text (ignored in database mode) |
 | `existingSecret` | `""` | Secret whose keys become env vars |
 | `env`, `envFrom` | `[]` | Extra env / envFrom entries |

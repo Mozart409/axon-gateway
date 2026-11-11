@@ -82,7 +82,7 @@ bacon pedantic
 - **config.rs**: Config types and TOML parsing (standalone mode and the import)
 - **bootstrap.rs**: the environment of database mode (`AXON_DATABASE_URL`, `AXON_BIND`, `AXON_BASE_URL`, `AXON_ALLOW_STDIO`, `AXON_OIDC_*`)
 - **dbconfig.rs**: assembles the runtime `Config` from the database tables (backends, toolsets, OIDC providers, settings); secrets are sealed with the KEK
-- **import.rs**: `admin import-config <file> [--dry-run]`, which writes a config file into the database
+- **import.rs**: `admin import-config <file> [--dry-run] [--no-tokens]`, which writes a config file into the database
 - **types.rs**: Core domain types (ToolDefinition, JsonRpc, etc.)
 - **error.rs**: Error types using thiserror
 - **auth.rs**: Authentication middleware and token validation

@@ -3,16 +3,28 @@
 {{- fail "import.enabled needs database.enabled: the import writes into the database" }}
 {{- end }}
 {{- $_ := required "kek.existingSecret is required when import.enabled" .Values.kek.existingSecret }}
+{{- $inline := .Values.import.config }}
+{{- $existing := .Values.import.existingSecret }}
+{{- if and $inline $existing }}
+{{- fail "import.config and import.existingSecret are mutually exclusive: set exactly one" }}
+{{- end }}
+{{- if not (or $inline $existing) }}
+{{- fail "import.enabled needs the file to import: set import.config (the config.toml text) or import.existingSecret" }}
+{{- end }}
+{{- $configKey := .Values.import.existingSecretKey | default "config.toml" }}
 {{- /*
-  One-shot import of a config.toml (admin import-config). Both objects are
-  Helm hooks, so the ConfigMap exists before the Job on a first install. The
-  Job is kept after it finishes (hook-delete-policy before-hook-creation only)
-  because the new service-account tokens are on its log; the TTL removes it a
-  day later. The import runs before the Deployment is rolled, so a new
-  version's migrations run here first.
+  One-shot import of a config.toml (admin import-config). The file holds
+  secrets (backend tokens, client secrets), so it goes in a Secret, mounted
+  0400, never a ConfigMap. The Job runs with --no-tokens: [[tokens]] entries
+  become service accounts without a token, so no token ever reaches a pod log.
+  Both objects are Helm hooks, so the Secret exists before the Job on a first
+  install, and both are deleted once the Job succeeded. A failed Job stays for
+  debugging until its TTL. The import runs before the Deployment is rolled, so
+  a new version's migrations run here first.
 */}}
+{{- if $inline }}
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
   name: {{ include "axon-gateway.fullname" . }}-import
   labels:
@@ -20,11 +32,13 @@ metadata:
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": before-hook-creation
-data:
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+type: Opaque
+stringData:
   config.toml: |
-    {{- required "values.import.config (the config.toml text to import) is required" .Values.import.config | nindent 4 }}
+    {{- $inline | nindent 4 }}
 ---
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -34,10 +48,12 @@ metadata:
   annotations:
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 86400
+  # Only a failed Job is left behind (hook-succeeded deletes the rest): an hour
+  # to read its log
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       # Not the selector labels of the Deployment: the Service must not route to
@@ -64,6 +80,7 @@ spec:
             - admin
             - import-config
             - /config/config.toml
+            - --no-tokens
             {{- if .Values.import.dryRun }}
             - --dry-run
             {{- end }}
@@ -99,8 +116,16 @@ spec:
               readOnly: true
       volumes:
         - name: config
-          configMap:
-            name: {{ include "axon-gateway.fullname" . }}-import
+          secret:
+            {{- if $inline }}
+            secretName: {{ include "axon-gateway.fullname" . }}-import
+            {{- else }}
+            secretName: {{ $existing }}
+            {{- end }}
+            defaultMode: 0400
+            items:
+              - key: {{ if $inline }}config.toml{{ else }}{{ $configKey }}{{ end }}
+                path: config.toml
         - name: tmp
           emptyDir: {}
         - name: kek

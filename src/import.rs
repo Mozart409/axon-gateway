@@ -1,11 +1,11 @@
-//! `axon-gateway admin import-config <file> [--dry-run]`: writes a TOML config
+//! `axon-gateway admin import-config <file> [--dry-run] [--no-tokens]`: writes a TOML config
 //! file into the database
 //!
 //! The file wins: settings, backends, gateway toolsets, OIDC providers and the
 //! RBAC section are upserted, and each `[[tokens]]` entry becomes a service
-//! account with a fresh token. Everything runs in one transaction, which a dry
-//! run rolls back. The report goes to stderr; stdout carries only the new
-//! tokens, one `name<TAB>token` line each.
+//! account with a fresh token, or without one under `--no-tokens`. Everything
+//! runs in one transaction, which a dry run rolls back. The report goes to
+//! stderr; stdout carries only the new tokens, one `name<TAB>token` line each.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -235,8 +235,12 @@ struct Importer<'a> {
     report: Report,
     /// Service accounts met so far: id, and whether this run created it
     accounts: HashMap<String, (Uuid, bool)>,
+    /// Mint no tokens: the service accounts are created without one
+    no_tokens: bool,
     /// `(name, token)` of every token issued
     tokens: Vec<(String, String)>,
+    /// Service accounts this run created and left without a token
+    tokenless: Vec<String>,
 }
 
 impl Importer<'_> {
@@ -335,11 +339,16 @@ impl Importer<'_> {
         Ok(())
     }
 
-    /// Each `[[tokens]]` entry is a service account; a new one gets a token
+    /// Each `[[tokens]]` entry is a service account; a new one gets a token,
+    /// unless the run mints none
     async fn service_tokens(&mut self, config: &Config) -> color_eyre::Result<()> {
         for token in &config.tokens {
             let (id, created) = self.service_account(&token.name).await?;
-            if created {
+            if self.no_tokens {
+                if created {
+                    self.tokenless.push(token.name.clone());
+                }
+            } else if created {
                 let plaintext = store::import_service_token(self.conn, id, &token.name).await?;
                 self.tokens.push((token.name.clone(), plaintext));
                 self.report.record("tokens", Change::Created);
@@ -373,7 +382,8 @@ impl Importer<'_> {
 }
 
 /// Imports the config file at `path` into `db`, or only reports what it
-/// would do with `dry_run`.
+/// would do with `dry_run`. With `no_tokens` the `[[tokens]]` entries become
+/// service accounts without a token.
 ///
 /// # Errors
 /// Fails when the file cannot be loaded or a write fails; nothing is written then.
@@ -382,6 +392,7 @@ pub async fn run(
     keyring: &Keyring,
     path: &str,
     dry_run: bool,
+    no_tokens: bool,
 ) -> color_eyre::Result<()> {
     let config = Config::load_for_import(path)
         .wrap_err_with(|| format!("failed to load config from '{path}'"))?;
@@ -405,10 +416,17 @@ pub async fn run(
         keyring,
         report: Report::default(),
         accounts: HashMap::new(),
+        no_tokens,
         tokens: Vec::new(),
+        tokenless: Vec::new(),
     };
     importer.apply(&config).await?;
-    let Importer { report, tokens, .. } = importer;
+    let Importer {
+        report,
+        tokens,
+        tokenless,
+        ..
+    } = importer;
 
     if dry_run {
         tx.rollback()
@@ -420,6 +438,12 @@ pub async fn run(
     store::audit_import(&mut tx, report.details()).await?;
     tx.commit().await.wrap_err("failed to commit the import")?;
     eprintln!("{}", report.render(path, false));
+    for name in tokenless {
+        eprintln!(
+            "note: service account '{name}' has no token yet: issue one in the dashboard \
+             (Admin → Service accounts) or via the API"
+        );
+    }
     // the only time a token exists in plaintext
     let issued = !tokens.is_empty();
     for (name, token) in tokens {

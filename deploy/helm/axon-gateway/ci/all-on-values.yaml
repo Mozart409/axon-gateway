@@ -22,7 +22,7 @@ oidc:
     existingSecret: axon-gateway-oidc
     key: client-secret
 
-# The one-shot import hook, with a config that uses a ${VAR} reference.
+# The one-shot import hook, with an inline config that uses a ${VAR} reference.
 import:
   enabled: true
   dryRun: true

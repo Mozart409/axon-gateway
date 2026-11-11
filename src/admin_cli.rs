@@ -24,11 +24,13 @@ Commands:
   rewrap-secrets                 Re-wrap every sealed secret (personal
                                  backends, catalog credentials, backends and
                                  OIDC providers) under the active key
-  import-config <file> [--dry-run]
+  import-config <file> [--dry-run] [--no-tokens]
                                  Write a TOML config file into the database:
                                  the file wins, new [[tokens]] entries get a
                                  fresh token on stdout. --dry-run rolls the
-                                 import back and only reports
+                                 import back and only reports; --no-tokens
+                                 creates those service accounts without a
+                                 token (issue one in the dashboard or the API)
 
 The commands use the database-mode environment: AXON_DATABASE_URL, and the key
 (AXON_KEK_FILE or AXON_KEK) for rewrap-secrets and import-config.";
@@ -40,8 +42,12 @@ enum Command {
     LoginLink,
     /// `rewrap-secrets`
     RewrapSecrets,
-    /// `import-config <file> [--dry-run]`
-    ImportConfig { file: String, dry_run: bool },
+    /// `import-config <file> [--dry-run] [--no-tokens]`
+    ImportConfig {
+        file: String,
+        dry_run: bool,
+        no_tokens: bool,
+    },
     /// `--help`
     Help,
 }
@@ -71,13 +77,16 @@ fn no_arguments<'a>(mut args: impl Iterator<Item = &'a str>) -> Result<(), Strin
     }
 }
 
-/// The `<file>` and `--dry-run` of `import-config`, in any order
+/// The `<file>`, `--dry-run` and `--no-tokens` of `import-config`, in any order
 fn parse_import<'a>(args: impl Iterator<Item = &'a str>) -> Result<Command, String> {
     let mut file = None;
     let mut dry_run = false;
+    let mut no_tokens = false;
     for arg in args {
         if arg == "--dry-run" {
             dry_run = true;
+        } else if arg == "--no-tokens" {
+            no_tokens = true;
         } else if arg.starts_with("--") || file.is_some() {
             return Err(format!("unexpected argument '{arg}'"));
         } else {
@@ -85,7 +94,11 @@ fn parse_import<'a>(args: impl Iterator<Item = &'a str>) -> Result<Command, Stri
         }
     }
     let file = file.ok_or("import-config needs the path of a config file")?;
-    Ok(Command::ImportConfig { file, dry_run })
+    Ok(Command::ImportConfig {
+        file,
+        dry_run,
+        no_tokens,
+    })
 }
 
 /// Runs the admin command in `args` (the arguments after the program name,
@@ -99,7 +112,11 @@ pub async fn run(args: &[String]) -> color_eyre::Result<()> {
     match parse(args) {
         Ok(Command::LoginLink) => login_link().await,
         Ok(Command::RewrapSecrets) => rewrap_secrets().await,
-        Ok(Command::ImportConfig { file, dry_run }) => import_config(&file, dry_run).await,
+        Ok(Command::ImportConfig {
+            file,
+            dry_run,
+            no_tokens,
+        }) => import_config(&file, dry_run, no_tokens).await,
         Ok(Command::Help) => {
             println!("{USAGE}");
             Ok(())
@@ -132,10 +149,10 @@ fn keyring() -> color_eyre::Result<Keyring> {
 }
 
 /// Imports a config file into the database.
-async fn import_config(file: &str, dry_run: bool) -> color_eyre::Result<()> {
+async fn import_config(file: &str, dry_run: bool, no_tokens: bool) -> color_eyre::Result<()> {
     let keyring = keyring()?;
     let (_, store) = connect().await?;
-    import::run(&store, &keyring, file, dry_run).await
+    import::run(&store, &keyring, file, dry_run, no_tokens).await
 }
 
 /// Creates a break-glass code and prints the URL that redeems it.
@@ -233,29 +250,55 @@ mod tests {
         assert!(parse(&args(&["admin", "rewrap-secrets", "stray"])).is_err());
     }
 
+    fn import(file: &str, dry_run: bool, no_tokens: bool) -> Command {
+        Command::ImportConfig {
+            file: file.to_owned(),
+            dry_run,
+            no_tokens,
+        }
+    }
+
     #[test]
-    fn import_config_takes_a_file_and_an_optional_dry_run() {
+    fn import_config_takes_a_file_and_optional_flags() {
         assert_eq!(
             parse(&args(&["admin", "import-config", "a.toml"])),
-            Ok(Command::ImportConfig {
-                file: "a.toml".to_owned(),
-                dry_run: false
-            })
+            Ok(import("a.toml", false, false))
         );
-        let dry = Command::ImportConfig {
-            file: "a.toml".to_owned(),
-            dry_run: true,
-        };
         assert_eq!(
             parse(&args(&["admin", "import-config", "a.toml", "--dry-run"])),
-            Ok(dry)
+            Ok(import("a.toml", true, false))
         );
         assert_eq!(
             parse(&args(&["admin", "import-config", "--dry-run", "a.toml"])),
-            Ok(Command::ImportConfig {
-                file: "a.toml".to_owned(),
-                dry_run: true
-            })
+            Ok(import("a.toml", true, false))
+        );
+        assert_eq!(
+            parse(&args(&["admin", "import-config", "a.toml", "--no-tokens"])),
+            Ok(import("a.toml", false, true))
+        );
+        assert_eq!(
+            parse(&args(&["admin", "import-config", "--no-tokens", "a.toml"])),
+            Ok(import("a.toml", false, true))
+        );
+        assert_eq!(
+            parse(&args(&[
+                "admin",
+                "import-config",
+                "--no-tokens",
+                "a.toml",
+                "--dry-run"
+            ])),
+            Ok(import("a.toml", true, true))
+        );
+        assert_eq!(
+            parse(&args(&[
+                "admin",
+                "import-config",
+                "--dry-run",
+                "--no-tokens",
+                "a.toml"
+            ])),
+            Ok(import("a.toml", true, true))
         );
     }
 
@@ -263,6 +306,7 @@ mod tests {
     fn import_config_without_a_file_is_a_usage_error() {
         assert!(parse(&args(&["admin", "import-config"])).is_err());
         assert!(parse(&args(&["admin", "import-config", "--dry-run"])).is_err());
+        assert!(parse(&args(&["admin", "import-config", "--no-tokens"])).is_err());
         assert!(parse(&args(&["admin", "import-config", "a.toml", "b.toml"])).is_err());
         assert!(parse(&args(&["admin", "import-config", "a.toml", "--nope"])).is_err());
     }

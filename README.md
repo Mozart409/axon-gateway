@@ -163,9 +163,11 @@ grafanaDashboard: {enabled: true}
 
 To move an existing `config.toml` into the database, set `import.enabled` and
 give the file as `import.config`: a `pre-install,pre-upgrade` hook Job runs
-`axon-gateway admin import-config` on it. It is off by default, and it prints
-the new service-account tokens to the Job log once, so read them there and turn
-the value off again (see [Migrating a config file](#migrating-a-config-file)).
+`axon-gateway admin import-config --no-tokens` on it (or on a Secret you name
+with `import.existingSecret`). It is off by default. The file is mounted from a
+Secret, and the Job creates `[[tokens]]` service accounts without tokens, so no
+token reaches a pod log: issue them in the dashboard, then turn the value off
+again (see [Migrating a config file](#migrating-a-config-file)).
 The values are documented in the chart's
 [README](deploy/helm/axon-gateway/README.md).
 
@@ -552,7 +554,7 @@ are read at startup).
 
 ### Migrating a config file
 
-`axon-gateway admin import-config <file> [--dry-run]` writes an existing
+`axon-gateway admin import-config <file> [--dry-run] [--no-tokens]` writes an existing
 `config.toml` into the database, with the same environment as the gateway
 (database URL and KEK). It loads the file like the gateway does (`${VAR}`
 references, the `.env` next to it, `client_secret_env`), so the secrets the
@@ -566,12 +568,13 @@ groups, IdP mappings, grants (added when no identical one exists), custom
 roles, role bindings, and the `service_accounts` listed in `[[rbac.groups]]`
 (the account is created when missing, then made a member). Each `[[tokens]]`
 entry becomes a service account of that name, created when missing, with a
-fresh token. Its `allowed_tools` and `allowed_backends` are not carried over:
+fresh token (without one under `--no-tokens`). Its `allowed_tools` and `allowed_backends` are not carried over:
 what it may call comes from its groups.
 
 ```sh
 axon-gateway admin import-config config.toml --dry-run   # report, write nothing
 axon-gateway admin import-config config.toml > tokens.tsv
+axon-gateway admin import-config config.toml --no-tokens # accounts only, no tokens
 ```
 
 The summary (created, updated and unchanged per kind) and all warnings go to
@@ -583,6 +586,12 @@ New tokens are the only thing on **stdout**: one line per service account,
 capture it. It expires after the service-token lifetime (365 days, the note on
 stderr gives the date): plan to rotate it. An existing account gets no new
 token.
+
+With `--no-tokens` no token is minted or printed: the accounts are still
+created, counted under `service_accounts`, and stderr names each created one
+(`note: service account '<name>' has no token yet`). Issue its token in the
+dashboard (Admin → Service accounts) or via the API. The Helm import Job always
+runs this way, so tokens never land in a pod log.
 
 Warnings name the keys that are environment-only now and are not imported:
 `[gateway]` `bind`, `base_url`, `auth_token` (use a service account token) and
