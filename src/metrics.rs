@@ -7,6 +7,7 @@
 //! - `axon_backend_connections` — Gauge of backend connection states
 //! - `axon_backend_inflight_calls` — Gauge of requests in flight per backend
 //! - `axon_requests_total` — Counter of HTTP requests by method/path
+//! - `axon_mcp_requests_total` — Counter of MCP requests by `Mcp-Method` header value
 //! - `axon_health_checks_total` — Counter of health check results
 //! - `axon_audit_dropped_total` — Counter of tool call audit events dropped (queue full)
 //! - `axon_audit_write_errors_total` — Counter of failed tool call audit batch writes
@@ -94,6 +95,52 @@ pub fn record_http_request(method: &str, path: &str, status: u16) {
         "status" => status.to_string()
     )
     .increment(1);
+}
+
+/// The MCP methods `axon_mcp_requests_total` tells apart; any other value of the
+/// client-controlled `Mcp-Method` header is counted as `other`.
+const MCP_METHODS: &[&str] = &[
+    "initialize",
+    "ping",
+    "server/discover",
+    "tools/list",
+    "tools/call",
+    "resources/list",
+    "resources/templates/list",
+    "resources/read",
+    "resources/subscribe",
+    "resources/unsubscribe",
+    "prompts/list",
+    "prompts/get",
+    "completion/complete",
+    "logging/setLevel",
+    "subscriptions/listen",
+    "notifications/initialized",
+    "notifications/cancelled",
+    "notifications/progress",
+    "notifications/roots/list_changed",
+];
+
+/// Describe the MCP request metrics, so they show up with help text.
+pub fn describe_mcp_metrics() {
+    describe_counter!(
+        "axon_mcp_requests_total",
+        "MCP requests by the method in their Mcp-Method header (none: no header, other: not a known method)"
+    );
+}
+
+/// Record an MCP request by its `Mcp-Method` header; an empty `method` is a
+/// request without the header. The label is bounded: a value outside
+/// [`MCP_METHODS`] counts as `other`.
+pub fn record_mcp_request(method: &str) {
+    let label = if method.is_empty() {
+        "none"
+    } else if MCP_METHODS.contains(&method) {
+        method
+    } else {
+        "other"
+    };
+    counter!("axon_mcp_requests_total", "method" => label.to_string()).increment(1);
 }
 
 /// Record a health check result

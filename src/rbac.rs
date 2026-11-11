@@ -7,17 +7,18 @@
 //! permissions, validates input, writes through the store (which audits every
 //! change) and reloads the policy.
 
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::changes::{ChangeBus, ChangeScope};
 use crate::gateway::GetDetailedStatus;
 use crate::policy::{
-    GrantConfig, GrantView, GroupView, Permission, Permissions, Policy, RbacConfig, Role,
-    RoleBinding, RoleSubject, Source, validate_grant, validate_group_name,
+    GrantConfig, GrantView, GroupView, Permission, Permissions, Policy, RbacConfig, RbacSnapshot,
+    Role, RoleBinding, RoleSubject, Source, validate_grant, validate_group_name,
 };
 use crate::principal::TokenScope;
 use crate::server::AppState;
@@ -47,6 +48,10 @@ const MAX_SCOPE_ENTRY_CHARS: usize = 200;
 pub struct PolicyHandle {
     config: RbacConfig,
     current: RwLock<Arc<Policy>>,
+    /// The snapshot of the last refresh; `None` until the first one
+    last_snapshot: Mutex<Option<RbacSnapshot>>,
+    /// Told when a refresh finds the database rows changed
+    changes: Option<ChangeBus>,
 }
 
 impl PolicyHandle {
@@ -57,7 +62,17 @@ impl PolicyHandle {
         Self {
             config,
             current: RwLock::new(policy),
+            last_snapshot: Mutex::new(None),
+            changes: None,
         }
+    }
+
+    /// Publishes [`ChangeScope::All`] on `changes` whenever a refresh finds the
+    /// database rows changed.
+    #[must_use]
+    pub fn with_change_bus(mut self, changes: ChangeBus) -> Self {
+        self.changes = Some(changes);
+        self
     }
 
     /// The policy as of the last refresh. Hold it for one request, not longer.
@@ -73,7 +88,24 @@ impl PolicyHandle {
         let snapshot = store.rbac_snapshot().await?;
         let policy = Arc::new(Policy::from_parts(&self.config, &snapshot));
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = policy;
+        if self.remember(snapshot)
+            && let Some(changes) = &self.changes
+        {
+            changes.publish(ChangeScope::All);
+        }
         Ok(())
+    }
+
+    /// Keeps `snapshot` as the latest one; whether it differs from the one before.
+    /// The first snapshot is no change: nobody has listened to the config-only policy.
+    fn remember(&self, snapshot: RbacSnapshot) -> bool {
+        let mut last = self
+            .last_snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let changed = last.as_ref().is_some_and(|previous| *previous != snapshot);
+        *last = Some(snapshot);
+        changed
     }
 }
 
@@ -780,6 +812,8 @@ pub struct MyTokens<'a> {
     store: &'a Store,
     actor: Actor,
     owner_id: Uuid,
+    /// Told when a toolset of the caller changes
+    changes: Option<ChangeBus>,
 }
 
 impl<'a> MyTokens<'a> {
@@ -791,13 +825,28 @@ impl<'a> MyTokens<'a> {
                 label: actor_label(&session.user),
             },
             owner_id: session.user.id,
+            changes: None,
         }
+    }
+
+    /// Publishes [`ChangeScope::User`] on `changes` when a toolset of the caller changes.
+    #[must_use]
+    pub fn with_change_bus(mut self, changes: ChangeBus) -> Self {
+        self.changes = Some(changes);
+        self
     }
 
     /// The service for a session; `None` outside multi-user mode.
     pub fn from_state(state: &'a AppState, session: &SessionUser) -> Option<Self> {
         let (store, _) = state.multi_user()?;
-        Some(Self::new(store, session))
+        Some(Self::new(store, session).with_change_bus(state.changes.clone()))
+    }
+
+    /// Tells the caller's open MCP connections that their tool list may differ.
+    fn toolsets_changed(&self) {
+        if let Some(changes) = &self.changes {
+            changes.publish(ChangeScope::User(self.owner_id));
+        }
     }
 
     /// The caller's tokens, newest first, revoked and expired ones included.
@@ -872,10 +921,12 @@ impl<'a> MyTokens<'a> {
             tools: &tools,
             backends: &backends,
         };
-        Ok(self
+        let toolset = self
             .store
             .create_toolset(&self.actor, self.owner_id, &new)
-            .await?)
+            .await?;
+        self.toolsets_changed();
+        Ok(toolset)
     }
 
     /// Replaces name, description and lists of one of the caller's toolsets; the
@@ -900,10 +951,13 @@ impl<'a> MyTokens<'a> {
             tools: &tools,
             backends: &backends,
         };
-        self.store
+        let toolset = self
+            .store
             .update_toolset(&self.actor, self.owner_id, id, &new)
             .await?
-            .ok_or(AdminError::NotFound)
+            .ok_or(AdminError::NotFound)?;
+        self.toolsets_changed();
+        Ok(toolset)
     }
 
     /// Deletes one of the caller's toolsets.
@@ -919,6 +973,7 @@ impl<'a> MyTokens<'a> {
         {
             return Err(AdminError::NotFound);
         }
+        self.toolsets_changed();
         Ok(())
     }
 
@@ -1480,5 +1535,42 @@ mod tests {
         assert!(!handle.current().has_group("dev"));
         handle.refresh(&store).await.unwrap();
         assert!(handle.current().has_group("dev"));
+    }
+
+    #[test]
+    fn remember_reports_a_change_only_after_the_first_snapshot() {
+        let handle = PolicyHandle::new(test_config());
+        let mut snapshot = RbacSnapshot::default();
+
+        assert!(!handle.remember(snapshot.clone()), "first load");
+        assert!(!handle.remember(snapshot.clone()), "same rows");
+
+        snapshot.memberships.push((Uuid::nil(), "dev".to_owned()));
+        assert!(handle.remember(snapshot.clone()), "new membership");
+        assert!(!handle.remember(snapshot), "same rows again");
+    }
+
+    #[tokio::test]
+    async fn refresh_publishes_when_the_rows_changed() {
+        let Some(store) = test_store("axon_rbac_refresh_publish").await else {
+            return;
+        };
+        let bus = ChangeBus::new();
+        let mut subscription = bus.subscribe();
+        let handle = PolicyHandle::new(test_config()).with_change_bus(bus);
+        let session = test_session(&store, "root", true).await;
+        let actor = Actor {
+            user_id: Some(session.user.id),
+            label: "other replica".to_owned(),
+        };
+
+        handle.refresh(&store).await.unwrap();
+        store.create_group(&actor, "dev", None).await.unwrap();
+        handle.refresh(&store).await.unwrap();
+
+        let heard = tokio::time::timeout(Duration::from_secs(5), subscription.changed_for(None))
+            .await
+            .expect("a change is published");
+        assert!(heard);
     }
 }

@@ -16,22 +16,14 @@ mod support;
 use std::time::{Duration, Instant};
 
 use support::mock_backend::MockBackendBuilder;
-use support::{ConfigBuilder, Gateway, free_port, poll_until, rpc, rpc_call};
+use support::{ConfigBuilder, Gateway, free_port, mcp_post, poll_until, rpc, rpc_call};
 
 const DELAY: Duration = Duration::from_millis(500);
 
 /// Poll until the gateway lists at least one tool (backends connect async).
 async fn wait_for_tools(client: &reqwest::Client, base: &str) {
     poll_until(50, Duration::from_millis(100), || async {
-        let body: serde_json::Value = client
-            .post(format!("{base}/mcp"))
-            .json(&rpc("tools/list"))
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let (_, body) = mcp_post(client, &format!("{base}/mcp"), None, &rpc("tools/list")).await;
         body["result"]["tools"]
             .as_array()
             .filter(|tools| !tools.is_empty())
@@ -59,15 +51,14 @@ async fn slow_calls_to_one_backend_run_in_parallel() {
     wait_for_tools(&client, &server.base).await;
 
     let call = || async {
-        client
-            .post(format!("{}/mcp", server.base))
-            .json(&rpc_call("mock_slow", serde_json::json!({})))
-            .send()
-            .await
-            .expect("slow call")
-            .json::<serde_json::Value>()
-            .await
-            .expect("slow json")
+        let (_, body) = mcp_post(
+            &client,
+            &format!("{}/mcp", server.base),
+            None,
+            &rpc_call("mock_slow", serde_json::json!({})),
+        )
+        .await;
+        body
     };
 
     let started = Instant::now();

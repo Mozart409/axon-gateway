@@ -22,7 +22,7 @@ use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::{Value, json};
 use support::mock_backend::MockBackend;
 use support::mock_oidc::MockOidc;
-use support::{ConfigBuilder, Gateway, free_port, rpc};
+use support::{ConfigBuilder, Gateway, free_port, mcp_post, rpc};
 
 const SESSION_COOKIE: &str = "__Host-axon_session";
 const LOGIN_COOKIE: &str = "__Host-axon_login";
@@ -191,14 +191,14 @@ impl Harness {
 
     /// The status of `tools/list` with this bearer token.
     async fn mcp_status(&self, bearer: &str) -> StatusCode {
-        self.client
-            .post(self.url("/mcp"))
-            .json(&rpc("tools/list"))
-            .bearer_auth(bearer)
-            .send()
-            .await
-            .unwrap()
-            .status()
+        mcp_post(
+            &self.client,
+            &self.url("/mcp"),
+            Some(bearer),
+            &rpc("tools/list"),
+        )
+        .await
+        .0
     }
 
     /// The id of the user with this email, as the admin API lists it.

@@ -11,12 +11,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::BoxError;
+use futures::StreamExt;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
-use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::handler::client::ClientHandler;
+use rmcp::handler::client::progress::{ProgressDispatcher, ProgressSubscriber};
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+    ClientCapabilities, ClientConfig, ClientRequest, GetPromptRequestParams, Implementation,
+    ProgressNotificationParam, ReadResourceRequestParams, RequestId, ServerResult,
+};
+use rmcp::service::{
+    NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
+};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use tokio::process::Command;
@@ -26,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{BackendConfig, TransportType};
 use crate::registry::{RegistryActor, UpdateBackend};
+use crate::relay::CallRelay;
 use crate::types::{BackendState, PromptDefinition, ResourceDefinition, ToolDefinition};
 
 /// Maximum backoff duration for reconnection attempts
@@ -54,9 +64,180 @@ struct CallLabels {
 /// in an enum to store in the actor.
 enum McpClient {
     /// Client connected via streamable HTTP (used for both SSE and HTTP transports)
-    Http(RunningService<RoleClient, ()>),
+    Http(RunningService<RoleClient, BackendClient>),
     /// Client connected via child process stdio
-    Stdio(RunningService<RoleClient, ()>),
+    Stdio(RunningService<RoleClient, BackendClient>),
+}
+
+/// The client side of a backend connection
+///
+/// Routes the backend's progress notifications to the calls waiting on them and
+/// refreshes the tool list when the backend announces a change.
+#[derive(Clone)]
+struct BackendClient {
+    backend: String,
+    progress: ProgressDispatcher,
+    /// The backend actor, for the tool refresh; `None` before it has started
+    actor: Option<WeakActorRef<BackendActor>>,
+}
+
+impl ClientHandler for BackendClient {
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::new(
+            ClientCapabilities::default(),
+            Implementation::new("axon-gateway", env!("CARGO_PKG_VERSION")),
+        )
+    }
+
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.progress.handle_notification(params).await;
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let Some(actor_ref) = self.actor.as_ref().and_then(WeakActorRef::upgrade) else {
+            return;
+        };
+        let backend = self.backend.clone();
+        tracing::debug!("Backend '{backend}' announced a tool list change");
+
+        // Spawned so this connection's message loop stays free: the refresh lists
+        // tools over this very connection.
+        tokio::spawn(async move {
+            if let Err(e) = actor_ref.ask(RefreshTools).await {
+                tracing::debug!("Tool refresh for backend '{backend}' failed: {e}");
+            }
+        });
+    }
+}
+
+/// Why a request failed, as far as the circuit breaker is concerned
+trait CallFault {
+    /// The client cancelled the call; the backend is not at fault
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+impl CallFault for ServiceError {}
+
+/// Failure of a relayed tool call
+#[derive(Debug)]
+enum RelayError {
+    /// The client cancelled the call
+    Cancelled,
+    /// The backend or the connection failed it
+    Failed(String),
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled by the client"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl CallFault for RelayError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
+/// Sends `notifications/cancelled` for a request when dropped while armed, so a
+/// call that is abandoned (the backend timeout, a dropped task) does not keep
+/// running on the backend
+struct AbandonedCall {
+    peer: Peer<RoleClient>,
+    id: Option<RequestId>,
+}
+
+impl AbandonedCall {
+    fn disarm(&mut self) {
+        self.id.take();
+    }
+}
+
+impl Drop for AbandonedCall {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let peer = self.peer.clone();
+        tokio::spawn(async move {
+            let param = CancelledNotificationParam::new(Some(id), Some("timed out".to_string()));
+            let _ = peer.notify_cancelled(param).await;
+        });
+    }
+}
+
+/// The next progress notification of `subscriber`; never resolves without one
+async fn next_progress(subscriber: &mut Option<ProgressSubscriber>) -> ProgressNotificationParam {
+    if let Some(subscriber) = subscriber
+        && let Some(notification) = subscriber.next().await
+    {
+        return notification;
+    }
+    std::future::pending().await
+}
+
+/// Call a tool on `peer` on behalf of a client: forward the backend's progress
+/// to the relay and cancel the backend request when the client cancels.
+async fn call_tool_relayed(
+    peer: Peer<RoleClient>,
+    dispatcher: ProgressDispatcher,
+    params: CallToolRequestParams,
+    relay: CallRelay,
+) -> Result<CallToolResult, RelayError> {
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+    let mut handle = peer
+        .send_cancellable_request(request, PeerRequestOptions::no_options())
+        .await
+        .map_err(|e| RelayError::Failed(e.to_string()))?;
+    let mut abandoned = AbandonedCall {
+        peer: peer.clone(),
+        id: Some(handle.id.clone()),
+    };
+
+    // Dropping the subscriber unsubscribes it
+    let mut subscriber = if relay.progress.is_some() {
+        Some(dispatcher.subscribe(handle.progress_token.clone()).await)
+    } else {
+        None
+    };
+
+    let response = loop {
+        tokio::select! {
+            response = &mut handle.rx => break Some(response),
+            () = relay.cancel.cancelled() => break None,
+            notification = next_progress(&mut subscriber) => {
+                if let Some(progress) = &relay.progress {
+                    // Progress is advisory: drop it when the client is behind
+                    let _ = progress.try_send(notification);
+                }
+            }
+        }
+    };
+    drop(subscriber);
+    abandoned.disarm();
+
+    let failed = |e: ServiceError| RelayError::Failed(e.to_string());
+    match response {
+        Some(Ok(Ok(ServerResult::CallToolResult(result)))) => Ok(result),
+        Some(Ok(Ok(_))) => Err(failed(ServiceError::UnexpectedResponse)),
+        Some(Ok(Err(e))) => Err(failed(e)),
+        Some(Err(_)) => Err(failed(ServiceError::TransportClosed)),
+        None => {
+            let _ = handle
+                .cancel(Some("cancelled by the client".to_string()))
+                .await;
+            Err(RelayError::Cancelled)
+        }
+    }
 }
 
 impl McpClient {
@@ -154,6 +335,8 @@ pub struct BackendActor {
     cancel_token: CancellationToken,
     /// Limits the requests in flight to this backend
     inflight: Arc<Semaphore>,
+    /// Routes the backend's progress notifications to the calls waiting on them
+    progress: ProgressDispatcher,
 }
 
 impl BackendActor {
@@ -172,6 +355,16 @@ impl BackendActor {
             self_ref: None,
             cancel_token: CancellationToken::new(),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CALLS_PER_BACKEND)),
+            progress: ProgressDispatcher::new(),
+        }
+    }
+
+    /// The client handler for a new connection to the backend
+    fn client_handler(&self) -> BackendClient {
+        BackendClient {
+            backend: self.config.name.clone(),
+            progress: self.progress.clone(),
+            actor: self.self_ref.clone(),
         }
     }
 
@@ -212,7 +405,7 @@ impl BackendActor {
                 }
                 let transport = StreamableHttpClientTransport::from_config(transport_config);
 
-                let service = timeout(connect_timeout, ().serve(transport))
+                let service = timeout(connect_timeout, self.client_handler().serve(transport))
                     .await
                     .map_err(|_| format!("Connection timeout after {}s", self.config.timeout_secs))?
                     .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
@@ -247,7 +440,7 @@ impl BackendActor {
                     .map_err(|e| format!("Failed to spawn process {cmd}: {e}"))?;
 
                 let connect_timeout = Duration::from_secs(self.config.timeout_secs);
-                let service = timeout(connect_timeout, ().serve(transport))
+                let service = timeout(connect_timeout, self.client_handler().serve(transport))
                     .await
                     .map_err(|_| {
                         format!(
@@ -486,7 +679,7 @@ impl BackendActor {
     where
         Fut: Future<Output = Result<T, E>> + Send + 'static,
         T: serde::Serialize + Send,
-        E: std::fmt::Display + Send,
+        E: std::fmt::Display + CallFault + Send,
     {
         let (delegated, reply_tx) = ctx.reply_sender();
 
@@ -516,21 +709,24 @@ impl BackendActor {
 
             let result = timeout(Duration::from_secs(timeout_secs), request(peer)).await;
 
-            // The error is what the actor counts against the circuit breaker; a result that
-            // cannot be serialized still reached the backend, so it counts as a success.
-            let (reply, error) = match result {
+            // The outcome is what the actor counts against the circuit breaker: `Some(None)`
+            // a success, `Some(Some(error))` a failure, `None` nothing (a client cancellation
+            // says nothing about the backend). A result that cannot be serialized still
+            // reached the backend, so it counts as a success.
+            let (reply, outcome) = match result {
                 Ok(Ok(value)) => (
                     serde_json::to_value(&value)
                         .map_err(|e| format!("{}: {e}", labels.serialize_failed)),
-                    None,
+                    Some(None),
                 ),
+                Ok(Err(e)) if e.is_cancelled() => (Err(e.to_string()), None),
                 Ok(Err(e)) => {
                     let error_msg = format!("{}: {e}", labels.failed);
-                    (Err(error_msg.clone()), Some(error_msg))
+                    (Err(error_msg.clone()), Some(Some(error_msg)))
                 }
                 Err(_) => {
                     let error_msg = format!("{} after {timeout_secs}s", labels.timed_out);
-                    (Err(error_msg.clone()), Some(error_msg))
+                    (Err(error_msg.clone()), Some(Some(error_msg)))
                 }
             };
 
@@ -538,7 +734,9 @@ impl BackendActor {
                 reply_tx.send(reply);
             }
 
-            if let Some(actor_ref) = self_ref.and_then(|weak| weak.upgrade()) {
+            if let Some(error) = outcome
+                && let Some(actor_ref) = self_ref.and_then(|weak| weak.upgrade())
+            {
                 let _ = actor_ref.tell(CallOutcome { error }).await;
             }
         });
@@ -782,6 +980,8 @@ impl Actor for BackendActor {
 pub struct CallTool {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// The client's progress and cancellation; `None` for calls without a client
+    pub relay: Option<CallRelay>,
 }
 
 impl Message<CallTool> for BackendActor {
@@ -794,6 +994,7 @@ impl Message<CallTool> for BackendActor {
             timed_out: "Tool call timeout",
             serialize_failed: "Failed to serialize tool result",
         };
+        let dispatcher = self.progress.clone();
         self.spawn_call(ctx, labels, move |peer| {
             tracing::info!(
                 "Backend '{}' executing tool '{}' with args: {}",
@@ -808,7 +1009,15 @@ impl Message<CallTool> for BackendActor {
                 params = params.with_arguments(args);
             }
 
-            async move { peer.call_tool(params).await }
+            async move {
+                match msg.relay {
+                    Some(relay) => call_tool_relayed(peer, dispatcher, params, relay).await,
+                    None => peer
+                        .call_tool(params)
+                        .await
+                        .map_err(|e| RelayError::Failed(e.to_string())),
+                }
+            }
         })
     }
 }

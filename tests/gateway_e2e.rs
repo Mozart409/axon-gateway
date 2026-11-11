@@ -15,7 +15,7 @@
 
 mod support;
 
-use support::{ConfigBuilder, Gateway, free_port, rpc};
+use support::{ConfigBuilder, Gateway, free_port, mcp_post, rpc};
 
 #[tokio::test]
 async fn serves_status_and_mcp_without_auth() {
@@ -59,28 +59,20 @@ async fn serves_status_and_mcp_without_auth() {
         .expect("build json");
     assert!(build["version"].is_string());
 
-    // MCP initialize handshake.
-    let init: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc("initialize"))
-        .send()
-        .await
-        .expect("initialize request")
-        .json()
-        .await
-        .expect("initialize json");
-    assert_eq!(init["result"]["serverInfo"]["name"], "axon-gateway");
+    // Stateless server discovery: no initialize handshake is needed.
+    let mcp = format!("{}/mcp", server.base);
+    let (status, discover) = mcp_post(&client, &mcp, None, &rpc("server/discover")).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{discover}");
+    assert!(
+        discover["result"]["supportedVersions"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|v| v == "2026-07-28")),
+        "{discover}"
+    );
 
     // tools/list returns an empty set when no backends are configured.
-    let tools: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc("tools/list"))
-        .send()
-        .await
-        .expect("tools/list request")
-        .json()
-        .await
-        .expect("tools/list json");
+    let (status, tools) = mcp_post(&client, &mcp, None, &rpc("tools/list")).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{tools}");
     assert_eq!(
         tools["result"]["tools"].as_array().map(Vec::len),
         Some(0),
@@ -100,33 +92,15 @@ async fn enforces_bearer_auth_on_mcp() {
     let mcp = format!("{}/mcp", server.base);
 
     // No Authorization header -> 401.
-    let missing = client
-        .post(&mcp)
-        .json(&rpc("initialize"))
-        .send()
-        .await
-        .expect("request without auth");
-    assert_eq!(missing.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let (status, _) = mcp_post(&client, &mcp, None, &rpc("tools/list")).await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
 
     // Wrong token -> 401.
-    let wrong = client
-        .post(&mcp)
-        .bearer_auth("not-the-token")
-        .json(&rpc("initialize"))
-        .send()
-        .await
-        .expect("request with wrong token");
-    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let (status, _) = mcp_post(&client, &mcp, Some("not-the-token"), &rpc("tools/list")).await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
 
-    // Correct token -> 200 and a valid handshake.
-    let ok = client
-        .post(&mcp)
-        .bearer_auth(token)
-        .json(&rpc("initialize"))
-        .send()
-        .await
-        .expect("request with correct token");
-    assert_eq!(ok.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = ok.json().await.expect("ok json");
-    assert_eq!(body["result"]["serverInfo"]["name"], "axon-gateway");
+    // Correct token -> 200 and a valid response.
+    let (status, body) = mcp_post(&client, &mcp, Some(token), &rpc("server/discover")).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert!(body["result"]["supportedVersions"].is_array(), "{body}");
 }

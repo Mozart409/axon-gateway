@@ -26,7 +26,7 @@ use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::{Value, json};
 use support::mock_backend::{MockBackend, MockBackendBuilder};
 use support::mock_oidc::MockOidc;
-use support::{ConfigBuilder, Gateway, free_port, poll_until, rpc, rpc_call};
+use support::{ConfigBuilder, Gateway, free_port, mcp_post, poll_until, rpc, rpc_call};
 
 const SESSION_COOKIE: &str = "__Host-axon_session";
 const LOGIN_COOKIE: &str = "__Host-axon_login";
@@ -209,17 +209,7 @@ impl Harness {
 
     /// A JSON-RPC call to `/mcp` with a bearer token; status and body.
     async fn mcp(&self, bearer: &str, body: &Value) -> (StatusCode, Value) {
-        let resp = self
-            .client
-            .post(self.url("/mcp"))
-            .bearer_auth(bearer)
-            .json(body)
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status();
-        let text = resp.text().await.unwrap();
-        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        mcp_post(&self.client, &self.url("/mcp"), Some(bearer), body).await
     }
 
     /// Waits until the `files` backend has connected, as seen by this token.
@@ -235,10 +225,16 @@ impl Harness {
         .expect("the files backend should connect");
     }
 
-    /// `tools/call` with a token; the whole JSON-RPC answer.
+    /// `tools/call` with a token; the whole JSON-RPC answer. A hidden tool's
+    /// "method not found" (-32601) comes with HTTP 404.
     async fn call(&self, token: &str, tool: &str, arguments: Value) -> Value {
         let (status, body) = self.mcp(token, &rpc_call(tool, arguments)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        let expected = if body["error"]["code"] == -32601 {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(status, expected, "{body}");
         body
     }
 

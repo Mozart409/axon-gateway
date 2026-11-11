@@ -1,20 +1,40 @@
-//! MCP JSON-RPC endpoints (`/mcp`, `/mcp/sse`, `/mcp/toolset/{name}`, plus the
-//! deprecated alias `/mcp/group/{name}`) and the toolset listing.
+//! The MCP endpoints (`/mcp`, `/mcp/toolset/{name}`, plus the deprecated alias
+//! `/mcp/group/{name}`) and the toolset listing.
+//!
+//! The wire protocol (Streamable HTTP, sessions, `Accept` and protocol version
+//! checks, JSON-RPC framing) is rmcp's [`StreamableHttpService`]. [`AxonMcp`] is the
+//! handler behind it and only translates: rmcp's typed requests become the gateway's
+//! [`JsonRpcRequest`], and the gateway's [`JsonRpcResponse`] becomes rmcp's result or
+//! error, so the gateway stays the one place of policy. [`authenticate_mcp`] runs in
+//! front of the transport and tells the handler who is calling.
 
-use std::convert::Infallible;
+use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse, Json, Response,
-        sse::{Event, Sse},
-    },
+    extract::{RawPathParams, Request, State},
+    http::{StatusCode, header},
+    middleware::Next,
+    response::{IntoResponse, Json, Response},
 };
-use futures::stream;
+use rmcp::ErrorData;
+use rmcp::ServerHandler;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, Extensions,
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    ProgressToken, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, RequestId, ServerCapabilities, ServerConfig, SubscriptionFilter,
+};
+use rmcp::service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use super::AppState;
 use super::auth::{ClientIp, authenticate};
@@ -22,6 +42,7 @@ use crate::audit::{CallOutcome, ToolCallEvent};
 use crate::auth::AuthManager;
 use crate::gateway::{Caller, DescribeTool, HandleRequest, HandleToolsetRequest};
 use crate::principal::{PrincipalPolicy, TokenScope};
+use crate::relay::{CallRelay, PROGRESS_BUFFER};
 use crate::types::{JsonRpcRequest, JsonRpcResponse};
 
 /// Longest `User-Agent` kept in the audit.
@@ -29,6 +50,121 @@ const MAX_USER_AGENT_CHARS: usize = 200;
 
 /// JSON-RPC code of a gateway that failed to answer.
 const INTERNAL_ERROR: i32 = -32603;
+
+/// JSON-RPC code of a legacy token that may not call the tool.
+const FORBIDDEN: i32 = -32000;
+
+/// Who is calling and how, as [`authenticate_mcp`] found out. It travels in the
+/// request's extensions through rmcp, which hands the handler the request's
+/// `http::request::Parts`.
+#[derive(Clone)]
+struct McpCaller {
+    caller: Arc<Caller>,
+    client_ip: Option<String>,
+    user_agent: Option<String>,
+    /// The toolset named in the path of `/mcp/toolset/{name}`; `None` on `/mcp`
+    toolset: Option<String>,
+}
+
+/// The caller [`authenticate_mcp`] recorded on the request behind `extensions`.
+fn mcp_caller(extensions: &Extensions) -> Result<McpCaller, ErrorData> {
+    extensions
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<McpCaller>())
+        .cloned()
+        .ok_or_else(|| ErrorData::internal_error("request carries no authenticated caller", None))
+}
+
+/// The owner a caller's tool-list changes are published for: the user behind a
+/// principal. Legacy token and open callers have none and hear only global changes.
+fn change_owner(caller: &Caller) -> Option<Uuid> {
+    match caller {
+        Caller::Principal(principal) => principal.owner_id(),
+        Caller::Open | Caller::Token(_) => None,
+    }
+}
+
+/// Log which principal (user or service account and token) sent a request.
+/// `method` is the `Mcp-Method` header, empty when the request has none.
+fn log_principal(caller: &Caller, method: &str, client_ip: Option<&str>) {
+    if let Caller::Principal(principal) = caller {
+        tracing::debug!(
+            principal = principal.label(),
+            method,
+            ip = client_ip,
+            "MCP request"
+        );
+    }
+}
+
+/// Authenticates a request to an MCP endpoint before rmcp's transport sees it.
+///
+/// A refused request gets `authenticate`'s response unchanged (a 401 stays an HTTP
+/// 401). An accepted one carries an [`McpCaller`] in its extensions, and is counted
+/// by the `Mcp-Method` header the client sent (rmcp checks it against the body).
+pub(super) async fn authenticate_mcp(
+    State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
+    path_params: RawPathParams,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let caller = match authenticate(request.headers(), &state, client_ip.as_deref()).await {
+        Ok(caller) => caller,
+        Err(response) => return *response,
+    };
+    let mcp_method = request
+        .headers()
+        .get("mcp-method")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    crate::metrics::record_mcp_request(mcp_method);
+    log_principal(&caller, mcp_method, client_ip.as_deref());
+
+    let toolset = path_params
+        .iter()
+        .find(|(name, _)| *name == "toolset_name")
+        .map(|(_, value)| value.to_owned());
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|agent| agent.chars().take(MAX_USER_AGENT_CHARS).collect());
+    request.extensions_mut().insert(McpCaller {
+        caller: Arc::new(caller),
+        client_ip,
+        user_agent,
+        toolset,
+    });
+    next.run(request).await
+}
+
+/// The rmcp Streamable HTTP service that serves [`AxonMcp`].
+///
+/// Sessions are kept for clients before 2026-07-28 (`legacy_session_mode`); the
+/// newer protocol is stateless. Replies are plain JSON rather than an event
+/// stream, and `mcp_allowed_hosts` guards against DNS rebinding.
+pub(super) fn mcp_service(state: &AppState) -> StreamableHttpService<AxonMcp, LocalSessionManager> {
+    crate::metrics::describe_mcp_metrics();
+    let handler = AxonMcp {
+        state: state.clone(),
+    };
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(true)
+        .with_json_response(true)
+        .with_allowed_hosts(state.mcp_allowed_hosts.clone());
+    StreamableHttpService::new(
+        move || Ok(handler.clone()),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    )
+}
+
+/// The MCP handler: asks the gateway actor for everything and relays its answer.
+#[derive(Clone)]
+pub(super) struct AxonMcp {
+    state: AppState,
+}
 
 /// What the tool-call audit needs from a `tools/call` made by a principal,
 /// taken before the call so the time can be measured around it.
@@ -45,14 +181,8 @@ struct CallAudit {
 impl CallAudit {
     /// `Some` for a `tools/call` of a principal while the audit is on. Legacy
     /// token and open callers (standalone mode) are not recorded.
-    fn start(
-        state: &AppState,
-        caller: &Caller,
-        request: &JsonRpcRequest,
-        client_ip: Option<&str>,
-        headers: &HeaderMap,
-    ) -> Option<Self> {
-        let Caller::Principal(principal) = caller else {
+    fn start(state: &AppState, auth: &McpCaller, request: &JsonRpcRequest) -> Option<Self> {
+        let Caller::Principal(principal) = auth.caller.as_ref() else {
             return None;
         };
         if request.method != "tools/call" || state.audit.is_none() {
@@ -71,11 +201,8 @@ impl CallAudit {
                 .get("arguments")
                 .cloned()
                 .unwrap_or(Value::Null),
-            client_ip: client_ip.map(str::to_owned),
-            user_agent: headers
-                .get(axum::http::header::USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .map(|agent| agent.chars().take(MAX_USER_AGENT_CHARS).collect()),
+            client_ip: auth.client_ip.clone(),
+            user_agent: auth.user_agent.clone(),
             trace_id: crate::telemetry::current_trace_id(),
             started: Instant::now(),
         })
@@ -165,195 +292,295 @@ fn outcome_of(response: Option<&JsonRpcResponse>) -> (CallOutcome, Option<i32>, 
     (CallOutcome::Ok, None, None)
 }
 
-/// Records the call when it is audited and turns the gateway's answer into the
-/// HTTP response.
-fn reply<E: std::fmt::Debug>(
-    state: &AppState,
-    audit: Option<CallAudit>,
-    result: Result<JsonRpcResponse, E>,
-) -> Response {
-    if let Some(audit) = audit {
-        audit.finish(state, result.as_ref().ok());
-    }
-    match result {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => {
-            tracing::error!("Gateway error: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+impl AxonMcp {
+    /// Asks the gateway `method` with `params` on behalf of the caller of the
+    /// request, audits it when it is a principal's `tools/call`, and turns the
+    /// answer into the rmcp result type `R`.
+    async fn forward<P: Serialize, R: DeserializeOwned>(
+        &self,
+        auth: &McpCaller,
+        id: &RequestId,
+        method: &str,
+        params: &P,
+        relay: Option<CallRelay>,
+    ) -> Result<R, ErrorData> {
+        let params = serde_json::to_value(params)
+            .map_err(|error| ErrorData::invalid_params(format!("Invalid params: {error}"), None))?;
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: serde_json::to_value(id).ok(),
+            method: method.to_owned(),
+            params,
+        };
+        let audit = CallAudit::start(&self.state, auth, &request);
+        let response = self.ask_gateway(auth, request, relay).await;
+        if let Some(audit) = audit {
+            audit.finish(&self.state, response.as_ref().ok());
         }
-    }
-}
-
-/// Answer a JSON-RPC notification (a message without an `id`).
-///
-/// Notifications get no JSON-RPC response; the Streamable HTTP transport
-/// acknowledges them with `202 Accepted` and an empty body. The gateway has
-/// nothing to do for any of them (`initialized`, `cancelled`, ...), so they are
-/// not forwarded.
-fn accept_notification(request: &JsonRpcRequest) -> Option<Response> {
-    if request.id.is_some() {
-        return None;
-    }
-    tracing::debug!(method = %request.method, "Accepted JSON-RPC notification");
-    Some(StatusCode::ACCEPTED.into_response())
-}
-
-/// Log which principal (user or service account and token) sent a request.
-fn log_principal(caller: &Caller, request: &JsonRpcRequest, client_ip: Option<&str>) {
-    if let Caller::Principal(principal) = caller {
-        tracing::debug!(
-            principal = principal.label(),
-            method = %request.method,
-            ip = client_ip,
-            "MCP request"
-        );
-    }
-}
-
-/// Handle POST /mcp - JSON-RPC over HTTP
-pub(super) async fn handle_mcp_request(
-    State(state): State<AppState>,
-    ClientIp(client_ip): ClientIp,
-    headers: HeaderMap,
-    Json(request): Json<JsonRpcRequest>,
-) -> Response {
-    let caller = match authenticate(&headers, &state, client_ip.as_deref()).await {
-        Ok(caller) => caller,
-        Err(response) => return *response,
-    };
-    if let Some(accepted) = accept_notification(&request) {
-        return accepted;
-    }
-    log_principal(&caller, &request, client_ip.as_deref());
-
-    // For tool calls, check tool-level permissions of a legacy token. A
-    // principal's are checked in the gateway, which answers a tool it may not
-    // call like an unknown one.
-    if request.method == "tools/call"
-        && let Caller::Token(identity) = &caller
-        && let Some(tool_name) = request.params.get("name").and_then(|v| v.as_str())
-        && let Err(e) = AuthManager::check_tool_permission(Some(identity), tool_name)
-    {
-        tracing::warn!("Tool permission denied: {e}");
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    let audit = CallAudit::start(&state, &caller, &request, client_ip.as_deref(), &headers);
-    let result = state
-        .gateway
-        .ask(HandleRequest {
-            request,
-            caller: Arc::new(caller),
+        let result = into_result(response?)?;
+        serde_json::from_value(result).map_err(|error| {
+            tracing::error!("Gateway answered {method} with an unexpected result: {error}");
+            ErrorData::internal_error("gateway error", None)
         })
-        .await;
-    reply(&state, audit, result)
-}
-
-/// Handle GET /mcp/sse - Server-Sent Events endpoint
-///
-/// For MCP SSE transport, the flow is:
-/// 1. Client connects to SSE endpoint
-/// 2. Server sends `endpoint` event with POST URL
-/// 3. Client sends JSON-RPC requests to that POST URL
-/// 4. Server streams responses via SSE
-pub(super) async fn handle_mcp_sse(
-    State(state): State<AppState>,
-    ClientIp(client_ip): ClientIp,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(response) = authenticate(&headers, &state, client_ip.as_deref()).await {
-        return *response;
     }
 
-    // For SSE transport, we send an initial "endpoint" message
-    // Real implementation would maintain a session and stream responses
-    let stream = stream::once(async {
-        Ok::<_, Infallible>(Event::default().event("endpoint").data("/mcp"))
-    });
-
-    Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(30))
-                .text("ping"),
-        )
-        .into_response()
-}
-
-/// Handle toolset endpoint - JSON-RPC scoped to a toolset
-///
-/// Same as `/mcp` but only lists tools in the specified toolset. Tool calls are
-/// forwarded normally (no restriction to toolset tools at call time), except for a
-/// principal that owns a toolset of that name: the toolset then narrows the principal
-/// like a pinned one, and the request is handled as on `/mcp`, listing and calls both.
-pub(super) async fn handle_toolset_request(
-    State(state): State<AppState>,
-    ClientIp(client_ip): ClientIp,
-    headers: HeaderMap,
-    Path(toolset_name): Path<String>,
-    Json(request): Json<JsonRpcRequest>,
-) -> Response {
-    let caller = match authenticate(&headers, &state, client_ip.as_deref()).await {
-        Ok(caller) => caller,
-        Err(response) => return *response,
-    };
-    if let Some(accepted) = accept_notification(&request) {
-        return accepted;
-    }
-    log_principal(&caller, &request, client_ip.as_deref());
-
-    // For tool calls, check tool-level permissions of a legacy token. A
-    // principal's are checked in the gateway, which answers a tool it may not
-    // call like an unknown one.
-    if request.method == "tools/call"
-        && let Caller::Token(identity) = &caller
-        && let Some(tool_name) = request.params.get("name").and_then(|v| v.as_str())
-        && let Err(e) = AuthManager::check_tool_permission(Some(identity), tool_name)
-    {
-        tracing::warn!("Tool permission denied: {e}");
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    let audit = CallAudit::start(&state, &caller, &request, client_ip.as_deref(), &headers);
-    let caller = match own_toolset(&state, caller, &toolset_name).await {
-        Ok(Ok(principal)) => {
-            let result = state
-                .gateway
+    /// Sends the request to the gateway actor. On `/mcp/toolset/{name}` a principal
+    /// that owns a toolset of that name is narrowed with it and served like on
+    /// `/mcp`, listing and calls both; anyone else gets the config toolset, which
+    /// only filters `tools/list` (tool calls are forwarded normally).
+    async fn ask_gateway(
+        &self,
+        auth: &McpCaller,
+        request: JsonRpcRequest,
+        relay: Option<CallRelay>,
+    ) -> Result<JsonRpcResponse, ErrorData> {
+        let gateway = &self.state.gateway;
+        let answer = match auth.toolset.as_deref() {
+            None => gateway
                 .ask(HandleRequest {
                     request,
-                    caller: Arc::new(Caller::Principal(principal)),
+                    caller: auth.caller.clone(),
+                    relay,
                 })
-                .await;
-            return reply(&state, audit, result);
-        }
-        Ok(Err(caller)) => caller,
-        Err(response) => return *response,
-    };
-
-    let result = state
-        .gateway
-        .ask(HandleToolsetRequest {
-            request,
-            caller: Arc::new(caller),
-            toolset_name,
+                .await
+                .map_err(|error| format!("{error:?}")),
+            Some(name) => match own_toolset(&self.state, &auth.caller, name).await? {
+                Some(principal) => gateway
+                    .ask(HandleRequest {
+                        request,
+                        caller: Arc::new(Caller::Principal(principal)),
+                        relay,
+                    })
+                    .await
+                    .map_err(|error| format!("{error:?}")),
+                None => gateway
+                    .ask(HandleToolsetRequest {
+                        request,
+                        caller: auth.caller.clone(),
+                        toolset_name: name.to_owned(),
+                        relay,
+                    })
+                    .await
+                    .map_err(|error| format!("{error:?}")),
+            },
+        };
+        answer.map_err(|error| {
+            tracing::error!("Gateway error: {error}");
+            ErrorData::internal_error("gateway error", None)
         })
-        .await;
-    reply(&state, audit, result)
+    }
 }
 
-/// Narrows a principal with its own toolset called `name`. `Ok(Ok(narrowed))` when it
-/// has one, `Ok(Err(caller))` hands the caller back for the config toolset path (no
-/// owner, no multi-user store, or no such toolset), `Err` is a store failure.
+/// The result of a gateway answer, or its JSON-RPC error with the same code,
+/// message and data.
+fn into_result(response: JsonRpcResponse) -> Result<Value, ErrorData> {
+    match response.error {
+        Some(error) => Err(ErrorData::new(
+            ErrorCode(error.code),
+            error.message,
+            error.data,
+        )),
+        None => Ok(response.result.unwrap_or(Value::Null)),
+    }
+}
+
+/// What a `tools/call` hands down to the backend call: the client's progress
+/// (only when it sent a progress token) and its cancellation.
+fn call_relay(context: &RequestContext<RoleServer>) -> CallRelay {
+    let progress = context.meta.get_progress_token().map(|token| {
+        let (sender, receiver) = mpsc::channel(PROGRESS_BUFFER);
+        tokio::spawn(forward_progress(receiver, token, context.peer.clone()));
+        sender
+    });
+    CallRelay {
+        progress,
+        cancel: context.ct.clone(),
+    }
+}
+
+/// Passes the backend's progress notifications on to the client, under the
+/// client's own progress token. Ends when the call is over and the channel closes.
+async fn forward_progress(
+    mut receiver: mpsc::Receiver<ProgressNotificationParam>,
+    token: ProgressToken,
+    peer: rmcp::Peer<RoleServer>,
+) {
+    while let Some(mut progress) = receiver.recv().await {
+        progress.progress_token = token.clone();
+        if let Err(error) = peer.notify_progress(progress).await {
+            tracing::debug!("Could not forward progress to the client: {error}");
+        }
+    }
+}
+
+impl ServerHandler for AxonMcp {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "axon-gateway",
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Owned(vec![
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
+        ])
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let auth = mcp_caller(&context.extensions)?;
+        self.forward(&auth, &context.id, "tools/list", &request, None)
+            .await
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let auth = mcp_caller(&context.extensions)?;
+        // A legacy token's tool-level permissions are checked here. A principal's
+        // are checked in the gateway, which answers a tool it may not call like an
+        // unknown one.
+        if let Caller::Token(identity) = auth.caller.as_ref()
+            && let Err(error) = AuthManager::check_tool_permission(Some(identity), &request.name)
+        {
+            tracing::warn!("Tool permission denied: {error}");
+            return Err(ErrorData::new(
+                ErrorCode(FORBIDDEN),
+                "Forbidden: the token may not call this tool",
+                None,
+            ));
+        }
+        let relay = call_relay(&context);
+        let result = self
+            .forward::<_, CallToolResult>(&auth, &context.id, "tools/call", &request, Some(relay))
+            .await?;
+        Ok(result.into())
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let auth = mcp_caller(&context.extensions)?;
+        self.forward(&auth, &context.id, "resources/list", &request, None)
+            .await
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let auth = mcp_caller(&context.extensions)?;
+        let result = self
+            .forward::<_, ReadResourceResult>(&auth, &context.id, "resources/read", &request, None)
+            .await?;
+        Ok(result.into())
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        let auth = mcp_caller(&context.extensions)?;
+        self.forward(&auth, &context.id, "prompts/list", &request, None)
+            .await
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let auth = mcp_caller(&context.extensions)?;
+        let result = self
+            .forward::<_, GetPromptResult>(&auth, &context.id, "prompts/get", &request, None)
+            .await?;
+        Ok(result.into())
+    }
+
+    /// Only tool-list changes are offered; rmcp narrows the request to the
+    /// intersection with this and the advertised capabilities.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(SubscriptionFilter::builder().tools_list_changed().build())
+    }
+
+    /// A 2026-07-28 `subscriptions/listen`: tells the caller whenever its tool list
+    /// may have changed, until the client cancels the request or the bus closes.
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let auth = mcp_caller(&context.request_context().extensions)?;
+        let owner = change_owner(&auth.caller);
+        let mut subscription = self.state.changes.subscribe();
+        loop {
+            tokio::select! {
+                () = context.cancelled() => return Ok(()),
+                changed = subscription.changed_for(owner) => {
+                    if !changed || context.sink().notify_tool_list_changed().await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sessions before 2026-07-28 have no `subscriptions/listen`: once the client
+    /// is initialized, a task sends it `notifications/tools/list_changed` on its
+    /// stream. It ends when sending fails (the session is gone) or the bus closes.
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        let auth = match mcp_caller(&context.extensions) {
+            Ok(auth) => auth,
+            Err(error) => {
+                tracing::warn!("No tool-list notifications for a session: {error}");
+                return;
+            }
+        };
+        let owner = change_owner(&auth.caller);
+        let mut changes = self.state.changes.subscribe();
+        let peer = context.peer.clone();
+        tokio::spawn(async move {
+            while changes.changed_for(owner).await {
+                if peer.notify_tool_list_changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// The caller narrowed with its own toolset called `name`. `Ok(None)` when it has
+/// none (the caller is no principal, has no owner, there is no multi-user store, or
+/// no such toolset) and the config toolset path applies; `Err` is a store failure.
 async fn own_toolset(
     state: &AppState,
-    caller: Caller,
+    caller: &Caller,
     name: &str,
-) -> Result<Result<PrincipalPolicy, Caller>, Box<Response>> {
-    let (Caller::Principal(principal), Some((store, _))) = (&caller, state.multi_user()) else {
-        return Ok(Err(caller));
+) -> Result<Option<PrincipalPolicy>, ErrorData> {
+    let (Caller::Principal(principal), Some((store, _))) = (caller, state.multi_user()) else {
+        return Ok(None);
     };
     let Some(owner_id) = principal.owner_id() else {
-        return Ok(Err(caller));
+        return Ok(None);
     };
     match store.toolset_by_name(owner_id, name).await {
         Ok(Some(toolset)) => {
@@ -361,15 +588,15 @@ async fn own_toolset(
                 backends: toolset.backends,
                 tools: toolset.tools,
             };
-            match caller {
-                Caller::Principal(principal) => Ok(Ok(principal.with_toolset(scope))),
-                other => Ok(Err(other)),
-            }
+            Ok(Some(principal.clone().with_toolset(scope)))
         }
-        Ok(None) => Ok(Err(caller)),
+        Ok(None) => Ok(None),
         Err(error) => {
             tracing::error!("Failed to look up a user toolset: {error}");
-            Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))
+            Err(ErrorData::internal_error(
+                "Failed to look up the toolset",
+                None,
+            ))
         }
     }
 }
@@ -397,20 +624,49 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::auth::SharedAuth;
+    use crate::config::GatewayConfig;
     use crate::server::create_router;
     use crate::server::tests::test_state;
 
-    async fn post_mcp(uri: &str, body: serde_json::Value) -> (StatusCode, Vec<u8>) {
-        let app = create_router(test_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .method(http::Method::POST)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .expect("request should build"),
-            )
+    /// The `_meta` every 2026-07-28 request carries.
+    fn stateless_meta() -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "0" },
+        })
+    }
+
+    /// A 2026-07-28 JSON-RPC request with the headers rmcp requires of it.
+    fn stateless_request(
+        uri: &str,
+        method: &str,
+        name: Option<&str>,
+        params: Value,
+    ) -> Request<Body> {
+        let mut params = params;
+        params["_meta"] = stateless_meta();
+        let mut builder = Request::builder()
+            .uri(uri)
+            .method(http::Method::POST)
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", method);
+        if let Some(name) = name {
+            builder = builder.header("mcp-name", name);
+        }
+        let body = json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": params });
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("request should build")
+    }
+
+    async fn send(state: AppState, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let response = create_router(state)
+            .oneshot(request)
             .await
             .expect("router should respond");
         let status = response.status();
@@ -420,30 +676,114 @@ mod tests {
         (status, body.to_vec())
     }
 
+    async fn call(uri: &str, method: &str, name: Option<&str>, params: Value) -> Value {
+        let (status, body) = send(test_state(), stateless_request(uri, method, name, params)).await;
+        assert!(status.is_success() || status.is_client_error(), "{status}");
+        serde_json::from_slice(&body).expect("json body")
+    }
+
     #[rstest::rstest]
     #[case("/mcp", "notifications/initialized")]
     #[case("/mcp", "notifications/cancelled")]
     #[case("/mcp/toolset/any", "notifications/initialized")]
+    #[case("/mcp/group/any", "notifications/initialized")]
     #[tokio::test]
     async fn notifications_get_202_with_empty_body(#[case] uri: &str, #[case] method: &str) {
-        let (status, body) = post_mcp(
-            uri,
-            json!({ "jsonrpc": "2.0", "method": method, "params": {} }),
-        )
-        .await;
+        let body = json!({ "jsonrpc": "2.0", "method": method, "params": {} });
+        let request = Request::builder()
+            .uri(uri)
+            .method(http::Method::POST)
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", method)
+            .body(Body::from(body.to_string()))
+            .expect("request should build");
+        let (status, body) = send(test_state(), request).await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert!(body.is_empty(), "notification body must be empty");
     }
 
     #[tokio::test]
-    async fn requests_with_id_still_get_a_json_response() {
-        let (status, body) = post_mcp(
+    async fn bare_json_post_is_rejected() {
+        // The transport is strict: no `Accept`, no protocol version, no session
+        let request = Request::builder()
+            .uri("/mcp")
+            .method(http::Method::POST)
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }).to_string(),
+            ))
+            .expect("request should build");
+        let (status, _) = send(test_state(), request).await;
+        assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn requests_with_id_get_a_json_response() {
+        let payload = call("/mcp", "tools/list", None, json!({})).await;
+        assert_eq!(payload["id"], 7);
+        assert!(payload["result"].is_object(), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn tools_list_is_answered_by_the_gateway() {
+        let payload = call("/mcp", "tools/list", None, json!({})).await;
+        assert_eq!(payload["id"], 7);
+        assert_eq!(payload["result"]["tools"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_keep_their_code_and_message() {
+        let payload = call(
             "/mcp",
-            json!({ "jsonrpc": "2.0", "id": 7, "method": "ping" }),
+            "tools/call",
+            Some("nope"),
+            json!({ "name": "nope", "arguments": {} }),
         )
         .await;
+        assert_eq!(payload["error"]["code"], -32601);
+        assert_eq!(payload["error"]["message"], "Unknown tool: nope");
+    }
+
+    #[tokio::test]
+    async fn requests_need_the_token_when_auth_is_configured() {
+        let config = GatewayConfig {
+            bind: String::from("127.0.0.1:0"),
+            base_url: String::from("http://127.0.0.1:8080"),
+            auth_token: Some(String::from("secret")),
+            rate_limit_per_minute: 0,
+            allow_stdio: false,
+            allowed_hosts: vec![],
+        };
+        let state = AppState {
+            auth_manager: SharedAuth::new(AuthManager::new(&config, &[])),
+            ..test_state()
+        };
+        let (status, _) = send(
+            state.clone(),
+            stateless_request("/mcp", "tools/list", None, json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let mut request = stateless_request("/mcp", "tools/list", None, json!({}));
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer secret".parse().expect("header"));
+        let (status, _) = send(state, request).await;
         assert_eq!(status, StatusCode::OK);
-        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(payload["id"], 7);
+    }
+
+    #[tokio::test]
+    async fn serves_the_three_protocol_versions() {
+        let handler = AxonMcp {
+            state: test_state(),
+        };
+        let versions = handler.supported_protocol_versions();
+        let names: Vec<&str> = versions.iter().map(ProtocolVersion::as_str).collect();
+        assert_eq!(names, ["2025-06-18", "2025-11-25", "2026-07-28"]);
     }
 }

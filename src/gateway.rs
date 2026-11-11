@@ -113,6 +113,8 @@ pub struct HandleRequest {
     pub request: JsonRpcRequest,
     /// Who is asking, and so what they may see and call
     pub caller: Arc<Caller>,
+    /// The client's progress and cancellation for a `tools/call`
+    pub relay: Option<crate::relay::CallRelay>,
 }
 
 impl Message<HandleRequest> for GatewayActor {
@@ -129,7 +131,9 @@ impl Message<HandleRequest> for GatewayActor {
         let router = self.router();
         let (delegated, sender) = ctx.reply_sender();
         tokio::spawn(async move {
-            let response = router.handle_request(msg.request, &msg.caller).await;
+            let response = router
+                .handle_request(msg.request, &msg.caller, msg.relay)
+                .await;
             if let Some(sender) = sender {
                 sender.send(response);
             }
@@ -288,7 +292,12 @@ impl RequestRouter {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn handle_request(&self, request: JsonRpcRequest, caller: &Caller) -> JsonRpcResponse {
+    async fn handle_request(
+        &self,
+        request: JsonRpcRequest,
+        caller: &Caller,
+        relay: Option<crate::relay::CallRelay>,
+    ) -> JsonRpcResponse {
         tracing::debug!("Handling MCP request: {}", request.method);
 
         match request.method.as_str() {
@@ -389,6 +398,7 @@ impl RequestRouter {
                                 .ask(CallTool {
                                     tool_name: original_tool_name.clone(),
                                     arguments,
+                                    relay,
                                 })
                                 .await
                             {
@@ -636,6 +646,8 @@ pub struct HandleToolsetRequest {
     pub request: JsonRpcRequest,
     pub caller: Arc<Caller>,
     pub toolset_name: String,
+    /// The client's progress and cancellation for a `tools/call`
+    pub relay: Option<crate::relay::CallRelay>,
 }
 
 impl Message<HandleToolsetRequest> for GatewayActor {
@@ -650,7 +662,7 @@ impl Message<HandleToolsetRequest> for GatewayActor {
         let (delegated, sender) = ctx.reply_sender();
         tokio::spawn(async move {
             let response = router
-                .handle_toolset_request(msg.request, &msg.caller, &msg.toolset_name)
+                .handle_toolset_request(msg.request, &msg.caller, &msg.toolset_name, msg.relay)
                 .await;
             if let Some(sender) = sender {
                 sender.send(response);
@@ -666,6 +678,7 @@ impl RequestRouter {
         request: JsonRpcRequest,
         caller: &Caller,
         toolset_name: &str,
+        relay: Option<crate::relay::CallRelay>,
     ) -> JsonRpcResponse {
         // For tools/list, return toolset-filtered tools
         if request.method == "tools/list" {
@@ -689,7 +702,7 @@ impl RequestRouter {
         }
 
         // For all other methods, delegate to the normal handler
-        self.handle_request(request, caller).await
+        self.handle_request(request, caller, relay).await
     }
 }
 
@@ -1365,6 +1378,8 @@ mod tests {
                     base_url: String::from("http://127.0.0.1:0"),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: false,
+                    allowed_hosts: vec![],
                 },
                 backends: Vec::new(),
                 tokens: Vec::new(),
@@ -1395,6 +1410,7 @@ mod tests {
                         params,
                     },
                     caller,
+                    relay: None,
                 })
                 .await
                 .unwrap()
@@ -1640,6 +1656,7 @@ mod tests {
                     },
                     caller,
                     toolset_name: String::from("any"),
+                    relay: None,
                 })
                 .await
                 .unwrap();

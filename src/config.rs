@@ -6,6 +6,7 @@
 //! bind = "0.0.0.0:8080"
 //! base_url = "http://localhost:8080"
 //! auth_token = "your-secret-token"  # optional
+//! allow_stdio = true  # needed for the stdio backend below
 //!
 //! [[backends]]
 //! name = "homeassistant"
@@ -141,6 +142,38 @@ pub struct GatewayConfig {
     /// Rate limit: max requests per minute per token (0 = unlimited)
     #[serde(default)]
     pub rate_limit_per_minute: u32,
+    /// Allow `transport = "stdio"` backends. They spawn processes inside the
+    /// gateway, so this is off by default and a stdio backend fails the load.
+    #[serde(default)]
+    pub allow_stdio: bool,
+    /// Extra `Host` names or `host:port` pairs the MCP endpoints accept, besides
+    /// loopback and the host of `base_url`
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+/// `Host` values the MCP endpoints accept: loopback, the host (and `host:port`)
+/// of `base_url`, then `[gateway] allowed_hosts`, without duplicates
+pub fn mcp_allowed_hosts(gateway: &GatewayConfig) -> Vec<String> {
+    let mut hosts: Vec<String> = ["localhost", "127.0.0.1", "::1"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if let Ok(uri) = gateway.base_url.parse::<http::Uri>()
+        && let Some(host) = uri.host()
+    {
+        // `Uri::host` keeps the brackets of an IPv6 literal
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        hosts.push(host.to_string());
+        if let Some(port) = uri.port_u16() {
+            hosts.push(format!("{host}:{port}"));
+        }
+    }
+    hosts.extend(gateway.allowed_hosts.iter().cloned());
+
+    let mut seen = std::collections::HashSet::new();
+    hosts.retain(|host| seen.insert(host.clone()));
+    hosts
 }
 
 fn default_base_url() -> String {
@@ -437,6 +470,20 @@ impl Config {
             }
         }
 
+        if !self.gateway.allow_stdio {
+            let stdio: Vec<&str> = self
+                .backends
+                .iter()
+                .filter(|b| b.transport == TransportType::Stdio)
+                .map(|b| b.name.as_str())
+                .collect();
+            if !stdio.is_empty() {
+                return Err(ConfigError::StdioNotAllowed {
+                    names: stdio.join(", "),
+                });
+            }
+        }
+
         let mut toolset_names = std::collections::HashSet::new();
         for toolset in &self.toolsets {
             if !toolset_names.insert(toolset.name.as_str()) {
@@ -705,6 +752,8 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: false,
+                    allowed_hosts: vec![],
                 },
                 backends: vec![BackendConfig {
                     name: "test".to_string(),
@@ -738,6 +787,8 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: false,
+                    allowed_hosts: vec![],
                 },
                 backends: vec![BackendConfig {
                     name: "http_backend".to_string(),
@@ -768,6 +819,8 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: true,
+                    allowed_hosts: vec![],
                 },
                 backends: vec![BackendConfig {
                     name: "stdio_backend".to_string(),
@@ -791,6 +844,52 @@ mod tests {
         }
 
         #[test]
+        fn stdio_backend_needs_allow_stdio() {
+            let config = Config {
+                gateway: GatewayConfig {
+                    bind: "0.0.0.0:8080".to_string(),
+                    base_url: "http://localhost".to_string(),
+                    auth_token: None,
+                    rate_limit_per_minute: 0,
+                    allow_stdio: false,
+                    allowed_hosts: vec![],
+                },
+                backends: vec![
+                    BackendConfig {
+                        name: "web".to_string(),
+                        transport: TransportType::Http,
+                        url: Some("http://localhost:3001/mcp".to_string()),
+                        ..Default::default()
+                    },
+                    BackendConfig {
+                        name: "files".to_string(),
+                        transport: TransportType::Stdio,
+                        command: Some("/usr/local/bin/mcp-files".to_string()),
+                        ..Default::default()
+                    },
+                    BackendConfig {
+                        name: "shell".to_string(),
+                        transport: TransportType::Stdio,
+                        command: Some("/usr/local/bin/mcp-shell".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                tokens: vec![],
+                toolsets: vec![],
+                groups: vec![],
+                database: None,
+                auth: AuthConfig::default(),
+                rbac: crate::policy::RbacConfig::default(),
+            };
+
+            let error = config.validate().expect_err("should refuse stdio");
+            match error {
+                ConfigError::StdioNotAllowed { names } => assert_eq!(names, "files, shell"),
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
         fn valid_sse_config_passes() {
             let config = Config {
                 gateway: GatewayConfig {
@@ -798,6 +897,8 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: false,
+                    allowed_hosts: vec![],
                 },
                 backends: vec![BackendConfig {
                     name: "valid".to_string(),
@@ -823,6 +924,8 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: false,
+                    allowed_hosts: vec![],
                 },
                 backends: vec![BackendConfig {
                     name: "hdr".to_string(),
@@ -886,6 +989,8 @@ mod tests {
                     base_url: "http://localhost".to_string(),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: true,
+                    allowed_hosts: vec![],
                 },
                 backends: vec![BackendConfig {
                     name: "stdio".to_string(),
@@ -1309,6 +1414,66 @@ name = "same"
             assert_eq!(config.allowed_tools, Vec::<String>::new());
             assert!(config.headers.is_empty());
             assert!(config.env.is_empty());
+        }
+    }
+
+    mod allowed_hosts {
+        use super::*;
+
+        fn gateway(base_url: &str, allowed_hosts: &[&str]) -> GatewayConfig {
+            GatewayConfig {
+                bind: "0.0.0.0:8080".to_string(),
+                base_url: base_url.to_string(),
+                auth_token: None,
+                rate_limit_per_minute: 0,
+                allow_stdio: false,
+                allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_string()).collect(),
+            }
+        }
+
+        #[test]
+        fn includes_loopback_and_base_url_host_with_port() {
+            let hosts = mcp_allowed_hosts(&gateway("http://localhost:8080", &[]));
+            assert_eq!(hosts, ["localhost", "127.0.0.1", "::1", "localhost:8080"]);
+        }
+
+        #[test]
+        fn adds_public_host_and_extra_hosts_without_duplicates() {
+            let hosts = mcp_allowed_hosts(&gateway(
+                "https://axon.homelab.internal",
+                &["axon.homelab.local", "localhost", "axon.homelab.internal"],
+            ));
+            assert_eq!(
+                hosts,
+                [
+                    "localhost",
+                    "127.0.0.1",
+                    "::1",
+                    "axon.homelab.internal",
+                    "axon.homelab.local",
+                ]
+            );
+        }
+
+        #[test]
+        fn unparsable_base_url_keeps_loopback_and_extras() {
+            let hosts = mcp_allowed_hosts(&gateway("not a url", &["axon.example"]));
+            assert_eq!(hosts, ["localhost", "127.0.0.1", "::1", "axon.example"]);
+        }
+
+        #[test]
+        fn allowed_hosts_default_to_empty_and_stdio_to_off() {
+            let toml = r#"
+                [gateway]
+                bind = "0.0.0.0:8080"
+            "#;
+            let value: toml::Table = toml::from_str(toml).expect("should parse");
+            let gateway: GatewayConfig = value["gateway"]
+                .clone()
+                .try_into()
+                .expect("should deserialize");
+            assert!(!gateway.allow_stdio);
+            assert_eq!(gateway.allowed_hosts, Vec::<String>::new());
         }
     }
 }

@@ -6,7 +6,8 @@ A lightweight, self-hosted MCP (Model Context Protocol) gateway that aggregates 
 
 - **Aggregation**: Combine tools from multiple MCP servers into one endpoint
 - **Namespacing**: Tools are automatically prefixed with backend name (e.g., `homeassistant_turn_on`)
-- **Multiple transports**: SSE, HTTP, and stdio backends supported
+- **Multiple transports**: SSE, HTTP, and stdio backends supported (stdio is opt-in, see [Gateway settings](#gateway-settings))
+- **Streamable HTTP**: Clients connect per the MCP spec and hear `notifications/tools/list_changed` when their tools change
 - **Multi-token auth**: Named API tokens with fine-grained permissions (allowed tools/backends)
 - **Toolsets**: Expose subsets of tools via different path prefixes
 - **Hot reload**: Config file watching with automatic backend updates
@@ -110,10 +111,9 @@ argument (both example files already do this).
 
 | Endpoint                                | Method | Description                                         |
 | --------------------------------------- | ------ | --------------------------------------------------- |
-| `/mcp`                                  | POST   | JSON-RPC endpoint (Streamable HTTP transport)       |
-| `/mcp/sse`                              | GET    | SSE endpoint for streaming transport                |
-| `/mcp/toolset/{toolset_name}`           | POST   | JSON-RPC endpoint filtered by toolset               |
-| `/mcp/group/{toolset_name}`             | POST   | Deprecated alias of `/mcp/toolset/{toolset_name}`   |
+| `/mcp`                                  | any    | MCP endpoint (Streamable HTTP, see MCP Endpoint)    |
+| `/mcp/toolset/{toolset_name}`           | any    | MCP endpoint filtered by toolset                    |
+| `/mcp/group/{toolset_name}`             | any    | Deprecated alias of `/mcp/toolset/{toolset_name}`   |
 | `/`                                     | GET    | Landing page                                        |
 | `/ui`                                   | GET    | SSR dashboard page                                  |
 | `/ui/backends/{name}`                   | GET    | Backend detail page                                 |
@@ -135,6 +135,37 @@ argument (both example files already do this).
 | `/status/toolsets`                      | GET    | List configured toolsets                            |
 | `/status/groups`                        | GET    | Deprecated alias of `/status/toolsets`              |
 | `/metrics`                              | GET    | Prometheus metrics endpoint                         |
+
+## MCP Endpoint
+
+`/mcp` and the toolset endpoints speak Streamable HTTP as the MCP spec defines
+it: clients `POST` JSON-RPC messages and may open a `GET` stream for messages
+from the gateway. Three protocol versions are served:
+
+- `2025-06-18` and `2025-11-25` use sessions: `initialize` returns an
+  `Mcp-Session-Id` header that the client sends on every later request.
+- `2026-07-28` is stateless: there is no session, and a client that wants to
+  hear changes opens a `subscriptions/listen` stream.
+
+`/mcp/sse`, the old SSE endpoint, is removed; point clients at `/mcp` with the
+Streamable HTTP transport.
+
+The gateway sends `notifications/tools/list_changed` to the callers a change
+concerns, after a short debounce so a burst becomes one notification:
+
+- a backend connects, disconnects or changes its tools (every caller)
+- a grant, group or role changes, in config or the database (every caller)
+- a user changes their opt-outs or toolsets (that user's callers)
+
+Progress notifications and cancellation pass through to the backend that runs
+the call, so a long tool call reports progress and stops when the client
+cancels it.
+
+The endpoints check the `Host` header against an allowlist (DNS rebinding
+protection): loopback, the host of `[gateway] base_url` and everything in
+`[gateway] allowed_hosts`. A request with any other `Host` is refused, so behind
+a reverse proxy set `base_url` to the public URL, and list every other name the
+proxy answers to in `allowed_hosts`.
 
 ## Frontend Architecture
 
@@ -352,12 +383,13 @@ login provider, and to every group they were added to by hand. A grant lets a
 group use a backend's tools (globs over the tool's original name); the union of
 a user's grants is what the "My tools" page shows as allowed.
 
-On `/mcp` (and `/mcp/sse` and the toolset endpoints) a personal access token
+On `/mcp` (and the toolset endpoints) a personal access token
 (`axon_pat_...`, or a service account's) gets exactly what its owner's policy
 allows, narrowed by the token's scope (backends and tool globs) and minus the
 owner's opt-outs, in both `tools/list` and `tools/call`. A tool the token may
 not use is hidden like one that does not exist: `tools/call` answers it with
-the same `Unknown tool` error (-32601) as for a name no backend has, and a
+the same `Unknown tool` error (-32601) as for a name no backend has (with
+HTTP 404 on the stateless 2026-07-28 path, as rmcp maps that code), and a
 backend outside the policy is listed nowhere. Without a valid token in
 multi-user mode the endpoints answer 401 with `WWW-Authenticate: Bearer`. In
 multi-user mode the shared `gateway.auth_token` is refused (401) and the
@@ -689,6 +721,47 @@ Prometheus metrics are exposed at `/metrics`:
 - `axon_audit_dropped_total` - Tool-call audit events dropped on a full queue
 - `axon_audit_write_errors_total` - Tool-call audit batches the database refused
 
+## Gateway Settings
+
+Two `[gateway]` settings control what the gateway runs and answers to:
+
+```toml
+[gateway]
+bind = "0.0.0.0:8080"
+base_url = "https://axon.example.com"
+allow_stdio = false # default
+allowed_hosts = ["axon.internal.example.com", "axon.internal.example.com:8443"]
+```
+
+- `allow_stdio` (default `false`): stdio backends spawn processes inside the
+  gateway, so they are off unless you turn them on. A config with a
+  `transport = "stdio"` backend and `allow_stdio = false` fails to load, and
+  the error names the backends.
+- `allowed_hosts` (default empty): extra `Host` names, or `host:port` pairs,
+  that `/mcp` and the toolset endpoints accept. `localhost`, `127.0.0.1`, `::1`
+  and the host of `base_url` (with its port, when it has one) are always
+  accepted.
+
+> **Upgrading:** standalone setups that run stdio backends must now set
+> `allow_stdio = true` in `[gateway]`; without it the config no longer loads.
+> Setups behind a reverse proxy should check that `base_url` is the public URL
+> and add any other name the proxy answers to (an alias, a second vhost) to
+> `allowed_hosts`.
+
+### stdio backends on Kubernetes
+
+Leave `allow_stdio` off in a cluster: a process spawned inside the gateway pod
+shares its container, its secrets and its resource limits. Run the stdio
+server in its own Deployment instead, behind a stdio-to-Streamable-HTTP bridge,
+and point axon at the Service over HTTP:
+
+```toml
+[[backends]]
+name = "local-tool"
+url = "http://local-tool.tools.svc:8000/mcp"
+transport = "http"
+```
+
 ## Environment Variable References in Config
 
 You can reference environment variables in `config.toml` using `${VAR_NAME}` placeholders.
@@ -699,6 +772,7 @@ Example:
 [gateway]
 bind = "0.0.0.0:8080"
 auth_token = "${AXON_GATEWAY_TOKEN}"
+allow_stdio = true # needed for the stdio backend below
 
 [[tokens]]
 name = "claude-agent"
@@ -744,7 +818,7 @@ Completed:
 - [x] **Tool filtering**: Support `allowed_tools` config per token/group
 - [x] **Resource/Prompt proxying**: Forward MCP resources and prompts
 - [x] **Multi-token auth**: Named tokens with fine-grained permissions
-- [x] **SSE streaming**: MCP SSE transport support (`/mcp/sse`)
+- [x] **Streamable HTTP**: MCP Streamable HTTP server (`/mcp`) with `notifications/tools/list_changed`
 
 To make it production-ready:
 
@@ -761,7 +835,7 @@ src/
 ├── registry.rs  # Registry actor (tool aggregation)
 ├── backend.rs   # Backend actor (per-server connection via rmcp)
 ├── gateway.rs   # Gateway actor (orchestration)
-└── server.rs    # HTTP/SSE server (axum)
+└── server.rs    # HTTP server (axum), MCP Streamable HTTP
 ```
 
 ## License

@@ -18,19 +18,11 @@ mod support;
 use std::time::Duration;
 
 use support::mock_backend::MockBackend;
-use support::{ConfigBuilder, Gateway, free_port, poll_until, rpc};
+use support::{ConfigBuilder, Gateway, free_port, mcp_post, poll_until, rpc};
 
 /// Number of namespaced tools the gateway currently advertises.
 async fn tool_count(client: &reqwest::Client, base: &str) -> usize {
-    let body: serde_json::Value = client
-        .post(format!("{base}/mcp"))
-        .json(&rpc("tools/list"))
-        .send()
-        .await
-        .expect("tools/list request")
-        .json()
-        .await
-        .expect("tools/list json");
+    let (_, body) = mcp_post(client, &format!("{base}/mcp"), None, &rpc("tools/list")).await;
     body["result"]["tools"].as_array().map_or(0, Vec::len)
 }
 
@@ -149,15 +141,14 @@ async fn removing_a_backend_hot_reloads_tools_away() {
 
 /// HTTP status of an authenticated `tools/list` call.
 async fn status_with_token(client: &reqwest::Client, base: &str, token: &str) -> u16 {
-    client
-        .post(format!("{base}/mcp"))
-        .bearer_auth(token)
-        .json(&rpc("tools/list"))
-        .send()
-        .await
-        .expect("tools/list request")
-        .status()
-        .as_u16()
+    let (status, _) = mcp_post(
+        client,
+        &format!("{base}/mcp"),
+        Some(token),
+        &rpc("tools/list"),
+    )
+    .await;
+    status.as_u16()
 }
 
 #[tokio::test]

@@ -285,6 +285,8 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             auth_token: Some("secret".to_string()),
             rate_limit_per_minute: 0,
+            allow_stdio: false,
+            allowed_hosts: vec![],
         };
         let auth = AuthManager::new(&config, &[]);
 
@@ -299,6 +301,8 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             auth_token: None,
             rate_limit_per_minute: 0,
+            allow_stdio: false,
+            allowed_hosts: vec![],
         };
         let tokens = vec![TokenConfig {
             name: "agent1".to_string(),
@@ -324,6 +328,8 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             auth_token: None,
             rate_limit_per_minute: 0,
+            allow_stdio: false,
+            allowed_hosts: vec![],
         };
         let auth = AuthManager::new(&config, &[]);
 
@@ -356,6 +362,8 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             auth_token: Some("secret".to_string()),
             rate_limit_per_minute: 3,
+            allow_stdio: false,
+            allowed_hosts: vec![],
         };
         let auth = AuthManager::new(&config, &[]);
 
@@ -376,6 +384,8 @@ mod tests {
             base_url: "http://localhost:8080".to_string(),
             auth_token: auth_token.map(String::from),
             rate_limit_per_minute,
+            allow_stdio: false,
+            allowed_hosts: vec![],
         }
     }
 

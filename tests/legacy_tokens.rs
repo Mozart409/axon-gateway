@@ -24,7 +24,7 @@ use reqwest::{Method, RequestBuilder, StatusCode};
 use serde_json::{Value, json};
 use support::mock_backend::MockBackend;
 use support::mock_oidc::MockOidc;
-use support::{ConfigBuilder, Gateway, free_port, poll_until, rpc};
+use support::{ConfigBuilder, Gateway, free_port, mcp_request, poll_until, rpc};
 
 const SESSION_COOKIE: &str = "__Host-axon_session";
 const LOGIN_COOKIE: &str = "__Host-axon_login";
@@ -196,18 +196,14 @@ impl Harness {
 
     /// `tools/list` with a bearer token and extra headers; status and body.
     async fn list(&self, bearer: &str, headers: &[(&str, &str)]) -> (StatusCode, Value) {
-        let mut request = self
-            .client
-            .post(self.url("/mcp"))
-            .bearer_auth(bearer)
-            .json(&rpc("tools/list"));
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let resp = request.send().await.unwrap();
-        let status = resp.status();
-        let text = resp.text().await.unwrap();
-        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        mcp_request(
+            &self.client,
+            &self.url("/mcp"),
+            Some(bearer),
+            &rpc("tools/list"),
+            headers,
+        )
+        .await
     }
 
     /// The tool names `tools/list` returns for a token, sorted.

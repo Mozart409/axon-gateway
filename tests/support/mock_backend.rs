@@ -8,7 +8,8 @@
 //!
 //! The mock records every `tools/call` it receives so tests can assert the
 //! gateway routed correctly, and individual tools can be configured to return
-//! tool-level errors.
+//! tool-level errors, to send progress notifications, or to wait until the
+//! request is cancelled.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -18,8 +19,8 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
-    ToolAnnotations,
+    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities,
+    ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -41,6 +42,12 @@ struct MockState {
     tools: Vec<Tool>,
     failing: HashSet<String>,
     slow: HashMap<String, Duration>,
+    /// Tools that send this many progress notifications before returning.
+    progress: HashMap<String, u32>,
+    /// Tools that wait until their request is cancelled.
+    cancellable: HashSet<String>,
+    /// Cancellable tools whose request was cancelled.
+    cancelled: Mutex<HashSet<String>>,
     calls: Mutex<Vec<CallRecord>>,
 }
 
@@ -66,7 +73,7 @@ impl ServerHandler for MockHandler {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let arguments = request.arguments.clone().map_or(Value::Null, Value::Object);
@@ -75,6 +82,36 @@ impl ServerHandler for MockHandler {
             tool: name.clone(),
             arguments: arguments.clone(),
         });
+
+        if let Some(steps) = self.state.progress.get(&name)
+            && let Some(token) = context.meta.get_progress_token()
+        {
+            for step in 1..=*steps {
+                let _ = context
+                    .peer
+                    .notify_progress(
+                        ProgressNotificationParam::new(token.clone(), f64::from(step))
+                            .with_total(f64::from(*steps))
+                            .with_message(format!("{name} step {step}")),
+                    )
+                    .await;
+            }
+        }
+
+        if self.state.cancellable.contains(&name) {
+            // Wait for the cancellation (a generous cap keeps a broken test
+            // from leaving the request hanging forever).
+            tokio::select! {
+                () = context.ct.cancelled() => {
+                    self.state.cancelled.lock().unwrap().insert(name.clone());
+                }
+                () = tokio::time::sleep(Duration::from_secs(60)) => {}
+            }
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "mock tool '{name}' was cancelled"
+            ))])
+            .into());
+        }
 
         if let Some(delay) = self.state.slow.get(&name) {
             tokio::time::sleep(*delay).await;
@@ -133,6 +170,11 @@ impl MockBackend {
             .count()
     }
 
+    /// Whether a `wait_for_cancel` tool's request was cancelled.
+    pub fn was_cancelled(&self, tool: &str) -> bool {
+        self.state.cancelled.lock().unwrap().contains(tool)
+    }
+
     /// A snapshot of every recorded call.
     pub fn calls(&self) -> Vec<CallRecord> {
         self.state.calls.lock().unwrap().clone()
@@ -144,6 +186,8 @@ pub struct MockBackendBuilder {
     tools: Vec<Tool>,
     failing: HashSet<String>,
     slow: HashMap<String, Duration>,
+    progress: HashMap<String, u32>,
+    cancellable: HashSet<String>,
 }
 
 impl MockBackendBuilder {
@@ -152,7 +196,25 @@ impl MockBackendBuilder {
             tools: Vec::new(),
             failing: HashSet::new(),
             slow: HashMap::new(),
+            progress: HashMap::new(),
+            cancellable: HashSet::new(),
         }
+    }
+
+    /// Add a tool that sends `steps` progress notifications (to the request's
+    /// progress token, if it has one) and then succeeds.
+    pub fn progress_tool(mut self, name: &str, steps: u32) -> Self {
+        self.tools.push(make_tool(name));
+        self.progress.insert(name.to_string(), steps);
+        self
+    }
+
+    /// Add a tool that waits until its request is cancelled, recording that
+    /// it was (see [`MockBackend::was_cancelled`]).
+    pub fn wait_for_cancel_tool(mut self, name: &str) -> Self {
+        self.tools.push(make_tool(name));
+        self.cancellable.insert(name.to_string());
+        self
     }
 
     /// Add a tool that succeeds, but only after sleeping for `delay`.
@@ -188,6 +250,9 @@ impl MockBackendBuilder {
             tools: self.tools,
             failing: self.failing,
             slow: self.slow,
+            progress: self.progress,
+            cancellable: self.cancellable,
+            cancelled: Mutex::new(HashSet::new()),
             calls: Mutex::new(Vec::new()),
         });
 

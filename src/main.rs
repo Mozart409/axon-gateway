@@ -12,6 +12,7 @@ mod audit_admin;
 mod auth;
 mod authz;
 mod backend;
+mod changes;
 mod config;
 mod error;
 mod gateway;
@@ -21,6 +22,7 @@ mod policy;
 mod principal;
 mod rbac;
 mod registry;
+mod relay;
 mod server;
 mod store;
 mod telemetry;
@@ -40,6 +42,7 @@ use kameo::actor::Spawn;
 use kameo::mailbox;
 
 use crate::auth::{AuthManager, SharedAuth};
+use crate::changes::ChangeBus;
 use crate::config::Config;
 use crate::gateway::GatewayActor;
 use crate::oidc::OidcProviders;
@@ -152,7 +155,10 @@ async fn main() -> Result<()> {
 
     // Dashboard login. Built before `config` moves into the gateway actor.
     let oidc = setup_oidc(&config, &base_url)?;
-    let policy = Arc::new(rbac::PolicyHandle::new(config.rbac.clone()));
+    // Tool-list changes (backends, RBAC, toolsets) reach open MCP connections here
+    let changes = ChangeBus::new();
+    let policy =
+        Arc::new(rbac::PolicyHandle::new(config.rbac.clone()).with_change_bus(changes.clone()));
 
     let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy).await;
 
@@ -165,16 +171,23 @@ async fn main() -> Result<()> {
 
     let auth_manager = setup_auth(&config, store.is_some() && oidc.is_some());
 
+    // `Host` values the MCP endpoints accept. Built before `config` moves into
+    // the gateway actor.
+    let mcp_allowed_hosts = config::mcp_allowed_hosts(&config.gateway);
+
     // Spawn registry actor (with toolsets if configured)
     let registry = if config.toolsets.is_empty() {
-        RegistryActor::spawn_with_mailbox(RegistryActor::new(), mailbox::unbounded())
+        RegistryActor::spawn_with_mailbox(
+            RegistryActor::new().with_change_bus(changes.clone()),
+            mailbox::unbounded(),
+        )
     } else {
         tracing::info!(
             "Toolsets configured: {:?}",
             config.toolsets.iter().map(|g| &g.name).collect::<Vec<_>>()
         );
         RegistryActor::spawn_with_mailbox(
-            RegistryActor::with_toolsets(config.toolsets.clone()),
+            RegistryActor::with_toolsets(config.toolsets.clone()).with_change_bus(changes.clone()),
             mailbox::unbounded(),
         )
     };
@@ -221,6 +234,8 @@ async fn main() -> Result<()> {
         oidc,
         policy,
         audit,
+        changes,
+        mcp_allowed_hosts,
     };
 
     // Run server with graceful shutdown

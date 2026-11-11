@@ -216,6 +216,9 @@ pub(super) async fn handle_ui_tool_opt_out(
         tracing::warn!(%error, "could not save a tool opt-out");
         return store_unavailable();
     }
+    state
+        .changes
+        .publish(crate::changes::ChangeScope::User(session.user.id));
 
     let opt_outs = match load_opt_outs(store, session.user.id).await {
         Ok(opt_outs) => opt_outs,
@@ -505,6 +508,7 @@ async fn fetch_backend_prompts(state: &AppState, backend_name: &str) -> Vec<Prom
                 params: json!({}),
             },
             caller: Arc::new(Caller::Open),
+            relay: None,
         })
         .await
     {
@@ -549,6 +553,7 @@ async fn fetch_backend_resources(state: &AppState, backend_name: &str) -> Vec<Re
                 params: json!({}),
             },
             caller: Arc::new(Caller::Open),
+            relay: None,
         })
         .await
     {

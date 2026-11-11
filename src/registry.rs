@@ -15,6 +15,7 @@ use dashmap::DashMap;
 use kameo::actor::{Actor, ActorRef};
 use kameo::message::{Context, Message};
 
+use crate::changes::{ChangeBus, ChangeScope};
 use crate::config::ToolsetConfig;
 use crate::types::{BackendInfo, BackendState, NamespacedTool, ToolDefinition};
 
@@ -67,6 +68,8 @@ pub struct RegistryActor {
     tool_cache: ToolCache,
     /// Toolset definitions
     toolsets: Vec<ToolsetConfig>,
+    /// Told when a backend's tools change; `None` publishes nothing
+    changes: Option<ChangeBus>,
 }
 
 impl RegistryActor {
@@ -76,6 +79,7 @@ impl RegistryActor {
             tool_routing: Arc::new(DashMap::new()),
             tool_cache: ToolCache::new(DEFAULT_CACHE_TTL_SECS),
             toolsets: Vec::new(),
+            changes: None,
         }
     }
 
@@ -86,7 +90,34 @@ impl RegistryActor {
             tool_routing: Arc::new(DashMap::new()),
             tool_cache: ToolCache::new(DEFAULT_CACHE_TTL_SECS),
             toolsets,
+            changes: None,
         }
+    }
+
+    /// Publish tool-list changes on `bus`
+    #[must_use]
+    pub fn with_change_bus(mut self, bus: ChangeBus) -> Self {
+        self.changes = Some(bus);
+        self
+    }
+
+    /// Tell the subscribers that some caller's tool list may have changed
+    fn publish_tools_changed(&self) {
+        if let Some(bus) = &self.changes {
+            bus.publish(ChangeScope::All);
+        }
+    }
+
+    /// Whether two tool lists hold the same namespaced names and definitions
+    fn same_tools(old: &[NamespacedTool], new: &[NamespacedTool]) -> bool {
+        old.len() == new.len()
+            && old.iter().zip(new).all(|(old, new)| {
+                old.namespaced_name == new.namespaced_name
+                    && old.definition.name == new.definition.name
+                    && old.definition.description == new.definition.description
+                    && old.definition.input_schema == new.definition.input_schema
+                    && old.definition.annotations == new.definition.annotations
+            })
     }
 
     /// Build the aggregated tool list from all connected backends
@@ -208,6 +239,14 @@ impl Message<UpdateBackend> for RegistryActor {
             })
             .collect();
 
+        // The guard of `get` is gone by the end of the statement, before `insert`
+        let unchanged = self
+            .backends
+            .get(&msg.name)
+            .map_or(namespaced_tools.is_empty(), |previous| {
+                Self::same_tools(&previous.tools, &namespaced_tools)
+            });
+
         // Update backend info
         self.backends.insert(
             msg.name.clone(),
@@ -216,6 +255,10 @@ impl Message<UpdateBackend> for RegistryActor {
 
         // Invalidate tool cache on any backend update
         self.tool_cache.invalidate();
+
+        if !unchanged {
+            self.publish_tools_changed();
+        }
     }
 }
 
@@ -419,9 +462,15 @@ impl Message<RemoveBackend> for RegistryActor {
         // Remove tool routes for this backend
         self.tool_routing.retain(|_, backend| backend != &msg.name);
         // Remove the backend
-        self.backends.remove(&msg.name);
+        let had_tools = self
+            .backends
+            .remove(&msg.name)
+            .is_some_and(|(_, backend)| !backend.tools.is_empty());
         // Invalidate cache
         self.tool_cache.invalidate();
+        if had_tools {
+            self.publish_tools_changed();
+        }
         tracing::info!("Removed backend '{}' from registry", msg.name);
     }
 }
@@ -631,6 +680,77 @@ mod tests {
             let tool_list = registry.build_tool_list();
             assert_eq!(tool_list.len(), 1);
             assert_eq!(tool_list[0].name, "connected_test_tool");
+        }
+    }
+
+    mod change_publishing {
+        use super::*;
+        use kameo::actor::Spawn;
+        use kameo::mailbox;
+
+        /// Waits long enough, on the paused clock, to see whether anything was published
+        async fn published(subscription: &mut crate::changes::ChangeSubscription) -> bool {
+            tokio::time::timeout(Duration::from_secs(5), subscription.changed_for(None))
+                .await
+                .is_ok()
+        }
+
+        fn update(name: &str, tools: &[&str]) -> UpdateBackend {
+            UpdateBackend {
+                name: name.to_string(),
+                state: BackendState::Connected,
+                tools: tools.iter().map(|tool| make_tool(tool)).collect(),
+                error: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_changed_tool_list_is_published_and_an_identical_one_is_not() {
+            let bus = ChangeBus::new();
+            let mut subscription = bus.subscribe();
+            let registry = RegistryActor::spawn_with_mailbox(
+                RegistryActor::new().with_change_bus(bus),
+                mailbox::unbounded(),
+            );
+
+            registry.ask(update("b", &["one"])).await.unwrap();
+            assert!(published(&mut subscription).await);
+
+            registry.ask(update("b", &["one"])).await.unwrap();
+            assert!(!published(&mut subscription).await);
+
+            registry.ask(update("b", &["one", "two"])).await.unwrap();
+            assert!(published(&mut subscription).await);
+        }
+
+        #[tokio::test]
+        async fn removing_a_backend_publishes_only_when_it_had_tools() {
+            let bus = ChangeBus::new();
+            let mut subscription = bus.subscribe();
+            let registry = RegistryActor::spawn_with_mailbox(
+                RegistryActor::with_toolsets(Vec::new()).with_change_bus(bus),
+                mailbox::unbounded(),
+            );
+
+            registry.ask(update("empty", &[])).await.unwrap();
+            assert!(!published(&mut subscription).await);
+            registry
+                .ask(RemoveBackend {
+                    name: "empty".to_string(),
+                })
+                .await
+                .unwrap();
+            assert!(!published(&mut subscription).await);
+
+            registry.ask(update("full", &["one"])).await.unwrap();
+            assert!(published(&mut subscription).await);
+            registry
+                .ask(RemoveBackend {
+                    name: "full".to_string(),
+                })
+                .await
+                .unwrap();
+            assert!(published(&mut subscription).await);
         }
     }
 

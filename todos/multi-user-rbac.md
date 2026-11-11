@@ -596,8 +596,8 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 11. Phased plan
 
-Status (2026-11-10): Phases 0 to 3c are done and committed. Resume at
-Phase 4 (Phase 8, config in the database, is planned). Open caveats: OIDC
+Status (2026-11-11): Phases 0 to 4a are done and committed. Resume at
+Phase 4b (Phase 8, config in the database, is planned). Open caveats: OIDC
 login is untested against a real IdP, and a plain-text 403 from the CSRF
 check can replace an admin page section (the htmx config swaps 4xx
 responses).
@@ -732,28 +732,43 @@ responses).
       Phase 8). Reading arguments needs `audit.read_sensitive` and is itself
       audited.
 
-### Phase 4 - Spec-compliant MCP transport
+### Phase 4a - Spec-compliant MCP transport (one replica)
 
-- [ ] Streamable HTTP server side via rmcp: stateless 2026-07-28 path first
+Split from Phase 4 on 2026-11-11: the transport ships on one replica first,
+multi-replica follows in 4b. Strict spec: a bare JSON POST with no `Accept`
+or protocol signals is refused (it was served before).
+
+- [x] Streamable HTTP server side via rmcp: stateless 2026-07-28 path first
       (no `initialize`, lifecycle data in `_meta`), session path for older
       clients; accept 2025-06-18, 2025-11-25, 2026-07-28 from clients.
-- [ ] Emit and consume SEP-2243 headers (`Mcp-Method`, `Mcp-Name`); rate limiter
-      and metrics read them instead of parsing the body.
-- [ ] `[gateway] allow_stdio` (default `false`): config load fails on a stdio
+- [x] Emit and consume SEP-2243 headers (`Mcp-Method`, `Mcp-Name`): rmcp emits
+      them to backends and checks them against the body; metrics read
+      `Mcp-Method`. (The rate limiter counts per token and never parsed the
+      body.)
+- [x] `[gateway] allow_stdio` (default `false`): config load fails on a stdio
       backend unless it is set; upgrade note for standalone users; document the
       stdio-to-HTTP bridge Deployment pattern for Kubernetes.
-- [ ] `notifications/tools/list_changed` on grant/backend changes and on opt-out
-      or toolset changes.
-- [ ] Progress and cancellation passthrough.
-- [ ] LISTEN/NOTIFY fan-out; multi-replica notes in the docs.
+- [x] `[gateway] allowed_hosts`: rmcp checks the `Host` header (DNS rebinding);
+      loopback and `base_url`'s host are always allowed.
+- [x] `notifications/tools/list_changed` on grant/backend changes and on opt-out
+      or toolset changes (`subscriptions/listen` for 2026-07-28, the session
+      stream before); a backend's own `list_changed` triggers a tool refresh.
+- [x] Progress and cancellation passthrough.
+- [x] Remove the SSE stub.
+- Exit: a spec-conformant client receives list_changed after a grant change.
+
+### Phase 4b - Multi-replica
+
+- [ ] LISTEN/NOTIFY fan-out (feeds the change bus); multi-replica notes in the
+      docs.
+- [ ] Postgres session store for pre-2026-07-28 sessions (rmcp `SessionStore`).
 - [ ] Shared rate limits (Postgres counters).
 - [ ] Singleton jobs under a Postgres advisory lock (retention, token expiry,
       inactive-user suspension).
 - [ ] Config watcher accepts the kubelet `..data` symlink swap (directory watch,
       adjust the file-name filter).
-- [ ] Remove the SSE stub.
-- Exit: a spec-conformant client receives list_changed after a grant change;
-  two replicas stay consistent.
+- Exit: two replicas stay consistent (a grant change on one reaches clients
+  of the other).
 
 ### Phase 5 - Personal MCP servers and catalog
 

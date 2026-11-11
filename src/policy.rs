@@ -182,7 +182,7 @@ pub struct RoleBindingConfig {
 }
 
 /// The database-managed RBAC rows, as the store loads them
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RbacSnapshot {
     /// Database groups with their `IdP` mappings
     pub groups: Vec<RbacGroupConfig>,
@@ -258,7 +258,7 @@ impl Permissions {
 }
 
 /// A group declared in config
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RbacGroupConfig {
     /// Unique name, `[a-z0-9_-]+`
     pub name: String,
@@ -284,7 +284,7 @@ pub struct IdpMapping {
 }
 
 /// A grant of one backend's tools to a group
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct GrantConfig {
     /// A declared group or [`AUTHENTICATED_GROUP`]
     pub group: String,
@@ -1443,8 +1443,8 @@ mod tests {
     #[test]
     fn an_absent_rbac_section_is_empty() {
         let rbac: RbacConfig = toml::from_str("").unwrap();
-        assert!(rbac.groups.is_empty());
-        assert!(rbac.grants.is_empty());
+        assert_eq!(rbac.groups, Vec::new());
+        assert_eq!(rbac.grants, Vec::new());
     }
 
     #[test]

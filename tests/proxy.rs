@@ -18,19 +18,11 @@ mod support;
 use std::time::Duration;
 
 use support::mock_backend::MockBackend;
-use support::{ConfigBuilder, Gateway, free_port, poll_until, rpc, rpc_call};
+use support::{ConfigBuilder, Gateway, free_port, mcp_post, poll_until, rpc, rpc_call};
 
 /// Fetch `tools/list` and return the namespaced tool names.
 async fn list_tool_names(client: &reqwest::Client, base: &str) -> Vec<String> {
-    let body: serde_json::Value = client
-        .post(format!("{base}/mcp"))
-        .json(&rpc("tools/list"))
-        .send()
-        .await
-        .expect("tools/list request")
-        .json()
-        .await
-        .expect("tools/list json");
+    let (_, body) = mcp_post(client, &format!("{base}/mcp"), None, &rpc("tools/list")).await;
     body["result"]["tools"]
         .as_array()
         .map(|tools| {
@@ -89,15 +81,14 @@ async fn routes_tool_call_to_owning_backend() {
 
     wait_for_tools(&client, &server.base, 1).await;
 
-    let resp: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc_call("mock_echo", serde_json::json!({ "value": 42 })))
-        .send()
-        .await
-        .expect("tools/call request")
-        .json()
-        .await
-        .expect("tools/call json");
+    let resp: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc_call("mock_echo", serde_json::json!({ "value": 42 })),
+    )
+    .await
+    .1;
 
     // The mock echoes "<tool>:<args>"; the gateway strips the namespace so the
     // backend sees the original name "echo".
@@ -160,15 +151,14 @@ async fn same_tool_name_on_two_backends_does_not_collide() {
     assert!(names.contains(&"beta_echo".to_string()), "got {names:?}");
 
     // A call to alpha_echo must reach only backend A.
-    let _: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc_call("alpha_echo", serde_json::json!({})))
-        .send()
-        .await
-        .expect("call alpha")
-        .json()
-        .await
-        .expect("alpha json");
+    let _: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc_call("alpha_echo", serde_json::json!({})),
+    )
+    .await
+    .1;
 
     assert_eq!(backend_a.call_count("echo"), 1);
     assert_eq!(backend_b.call_count("echo"), 0);
@@ -191,15 +181,14 @@ async fn tool_level_backend_error_propagates() {
 
     wait_for_tools(&client, &server.base, 1).await;
 
-    let resp: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc_call("mock_boom", serde_json::json!({})))
-        .send()
-        .await
-        .expect("call failing tool")
-        .json()
-        .await
-        .expect("failing json");
+    let resp: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc_call("mock_boom", serde_json::json!({})),
+    )
+    .await
+    .1;
 
     // The backend returned a tool-level error (isError=true), which the gateway
     // forwards as a successful JSON-RPC response carrying the error content.
@@ -235,15 +224,14 @@ async fn slow_tool_call_does_not_block_other_requests() {
         let client = client.clone();
         let url = format!("{}/mcp", server.base);
         tokio::spawn(async move {
-            client
-                .post(url)
-                .json(&rpc_call("slow_wait", serde_json::json!({})))
-                .send()
-                .await
-                .expect("slow call")
-                .json::<serde_json::Value>()
-                .await
-                .expect("slow json")
+            mcp_post(
+                &client,
+                &url,
+                None,
+                &rpc_call("slow_wait", serde_json::json!({})),
+            )
+            .await
+            .1
         })
     };
     poll_until(100, Duration::from_millis(20), || async {
@@ -261,15 +249,14 @@ async fn slow_tool_call_does_not_block_other_requests() {
         .expect("status request");
     assert!(status.status().is_success());
     assert_eq!(list_tool_names(&client, &server.base).await.len(), 2);
-    let resp: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc_call("fast_echo", serde_json::json!({})))
-        .send()
-        .await
-        .expect("fast call")
-        .json()
-        .await
-        .expect("fast json");
+    let resp: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc_call("fast_echo", serde_json::json!({})),
+    )
+    .await
+    .1;
     assert!(resp["result"].is_object(), "got {resp:?}");
     assert!(
         started.elapsed() < Duration::from_secs(2),

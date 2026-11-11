@@ -18,7 +18,7 @@ mod support;
 use std::time::Duration;
 
 use support::mock_backend::MockBackend;
-use support::{ConfigBuilder, Gateway, free_port, poll_until, rpc, rpc_call};
+use support::{ConfigBuilder, Gateway, free_port, mcp_post, poll_until, rpc, rpc_call};
 
 #[tokio::test]
 async fn unreachable_backend_is_degraded_but_gateway_stays_healthy() {
@@ -71,15 +71,14 @@ async fn unreachable_backend_is_degraded_but_gateway_stays_healthy() {
     );
 
     // No tools are exposed from a backend that never connected.
-    let tools: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc("tools/list"))
-        .send()
-        .await
-        .expect("tools/list request")
-        .json()
-        .await
-        .expect("tools/list json");
+    let tools: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc("tools/list"),
+    )
+    .await
+    .1;
     assert_eq!(tools["result"]["tools"].as_array().map(Vec::len), Some(0));
 }
 
@@ -137,6 +136,8 @@ async fn malformed_json_rpc_is_rejected_without_crashing() {
     let not_json = client
         .post(&mcp)
         .header("content-type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
         .body("this is not json")
         .send()
         .await
@@ -148,16 +149,11 @@ async fn malformed_json_rpc_is_rejected_without_crashing() {
     );
 
     // Valid JSON but missing the required JSON-RPC fields.
-    let wrong_shape = client
-        .post(&mcp)
-        .json(&serde_json::json!({ "foo": "bar" }))
-        .send()
-        .await
-        .expect("wrong-shape request");
+    let (wrong_shape, _) =
+        mcp_post(&client, &mcp, None, &serde_json::json!({ "foo": "bar" })).await;
     assert!(
-        wrong_shape.status().is_client_error(),
-        "wrong-shape body should be a 4xx, got {}",
-        wrong_shape.status()
+        wrong_shape.is_client_error(),
+        "wrong-shape body should be a 4xx, got {wrong_shape}"
     );
 
     // The gateway is still alive and serving after bad input.
@@ -181,15 +177,14 @@ async fn calling_an_unknown_tool_returns_json_rpc_error() {
     let server = Gateway::start(&config, &base).await;
     let client = reqwest::Client::new();
 
-    let resp: serde_json::Value = client
-        .post(format!("{}/mcp", server.base))
-        .json(&rpc_call("mock_does_not_exist", serde_json::json!({})))
-        .send()
-        .await
-        .expect("unknown tool request")
-        .json()
-        .await
-        .expect("unknown tool json");
+    let resp: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc_call("mock_does_not_exist", serde_json::json!({})),
+    )
+    .await
+    .1;
 
     // Method-not-found for an unroutable tool name.
     assert_eq!(

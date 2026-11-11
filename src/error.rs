@@ -18,6 +18,9 @@ pub enum ConfigError {
     #[error("invalid TOML in config file")]
     ParseError(#[from] toml::de::Error),
 
+    #[error("backends use the stdio transport but [gateway] allow_stdio is false: {names}")]
+    StdioNotAllowed { names: String },
+
     #[error("failed to read .env file at '{path}'")]
     EnvFileError {
         path: String,

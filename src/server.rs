@@ -1,9 +1,9 @@
 //! HTTP Server - Exposes the MCP gateway via SSE/HTTP
 //!
 //! Provides:
-//! - POST /mcp - JSON-RPC endpoint (Streamable HTTP)
-//! - GET /mcp/sse - SSE endpoint for streaming
-//! - POST /mcp/toolset/{name} - JSON-RPC scoped to a toolset (`/mcp/group/{name}` is a
+//! - /mcp - MCP Streamable HTTP endpoint (POST for requests and notifications, GET for the
+//!   event stream of a pre-2026-07-28 session, DELETE to end one), served by rmcp
+//! - /mcp/toolset/{name} - the same endpoint scoped to a toolset (`/mcp/group/{name}` is a
 //!   deprecated alias)
 //! - GET /health - Health check
 //! - GET /livez - Liveness probe
@@ -26,7 +26,8 @@
 //! - GET /metrics - Prometheus metrics
 //!
 //! HTML rendering lives in the [`views`] submodule (`admin_views` for the admin
-//! pages). Handlers live in `ui`, `mcp` and `api`, the admin JSON API in
+//! pages). Handlers live in `ui`, `mcp` (the MCP handler behind rmcp's transport) and `api`, the admin
+//! JSON API in
 //! `admin_api` (token routes in `tokens_api`), the admin pages in `admin_ui` (token pages in
 //! `tokens_ui` and `tokens_views`), token checks in `auth`, the
 //! dashboard login in `session`; this module owns the shared state, routing, middleware, and server lifecycle.
@@ -96,6 +97,12 @@ pub struct AppState {
     pub policy: Arc<crate::rbac::PolicyHandle>,
     /// Tool-call audit writer; `None` in standalone mode
     pub audit: Option<crate::audit::AuditSink>,
+    /// Where tool-list changes are published; MCP clients listening for
+    /// `notifications/tools/list_changed` wait on it
+    pub changes: crate::changes::ChangeBus,
+    /// `Host` values the MCP endpoints accept (DNS rebinding protection of the
+    /// rmcp transport); empty accepts any
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 impl AppState {
@@ -164,6 +171,23 @@ fn ui_action_routes(state: &AppState) -> Router<AppState> {
         ))
 }
 
+/// The MCP endpoints: one rmcp Streamable HTTP service at `/mcp` and the toolset paths.
+///
+/// The middleware authenticates every request before the transport sees it (a 401 stays
+/// an HTTP 401) and hands the caller to the MCP handler in a request extension.
+fn mcp_routes(state: &AppState) -> Router<AppState> {
+    let service = mcp::mcp_service(state);
+    Router::new()
+        .route_service("/mcp", service.clone())
+        .route_service("/mcp/toolset/{toolset_name}", service.clone())
+        // Deprecated alias for the toolset endpoint, removed after one minor release
+        .route_service("/mcp/group/{toolset_name}", service)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            mcp::authenticate_mcp,
+        ))
+}
+
 /// Create the Axum router
 pub fn create_router(state: AppState) -> Router {
     let ui_actions = ui_action_routes(&state);
@@ -205,9 +229,8 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         // Landing page
         .route("/", get(ui::handle_landing))
-        // MCP endpoints
-        .route("/mcp", post(mcp::handle_mcp_request))
-        .route("/mcp/sse", get(mcp::handle_mcp_sse))
+        // MCP endpoints (toolset paths included)
+        .merge(mcp_routes(&state))
         .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
         .route_service("/favicon.svg", ServeFile::new("static/favicon.svg"))
         // UI endpoints
@@ -225,17 +248,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/build", get(api::get_build_info))
         .route("/status", get(api::get_status))
         .route("/status/detailed", get(api::get_detailed_status))
-        // Toolset endpoints (subset of tools via named toolsets)
-        .route(
-            "/mcp/toolset/{toolset_name}",
-            post(mcp::handle_toolset_request),
-        )
+        // Toolset listing (the toolset MCP endpoints are in `mcp_routes`)
         .route("/status/toolsets", get(mcp::list_toolsets))
-        // Deprecated aliases for the toolset endpoints, removed after one minor release
-        .route(
-            "/mcp/group/{toolset_name}",
-            post(mcp::handle_toolset_request),
-        )
+        // Deprecated alias, removed after one minor release
         .route("/status/groups", get(mcp::list_toolsets))
         // Metrics endpoint
         .route("/metrics", get(api::prometheus_metrics))
@@ -425,6 +440,8 @@ mod tests {
                 base_url: String::from("http://127.0.0.1:8080"),
                 auth_token: None,
                 rate_limit_per_minute: 0,
+                allow_stdio: false,
+                allowed_hosts: vec![],
             },
             backends: Vec::new(),
             tokens: Vec::new(),
@@ -450,6 +467,8 @@ mod tests {
                     base_url: String::from("http://127.0.0.1:8080"),
                     auth_token: None,
                     rate_limit_per_minute: 0,
+                    allow_stdio: false,
+                    allowed_hosts: vec![],
                 },
                 &[],
             )),
@@ -466,6 +485,8 @@ mod tests {
                 crate::policy::RbacConfig::default(),
             )),
             audit: None,
+            changes: crate::changes::ChangeBus::new(),
+            mcp_allowed_hosts: Vec::new(),
         }
     }
 
