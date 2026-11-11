@@ -18,6 +18,7 @@ mod oauth;
 mod personal;
 mod rbac;
 mod replica;
+pub(crate) mod scim;
 mod stats;
 mod tokens;
 mod toolsets;
@@ -37,7 +38,7 @@ pub use personal::{
     NewPersonalBackend, PersonalBackend, PersonalBackendUpdate, PersonalError, SealedColumns,
     SecretUpdate, UserCredential,
 };
-pub use rbac::{Actor, AuditRecord};
+pub use rbac::{Actor, AuditRecord, RoleDeletion};
 pub use replica::MCP_SESSION_IDLE;
 pub use tokens::{
     ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, MAX_SERVICE_TOKEN_LIFETIME,

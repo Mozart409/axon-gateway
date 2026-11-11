@@ -44,7 +44,7 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::OidcProviderConfig;
 use crate::upstream_oauth::ClientCredentials;
@@ -54,6 +54,12 @@ pub const METADATA_TTL: Duration = Duration::from_secs(3_600);
 
 /// The signing keys are fetched again for an unknown key id at most this often.
 pub const JWKS_REFETCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A Graph app token is fetched again this long before it expires.
+const GRAPH_TOKEN_MARGIN: Duration = Duration::from_secs(60);
+
+/// At most this many pages of groups are read from Graph for one login.
+const GRAPH_MAX_PAGES: usize = 50;
 
 /// Clock skew allowed between the gateway and the provider for `exp`, `iat`
 /// and `nbf`, in seconds.
@@ -180,6 +186,10 @@ pub struct VerifiedLogin {
     /// The refresh token of the code exchange, when the provider gave one
     /// (`offline_access`); kept for the passthrough grants.
     pub refresh_token: Option<String>,
+    /// The string value of the provider's `scim_match_claim` in the ID token
+    /// (a number is stringified); what a SCIM `externalId` is matched against.
+    /// `None` when the claim is missing, or an array or an object.
+    pub scim_key: Option<String>,
 }
 
 impl fmt::Debug for VerifiedLogin {
@@ -198,6 +208,7 @@ impl fmt::Debug for VerifiedLogin {
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("scim_key", &self.scim_key)
             .finish()
     }
 }
@@ -239,6 +250,36 @@ struct ProviderMetadata {
     end_session_endpoint: Option<String>,
     #[serde(default)]
     token_endpoint_auth_methods_supported: Option<Vec<String>>,
+}
+
+/// An app token for Microsoft Graph, and when to get a new one.
+struct GraphToken {
+    token: String,
+    refresh_at: Instant,
+}
+
+/// The parts of a client-credentials token response that are used.
+#[derive(Deserialize)]
+struct GraphTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// One page of `transitiveMemberOf`.
+#[derive(Deserialize)]
+struct GraphPage {
+    #[serde(default)]
+    value: Vec<GraphGroup>,
+    #[serde(default, rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+/// A group in a Graph answer (`$select=id,displayName`); only the object id is kept.
+#[derive(Deserialize)]
+struct GraphGroup {
+    #[serde(default)]
+    id: Option<String>,
 }
 
 /// The provider's signing keys, and when they were fetched.
@@ -358,6 +399,13 @@ pub struct Provider {
     admin_groups: Vec<String>,
     accept_access_tokens: bool,
     access_token_audience: String,
+    graph_overage: bool,
+    /// The Graph base URL, without a trailing slash.
+    graph_url: String,
+    scim_match_claim: String,
+    /// The cached Graph app token. The lock is held across the token request,
+    /// so concurrent logins wait for one request instead of each running their own.
+    graph_token: Mutex<Option<GraphToken>>,
     http: reqwest::Client,
     discovery: RwLock<Option<Arc<Discovery>>>,
 }
@@ -421,6 +469,10 @@ impl Provider {
             admin_groups: config.admin_groups.clone(),
             accept_access_tokens: config.accept_access_tokens,
             access_token_audience: config.access_token_audience().to_owned(),
+            graph_overage: config.graph_overage,
+            graph_url: config.graph_url().to_owned(),
+            scim_match_claim: config.scim_match_claim().to_owned(),
+            graph_token: Mutex::new(None),
             http,
             discovery: RwLock::new(None),
         })
@@ -641,7 +693,7 @@ impl Provider {
             .as_deref()
             .ok_or_else(|| self.error("the provider returned no ID token".to_owned()))?;
         let claims = self.verify(&discovery, id_token, nonce).await?;
-        let mut login = self.login(claims, id_token)?;
+        let mut login = self.login(claims, id_token).await?;
         login.refresh_token = response
             .refresh_token()
             .map(|token| token.secret().clone())
@@ -714,7 +766,11 @@ impl Provider {
 
     /// Maps verified claims to a login. Runs after the signature check, so
     /// nothing here trusts an unverified token.
-    fn login(&self, claims: IdTokenClaims, id_token: &str) -> Result<VerifiedLogin, OidcError> {
+    async fn login(
+        &self,
+        claims: IdTokenClaims,
+        id_token: &str,
+    ) -> Result<VerifiedLogin, OidcError> {
         // An unverified address proves nothing about its domain: anyone can
         // put `x@corp.example` in a profile at a provider that does not check.
         let email_verified = claim_is_true(claims.email_verified.as_ref())
@@ -725,13 +781,18 @@ impl Provider {
         if !email_allowed(&self.allowed_email_domains, claims.email.as_deref()) {
             return Err(OidcError::EmailDomainNotAllowed);
         }
+        let mut groups = groups_from(&claims.extra, &self.groups_claim);
         if has_group_overage(&claims.extra) {
-            tracing::warn!(
-                provider = %self.id,
-                "the groups were not in the ID token (group overage); the user gets none"
-            );
+            if self.graph_overage {
+                groups = self.overage_groups(&claims.extra).await;
+            } else {
+                tracing::warn!(
+                    provider = %self.id,
+                    "the groups were not in the ID token (group overage); the user gets none"
+                );
+            }
         }
-        let groups = groups_from(&claims.extra, &self.groups_claim);
+        let scim_key = scim_key(&claims, &self.scim_match_claim);
         let is_admin = groups.iter().any(|group| self.admin_groups.contains(group));
         Ok(VerifiedLogin {
             issuer: claims.iss,
@@ -742,7 +803,109 @@ impl Provider {
             is_admin,
             id_token: id_token.to_owned(),
             refresh_token: None,
+            scim_key,
         })
+    }
+
+    /// The user's groups from Microsoft Graph, for an ID token with a groups
+    /// overage. A failure is logged and gives no groups: Graph being down must
+    /// not lock everybody out.
+    async fn overage_groups(&self, claims: &Map<String, Value>) -> Vec<String> {
+        let Some(oid) = claim_at(claims, "oid").and_then(Value::as_str) else {
+            tracing::warn!(
+                provider = %self.id,
+                "group overage but the ID token has no oid claim; the user gets no groups"
+            );
+            return Vec::new();
+        };
+        if !is_object_id(oid) {
+            tracing::warn!(
+                provider = %self.id,
+                "group overage but the oid claim is not an object id; the user gets no groups"
+            );
+            return Vec::new();
+        }
+        match self.graph_groups(oid).await {
+            Ok(groups) => groups,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %self.id,
+                    %error,
+                    "could not fetch the groups of a user with a group overage from Microsoft Graph; the user gets none"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// The object ids of the groups `oid` is a member of, directly or not,
+    /// following `@odata.nextLink` for at most [`GRAPH_MAX_PAGES`] pages.
+    async fn graph_groups(&self, oid: &str) -> Result<Vec<String>, String> {
+        let token = self.graph_app_token().await?;
+        let mut url = format!(
+            "{}/v1.0/users/{oid}/transitiveMemberOf/microsoft.graph.group?$select=id,displayName",
+            self.graph_url
+        );
+        let mut groups = Vec::new();
+        for _ in 0..GRAPH_MAX_PAGES {
+            let page: GraphPage = observed(
+                &self.id,
+                "graph_groups",
+                get_json_bearer(&self.http, &url, &token),
+            )
+            .await?;
+            groups.extend(page.value.into_iter().filter_map(|group| group.id));
+            match page.next_link {
+                None => return Ok(groups),
+                Some(next) if graph_link_allowed(&self.graph_url, &next) => url = next,
+                Some(next) => {
+                    return Err(format!(
+                        "refusing the next page link {next}: it is not under {}",
+                        self.graph_url
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "more than {GRAPH_MAX_PAGES} pages of groups, giving up"
+        ))
+    }
+
+    /// An app token for Graph by client credentials at the provider's token
+    /// endpoint, cached until [`GRAPH_TOKEN_MARGIN`] before it expires.
+    async fn graph_app_token(&self) -> Result<String, String> {
+        let mut slot = self.graph_token.lock().await;
+        if let Some(cached) = &*slot
+            && Instant::now() < cached.refresh_at
+        {
+            return Ok(cached.token.clone());
+        }
+        let secret = self
+            .client_secret
+            .as_ref()
+            .ok_or("no client secret for the client credentials grant")?;
+        let discovery = self.discovery().await.map_err(|error| error.to_string())?;
+        let scope = format!("{}/.default", self.graph_url);
+        let body = form_body(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", self.client_id.as_str()),
+            ("client_secret", secret.secret()),
+            ("scope", &scope),
+        ])?;
+        let started = Instant::now();
+        let response: GraphTokenResponse = observed(
+            &self.id,
+            "graph_token",
+            post_form_json(&self.http, &discovery.token_endpoint, body),
+        )
+        .await?;
+        let lifetime = Duration::from_secs(response.expires_in.unwrap_or(0));
+        *slot = Some(GraphToken {
+            token: response.access_token.clone(),
+            refresh_at: started + lifetime.saturating_sub(GRAPH_TOKEN_MARGIN),
+        });
+        drop(slot);
+        Ok(response.access_token)
     }
 
     /// The RP-initiated logout URL (OIDC `RP-Initiated Logout`) from the
@@ -794,6 +957,14 @@ async fn observed<T, E>(
     result
 }
 
+/// Encodes `fields` as an `application/x-www-form-urlencoded` body.
+fn form_body(fields: &[(&str, &str)]) -> Result<String, String> {
+    let mut url = reqwest::Url::parse("http://form.invalid/")
+        .map_err(|error| format!("could not encode the request: {error}"))?;
+    url.query_pairs_mut().extend_pairs(fields);
+    Ok(url.query().unwrap_or_default().to_owned())
+}
+
 /// Sends one of oauth2's requests through `http`.
 async fn send(
     http: reqwest::Client,
@@ -813,8 +984,43 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
 ) -> Result<T, String> {
-    let response = http
-        .get(url)
+    read_json(url, http.get(url)).await
+}
+
+/// Like [`get_json`], with `token` as the bearer token.
+async fn get_json_bearer<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<T, String> {
+    read_json(url, http.get(url).bearer_auth(token)).await
+}
+
+/// POSTs the form `body` to `url` and parses its JSON answer; anything but a
+/// 2xx is an error. The answer's body is not quoted, as it may hold a token.
+async fn post_form_json<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    body: String,
+) -> Result<T, String> {
+    read_json(
+        url,
+        http.post(url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body),
+    )
+    .await
+}
+
+/// Sends `request` (to `url`, for the messages) and parses the JSON answer.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    request: reqwest::RequestBuilder,
+) -> Result<T, String> {
+    let response = request
         .send()
         .await
         .map_err(|error| format!("{url}: {error}"))?;
@@ -1118,6 +1324,46 @@ fn has_group_overage(claims: &Map<String, Value>) -> bool {
         .get("_claim_names")
         .and_then(Value::as_object)
         .is_some_and(|names| names.contains_key("groups"))
+}
+
+/// Whether `oid` looks like an Entra object id (letters, digits and dashes),
+/// so it can go into a Graph URL path as is.
+fn is_object_id(oid: &str) -> bool {
+    !oid.is_empty()
+        && oid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Whether a Graph `@odata.nextLink` is under `graph_url` (given without a
+/// trailing slash): the same scheme, host and port, not just the same prefix
+/// (`https://graph.example.com.evil.test` must not pass).
+fn graph_link_allowed(graph_url: &str, link: &str) -> bool {
+    link.strip_prefix(graph_url)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?']))
+}
+
+/// The value of the claim at `path` in the ID token, as a SCIM match key (see
+/// [`scalar_claim`]). `sub`, `iss`, `email` and `name` are fields of
+/// [`IdTokenClaims`], not in its `extra` claims.
+fn scim_key(claims: &IdTokenClaims, path: &str) -> Option<String> {
+    scalar_claim(&claims.extra, path).or_else(|| match path {
+        "sub" => Some(claims.sub.clone()),
+        "iss" => Some(claims.iss.clone()),
+        "email" => claims.email.clone(),
+        "name" => claims.name.clone(),
+        _ => None,
+    })
+}
+
+/// The claim at the dotted `path` as a string: a string as is, a number
+/// stringified. `None` for anything else, an array or an object included.
+fn scalar_claim(claims: &Map<String, Value>, path: &str) -> Option<String> {
+    match claim_at(claims, path)? {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 /// Whether a boolean claim is set: `true`, `"true"` or `1`.
@@ -1588,6 +1834,93 @@ mod tests {
     }
 
     #[test]
+    fn a_graph_next_link_must_be_under_the_graph_url() {
+        let graph = "https://graph.microsoft.com";
+        for link in [
+            "https://graph.microsoft.com/v1.0/users/x/transitiveMemberOf?$skiptoken=1",
+            "https://graph.microsoft.com?$skiptoken=1",
+            "https://graph.microsoft.com",
+        ] {
+            assert!(graph_link_allowed(graph, link), "{link}");
+        }
+        for link in [
+            "https://graph.microsoft.com.evil.test/v1.0/x",
+            "https://graph.microsoft.com@evil.test/v1.0/x",
+            "http://graph.microsoft.com/v1.0/x",
+            "https://evil.test/https://graph.microsoft.com/v1.0/x",
+            "",
+        ] {
+            assert!(!graph_link_allowed(graph, link), "{link}");
+        }
+    }
+
+    #[test]
+    fn graph_object_ids_are_checked_before_they_go_into_a_url() {
+        assert!(is_object_id("00000000-1111-2222-3333-444444444444"));
+        assert!(!is_object_id(""));
+        assert!(!is_object_id("../me"));
+        assert!(!is_object_id("a/b"));
+        assert!(!is_object_id("a?b"));
+    }
+
+    #[test]
+    fn a_graph_page_yields_the_group_object_ids() {
+        let page: GraphPage = serde_json::from_value(json!({
+            "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#directoryObjects",
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/next",
+            "value": [
+                {"@odata.type": "#microsoft.graph.group", "id": "g-1", "displayName": "One"},
+                {"displayName": "No id"},
+                {"id": "g-2"},
+            ],
+        }))
+        .unwrap();
+        let ids: Vec<_> = page
+            .value
+            .into_iter()
+            .filter_map(|group| group.id)
+            .collect();
+        assert_eq!(ids, ["g-1", "g-2"]);
+        assert_eq!(
+            page.next_link.as_deref(),
+            Some("https://graph.microsoft.com/v1.0/next")
+        );
+
+        let last: GraphPage = serde_json::from_value(json!({"value": []})).unwrap();
+        assert!(last.value.is_empty());
+        assert!(last.next_link.is_none());
+    }
+
+    #[test]
+    fn the_scim_key_is_a_string_or_a_number_claim() {
+        let claims = json!({
+            "sub": "user-1",
+            "oid": "o-1",
+            "employee": 4711,
+            "tags": ["a"],
+            "nested": {"upn": "a@example.com"},
+            "flag": true,
+        });
+        let claims = claims.as_object().unwrap();
+        assert_eq!(scalar_claim(claims, "sub").as_deref(), Some("user-1"));
+        assert_eq!(scalar_claim(claims, "employee").as_deref(), Some("4711"));
+        assert_eq!(
+            scalar_claim(claims, "nested.upn").as_deref(),
+            Some("a@example.com")
+        );
+        assert_eq!(scalar_claim(claims, "missing"), None);
+        assert_eq!(scalar_claim(claims, "tags"), None);
+        assert_eq!(scalar_claim(claims, "nested"), None);
+        assert_eq!(scalar_claim(claims, "flag"), None);
+    }
+
+    #[test]
+    fn form_bodies_are_percent_encoded() {
+        let body = form_body(&[("scope", "https://g.example/.default"), ("a", "b c&d")]).unwrap();
+        assert_eq!(body, "scope=https%3A%2F%2Fg.example%2F.default&a=b+c%26d");
+    }
+
+    #[test]
     fn debug_output_redacts_the_secrets() {
         let redirect = LoginRedirect {
             url: "https://idp.example.com/authorize".to_owned(),
@@ -1608,6 +1941,7 @@ mod tests {
             is_admin: false,
             id_token: "id-token-secret".to_owned(),
             refresh_token: Some("refresh-token-secret".to_owned()),
+            scim_key: None,
         };
         let shown = format!("{login:?}");
         assert!(!shown.contains("id-token-secret"));
@@ -1690,6 +2024,9 @@ mod tests {
             admin_groups: Vec::new(),
             accept_access_tokens: false,
             access_token_audience: None,
+            graph_overage: false,
+            graph_url: None,
+            scim_match_claim: None,
         }
     }
 
@@ -1722,6 +2059,25 @@ mod tests {
         provider
             .exchange("the-code", &redirect.pkce_verifier, &redirect.nonce)
             .await
+    }
+
+    #[tokio::test]
+    async fn the_scim_key_comes_from_the_configured_claim() {
+        let key = Key::rsa("k1");
+        let (issuer, fake) = fake_provider(&[&key]).await;
+        let login = login_with(&config_for(&issuer), &key, &fake, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(login.scim_key.as_deref(), Some("user-1"), "sub by default");
+
+        let mut config = config_for(&issuer);
+        config.scim_match_claim = Some("oid".to_owned());
+        let login = login_with(&config, &key, &fake, json!({"oid": "o-1"}))
+            .await
+            .unwrap();
+        assert_eq!(login.scim_key.as_deref(), Some("o-1"));
+        let login = login_with(&config, &key, &fake, json!({})).await.unwrap();
+        assert_eq!(login.scim_key, None);
     }
 
     #[tokio::test]

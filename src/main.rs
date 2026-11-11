@@ -28,6 +28,7 @@ mod principal;
 mod rbac;
 mod registry;
 mod relay;
+mod scim;
 mod server;
 mod store;
 mod telemetry;

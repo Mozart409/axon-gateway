@@ -848,9 +848,9 @@ next two, 7c: the rest):
 - [x] MCP OAuth authorization server (RFC 9728, RFC 7591, PKCE, refresh).
 - [x] Upstream OAuth for backends ("Connect" button).
 - [x] Token-exchange passthrough (RFC 8693, plus Entra on-behalf-of).
-- [ ] SCIM 2.0.
-- [ ] Custom roles.
-- [ ] Entra groups-overage Graph lookup (fallback only; app roles are the default, section 5).
+- [x] SCIM 2.0.
+- [x] Custom roles.
+- [x] Entra groups-overage Graph lookup (fallback only; app roles are the default, section 5).
 
 ### Phase 8 - Configuration in the database (no config file)
 

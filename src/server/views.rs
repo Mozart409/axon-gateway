@@ -273,8 +273,9 @@ pub(super) fn render_auth_error_page(state: &AppState, title: &str, message: &st
 /// The "Admin" link shows for users who may open the admin pages.
 pub(super) fn render_user_bar(state: &AppState, user: &SessionUser) -> Markup {
     let (_, permissions) = resolve(&state.policy.current(), user);
-    let admin_pages =
-        permissions.has(Permission::GroupsManage) || permissions.has(Permission::AuditRead);
+    let admin_pages = permissions.has(Permission::GroupsManage)
+        || permissions.has(Permission::RolesManage)
+        || permissions.has(Permission::AuditRead);
     let name = user
         .user
         .display_name

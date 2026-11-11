@@ -18,14 +18,15 @@ use crate::changes::{ChangeBus, ChangeScope};
 use crate::gateway::GetDetailedStatus;
 use crate::policy::{
     GrantConfig, GrantView, GroupView, Permission, Permissions, Policy, RbacConfig, RbacSnapshot,
-    Role, RoleBinding, RoleSubject, Source, validate_grant, validate_group_name,
+    Role, RoleBinding, RoleSource, RoleSubject, RoleView, Source, parse_permissions,
+    validate_grant, validate_group_name, validate_role_name,
 };
 use crate::principal::TokenScope;
 use crate::server::AppState;
 use crate::store::{
     Actor, ApiToken, AuditRecord, DEFAULT_TOKEN_LIFETIME, IssuedToken, JwtBinding, JwtBindingError,
-    NewToken, NewToolset, ServiceAccount, SessionUser, Store, StoreError, TokenError, Toolset,
-    ToolsetError, User,
+    NewToken, NewToolset, RoleDeletion, ServiceAccount, SessionUser, Store, StoreError, TokenError,
+    Toolset, ToolsetError, User,
 };
 
 /// How often the policy is re-read from the database, so that changes made
@@ -223,6 +224,13 @@ fn clean_description(description: Option<&str>) -> Result<Option<String>, AdminE
     Ok(Some(description.to_owned()))
 }
 
+/// A role with the number of role bindings that name it, config bindings included
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleEntry {
+    pub role: RoleView,
+    pub bindings: usize,
+}
+
 /// A human user as the users page lists them
 #[derive(Debug, Clone)]
 pub struct ManagedUser {
@@ -344,9 +352,39 @@ impl<'a> Admin<'a> {
         }
     }
 
-    /// Everything that lists groups, grants or bindings.
+    /// The anti-escalation rule: whoever hands out permissions (in a custom role or
+    /// by binding a role) must hold every one of them.
+    fn require_holds(&self, wanted: &[Permission]) -> Result<(), AdminError> {
+        if self.permissions.missing(wanted).is_empty() {
+            Ok(())
+        } else {
+            Err(AdminError::Forbidden)
+        }
+    }
+
+    /// A database role: missing is not found, built in or from config is read-only.
+    fn local_role(&self, name: &str) -> Result<RoleView, AdminError> {
+        let role = self
+            .policy
+            .current()
+            .role(name)
+            .ok_or(AdminError::NotFound)?;
+        match role.source {
+            RoleSource::Local => Ok(role),
+            RoleSource::Builtin => Err(AdminError::Conflict(
+                "built-in role, cannot be changed".to_owned(),
+            )),
+            RoleSource::Config => Err(read_only()),
+        }
+    }
+
+    /// Everything that lists groups, grants, roles or bindings.
     fn require_listing(&self) -> Result<(), AdminError> {
-        self.require_any(&[Permission::GroupsManage, Permission::AuditRead])
+        self.require_any(&[
+            Permission::GroupsManage,
+            Permission::RolesManage,
+            Permission::AuditRead,
+        ])
     }
 
     /// All groups, config first.
@@ -387,6 +425,36 @@ impl<'a> Admin<'a> {
     pub fn role_bindings(&self) -> Result<Vec<RoleBinding>, AdminError> {
         self.require_listing()?;
         Ok(self.policy.current().role_bindings())
+    }
+
+    /// All roles (built-in, config, database) with their binding counts.
+    ///
+    /// # Errors
+    /// Forbidden like [`Admin::groups`].
+    pub fn roles(&self) -> Result<Vec<RoleEntry>, AdminError> {
+        self.require_listing()?;
+        let policy = self.policy.current();
+        let bindings = policy.role_bindings();
+        Ok(policy
+            .roles()
+            .into_iter()
+            .map(|role| {
+                let count = bindings.iter().filter(|b| b.role == role.name).count();
+                RoleEntry {
+                    role,
+                    bindings: count,
+                }
+            })
+            .collect())
+    }
+
+    /// Every permission a role may carry.
+    ///
+    /// # Errors
+    /// Forbidden like [`Admin::groups`].
+    pub fn permission_catalog(&self) -> Result<Vec<Permission>, AdminError> {
+        self.require_listing()?;
+        Ok(Permission::ALL.to_vec())
     }
 
     /// Up to `limit` users.
@@ -652,19 +720,139 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Binds a role to a group or a user and returns the binding's id.
+    /// Creates a custom role in the database and returns it.
     ///
     /// # Errors
-    /// Forbidden without `roles.manage`, invalid for an unknown group, not
+    /// Forbidden without `roles.manage` or when the role would carry a
+    /// permission the caller does not hold, invalid for a bad name, description
+    /// or permission list, conflict when the name is a built-in, config or
+    /// database role.
+    pub async fn create_role(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        permissions: &[String],
+    ) -> Result<RoleEntry, AdminError> {
+        self.require(Permission::RolesManage)?;
+        // A built-in name is taken, not malformed.
+        if Role::parse(name).is_some() {
+            return Err(AdminError::Conflict(
+                "built-in role, cannot be changed".to_owned(),
+            ));
+        }
+        validate_role_name(name).map_err(AdminError::Invalid)?;
+        let description = clean_description(description)?;
+        let permissions = parse_permissions(permissions).map_err(AdminError::Invalid)?;
+        self.require_holds(&permissions)?;
+        if self.policy.current().role(name).is_some() {
+            return Err(already_exists());
+        }
+        if !self
+            .store
+            .create_role(&self.actor, name, description.as_deref(), &permissions)
+            .await?
+        {
+            return Err(already_exists());
+        }
+        self.reload().await;
+        // Built here: the policy may not have reloaded yet if the refresh failed.
+        Ok(RoleEntry {
+            role: RoleView {
+                name: name.to_owned(),
+                description,
+                source: RoleSource::Local,
+                permissions,
+            },
+            bindings: 0,
+        })
+    }
+
+    /// Replaces a database role's description and permissions and returns it.
+    ///
+    /// # Errors
+    /// Forbidden without `roles.manage` or when the new permissions include one
+    /// the caller does not hold, not found for an unknown role, conflict for a
+    /// built-in or config role, invalid for a bad description or permission
+    /// list.
+    pub async fn update_role(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        permissions: &[String],
+    ) -> Result<RoleEntry, AdminError> {
+        self.require(Permission::RolesManage)?;
+        self.local_role(name)?;
+        let description = clean_description(description)?;
+        let permissions = parse_permissions(permissions).map_err(AdminError::Invalid)?;
+        self.require_holds(&permissions)?;
+        // `false` means the role already is that: nothing to do.
+        if self
+            .store
+            .update_role(&self.actor, name, description.as_deref(), &permissions)
+            .await?
+        {
+            self.reload().await;
+        }
+        let bindings = self
+            .policy
+            .current()
+            .role_bindings()
+            .iter()
+            .filter(|binding| binding.role == name)
+            .count();
+        Ok(RoleEntry {
+            role: RoleView {
+                name: name.to_owned(),
+                description,
+                source: RoleSource::Local,
+                permissions,
+            },
+            bindings,
+        })
+    }
+
+    /// Deletes a database role. With `force` the bindings that name it go too.
+    ///
+    /// # Errors
+    /// Forbidden without `roles.manage`, not found for an unknown role,
+    /// conflict for a built-in or config role, or when bindings name the role
+    /// and `force` is not set.
+    pub async fn delete_role(&self, name: &str, force: bool) -> Result<(), AdminError> {
+        self.require(Permission::RolesManage)?;
+        self.local_role(name)?;
+        match self.store.delete_role(&self.actor, name, force).await? {
+            RoleDeletion::Deleted => {}
+            RoleDeletion::Missing => return Err(AdminError::NotFound),
+            RoleDeletion::HasBindings(count) => {
+                return Err(AdminError::Conflict(format!(
+                    "{count} role binding(s) name this role; delete them too with force"
+                )));
+            }
+        }
+        self.reload().await;
+        Ok(())
+    }
+
+    /// Binds a role (built-in or custom, by name) to a group or a user and
+    /// returns the binding's id.
+    ///
+    /// # Errors
+    /// Forbidden without `roles.manage` or when the role carries a permission
+    /// the caller does not hold, invalid for an unknown role or group, not
     /// found for an unknown user, conflict when the binding exists.
     pub async fn create_role_binding(
         &self,
-        role: Role,
+        role: &str,
         subject: RoleSubject,
     ) -> Result<i64, AdminError> {
         self.require(Permission::RolesManage)?;
+        let policy = self.policy.current();
+        let Some(carried) = policy.role_permissions(role) else {
+            return Err(AdminError::Invalid(format!("unknown role {role:?}")));
+        };
+        self.require_holds(&carried)?;
         if let RoleSubject::Group(group) = &subject
-            && !self.policy.current().has_group(group)
+            && !policy.has_group(group)
         {
             return Err(AdminError::Invalid(format!("unknown group {group:?}")));
         }
@@ -1238,6 +1426,7 @@ mod tests {
             }],
             grants: Vec::new(),
             role_bindings: Vec::new(),
+            roles: Vec::new(),
         }
     }
 
@@ -1333,7 +1522,7 @@ mod tests {
         ));
         assert!(matches!(
             admin
-                .create_role_binding(Role::Admin, RoleSubject::User(session.user.id))
+                .create_role_binding(Role::Admin.as_str(), RoleSubject::User(session.user.id))
                 .await,
             Err(AdminError::Forbidden)
         ));
@@ -1555,24 +1744,29 @@ mod tests {
 
         let subject = RoleSubject::User(bob.user.id);
         let id = root_admin
-            .create_role_binding(Role::Auditor, subject.clone())
+            .create_role_binding(Role::Auditor.as_str(), subject.clone())
             .await
             .unwrap();
         // The handle was reloaded, so bob's next request sees the role.
         admin(&store, &handle, &bob).audit(10, None).await.unwrap();
         assert!(matches!(
-            root_admin.create_role_binding(Role::Auditor, subject).await,
+            root_admin
+                .create_role_binding(Role::Auditor.as_str(), subject)
+                .await,
             Err(AdminError::Conflict(_))
         ));
         assert!(matches!(
             root_admin
-                .create_role_binding(Role::Auditor, RoleSubject::User(Uuid::new_v4()))
+                .create_role_binding(Role::Auditor.as_str(), RoleSubject::User(Uuid::new_v4()))
                 .await,
             Err(AdminError::NotFound)
         ));
         assert!(matches!(
             root_admin
-                .create_role_binding(Role::Auditor, RoleSubject::Group("nobody".to_owned()))
+                .create_role_binding(
+                    Role::Auditor.as_str(),
+                    RoleSubject::Group("nobody".to_owned()),
+                )
                 .await,
             Err(AdminError::Invalid(_))
         ));

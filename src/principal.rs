@@ -221,6 +221,7 @@ mod tests {
                 grant("dev", "forgejo", &["whoami"], true),
             ],
             role_bindings: Vec::new(),
+            roles: Vec::new(),
         }
     }
 

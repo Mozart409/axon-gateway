@@ -368,6 +368,8 @@ pub(super) async fn callback(
 
 /// Consumes the stored flow, exchanges the code and opens a session. Returns
 /// the session token and where to send the browser, or the page to show.
+// One linear login sequence; splitting it would scatter the flow's checks
+#[allow(clippy::too_many_lines)]
 async fn finish_login(
     state: &AppState,
     store: &crate::store::Store,
@@ -431,6 +433,20 @@ async fn finish_login(
         .await
         .map_err(|error| {
             tracing::warn!(%error, "could not record a dashboard user");
+            Box::new(database_unavailable(state))
+        })?;
+    // A user the provider pushed over SCIM links to this login now, takes its
+    // SCIM groups and, when it is inactive there, is disabled before the check below
+    store
+        .link_scim_user_on_login(
+            &flow.provider_id,
+            user.id,
+            login.email.as_deref(),
+            login.scim_key.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "could not link a dashboard user to its SCIM user");
             Box::new(database_unavailable(state))
         })?;
     let disabled = store.user_disabled(user.id).await.map_err(|error| {

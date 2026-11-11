@@ -78,6 +78,8 @@ mod oauth_views;
 mod personal_api;
 mod personal_ui;
 mod personal_views;
+mod scim_admin;
+mod scim_api;
 mod session;
 mod tokens_api;
 mod tokens_ui;
@@ -184,6 +186,7 @@ fn ui_action_routes(state: &AppState) -> Router<AppState> {
         .merge(tokens_ui::action_routes())
         .merge(oauth_ui::action_routes())
         .merge(audit_ui::action_routes())
+        .merge(scim_admin::action_routes())
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -225,6 +228,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(tokens_ui::page_routes())
         .merge(oauth_ui::page_routes())
         .merge(audit_ui::page_routes())
+        .merge(scim_admin::page_routes())
         .merge(ui_actions)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -268,6 +272,9 @@ pub fn create_router(state: AppState) -> Router {
         // JSON admin API
         .merge(admin_api::router(state.clone()))
         .merge(audit_api::router(state.clone()))
+        .merge(scim_admin::api_router(state.clone()))
+        // SCIM provisioning by an identity provider (multi-user mode only)
+        .merge(scim_api::router(state.clone()))
         // Status endpoints
         .route("/health", get(api::health_check))
         .route("/livez", get(api::livez))

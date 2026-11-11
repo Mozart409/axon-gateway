@@ -1840,6 +1840,7 @@ mod tests {
                 }],
                 grants: vec![grant("public", &["*"]), grant("secret", &["nothing"])],
                 role_bindings: Vec::new(),
+                roles: Vec::new(),
             };
             let groups: Vec<String> = groups.iter().map(ToString::to_string).collect();
             let effective = Policy::from_config(&config).effective(&groups);

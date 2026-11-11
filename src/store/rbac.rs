@@ -1,5 +1,5 @@
-//! Dashboard-managed RBAC: groups, `IdP` mappings, memberships, grants and role
-//! bindings
+//! Dashboard-managed RBAC: groups, `IdP` mappings, memberships, grants, custom roles
+//! and role bindings
 //!
 //! Every write runs in one transaction together with its `audit_log` row, and
 //! a write that changes nothing records nothing.
@@ -14,7 +14,8 @@ use uuid::Uuid;
 use super::auth::User;
 use super::{Store, StoreError};
 use crate::policy::{
-    GrantConfig, IdpMapping, RbacGroupConfig, RbacSnapshot, Role, RoleBinding, RoleSubject,
+    GrantConfig, IdpMapping, Permission, RbacGroupConfig, RbacSnapshot, RoleBinding, RoleConfig,
+    RoleSubject,
 };
 
 /// Who made an admin change, for the audit log
@@ -76,6 +77,25 @@ fn grant_json(grant: &GrantConfig) -> Value {
     })
 }
 
+/// What [`Store::delete_role`] did
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleDeletion {
+    /// The role and its bindings are gone
+    Deleted,
+    /// There is no such role
+    Missing,
+    /// Nothing was deleted: this many bindings name the role and `force` was not set
+    HasBindings(i64),
+}
+
+fn permission_names(permissions: &[Permission]) -> Vec<String> {
+    permissions
+        .iter()
+        .copied()
+        .map(|permission| permission.as_str().to_owned())
+        .collect()
+}
+
 /// Appends the audit row of a change; runs inside the change's transaction
 pub(super) async fn audit(
     conn: &mut PgConnection,
@@ -100,8 +120,8 @@ pub(super) async fn audit(
 
 impl Store {
     /// All stored RBAC state: groups with their `IdP` mappings by name,
-    /// memberships, grants by id and role bindings by id. Bindings with a
-    /// role this build does not know are skipped.
+    /// memberships, grants by id, custom roles by name and role bindings by id.
+    /// A binding may name a role that no longer exists; it grants nothing.
     ///
     /// # Errors
     /// Fails when a query fails.
@@ -132,6 +152,10 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await?;
+        let roles: Vec<(String, Option<String>, Vec<String>)> =
+            sqlx::query_as("select name, description, permissions from rbac_roles order by name")
+                .fetch_all(&self.pool)
+                .await?;
 
         let mut idp: HashMap<String, Vec<IdpMapping>> = HashMap::new();
         for (group, provider, value) in mappings {
@@ -151,10 +175,6 @@ impl Store {
 
         let mut role_bindings = Vec::with_capacity(bindings.len());
         for (id, role, group, user_id) in bindings {
-            let Some(role) = Role::parse(&role) else {
-                tracing::warn!(id, role, "skipping a role binding with an unknown role");
-                continue;
-            };
             let subject = match (group, user_id) {
                 (Some(group), _) => RoleSubject::Group(group),
                 (None, Some(user_id)) => RoleSubject::User(user_id),
@@ -172,6 +192,14 @@ impl Store {
             memberships,
             grants: grants.into_iter().map(Into::into).collect(),
             role_bindings,
+            roles: roles
+                .into_iter()
+                .map(|(name, description, permissions)| RoleConfig {
+                    name,
+                    description,
+                    permissions,
+                })
+                .collect(),
         })
     }
 
@@ -505,27 +533,146 @@ impl Store {
         Ok(Some(grant))
     }
 
-    /// Binds a role to a group or user and returns the binding's id. `None`
-    /// when the binding exists.
+    /// Creates a custom role. `false` when the name is taken.
+    ///
+    /// # Errors
+    /// Fails when the transaction fails.
+    pub async fn create_role(
+        &self,
+        actor: &Actor,
+        name: &str,
+        description: Option<&str>,
+        permissions: &[Permission],
+    ) -> Result<bool, StoreError> {
+        let names = permission_names(permissions);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "insert into rbac_roles (name, description, permissions) values ($1, $2, $3) \
+             on conflict do nothing",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(names.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        audit(
+            &mut tx,
+            actor,
+            "role.create",
+            &format!("role:{name}"),
+            json!({ "description": description, "permissions": names }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Replaces a custom role's description and permissions. `false` when the
+    /// role is missing or already is that.
+    ///
+    /// # Errors
+    /// Fails when the transaction fails.
+    pub async fn update_role(
+        &self,
+        actor: &Actor,
+        name: &str,
+        description: Option<&str>,
+        permissions: &[Permission],
+    ) -> Result<bool, StoreError> {
+        let names = permission_names(permissions);
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "update rbac_roles set description = $2, permissions = $3, updated_at = now() \
+             where name = $1 and (description is distinct from $2 or permissions <> $3)",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(names.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        audit(
+            &mut tx,
+            actor,
+            "role.update",
+            &format!("role:{name}"),
+            json!({ "description": description, "permissions": names }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Deletes a custom role. Bindings that name it block the deletion unless
+    /// `force` is set, which deletes them too.
+    ///
+    /// # Errors
+    /// Fails when the transaction fails.
+    pub async fn delete_role(
+        &self,
+        actor: &Actor,
+        name: &str,
+        force: bool,
+    ) -> Result<RoleDeletion, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query("delete from rbac_roles where name = $1")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            return Ok(RoleDeletion::Missing);
+        }
+        let bound: i64 =
+            sqlx::query_scalar("select count(*) from rbac_role_bindings where role = $1")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await?;
+        if bound > 0 && !force {
+            tx.rollback().await?;
+            return Ok(RoleDeletion::HasBindings(bound));
+        }
+        sqlx::query("delete from rbac_role_bindings where role = $1")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        audit(
+            &mut tx,
+            actor,
+            "role.delete",
+            &format!("role:{name}"),
+            json!({ "role_bindings": bound }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RoleDeletion::Deleted)
+    }
+
+    /// Binds a role (by name, built-in or custom) to a group or user and returns
+    /// the binding's id. `None` when the binding exists.
     ///
     /// # Errors
     /// Fails when the transaction fails, e.g. for a user that does not exist.
     pub async fn create_role_binding(
         &self,
         actor: &Actor,
-        role: Role,
+        role: &str,
         subject: &RoleSubject,
     ) -> Result<Option<i64>, StoreError> {
         let (group, user_id, details) = match subject {
             RoleSubject::Group(group) => (
                 Some(group.as_str()),
                 None,
-                json!({ "role": role.as_str(), "group": group }),
+                json!({ "role": role, "group": group }),
             ),
             RoleSubject::User(user_id) => (
                 None,
                 Some(*user_id),
-                json!({ "role": role.as_str(), "user_id": user_id }),
+                json!({ "role": role, "user_id": user_id }),
             ),
         };
         let mut tx = self.pool.begin().await?;
@@ -533,7 +680,7 @@ impl Store {
             "insert into rbac_role_bindings (role, group_name, user_id) values ($1, $2, $3) \
              on conflict do nothing returning id",
         )
-        .bind(role.as_str())
+        .bind(role)
         .bind(group)
         .bind(user_id)
         .fetch_optional(&mut *tx)
@@ -746,11 +893,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_role_binding(
-                &cli(),
-                Role::Auditor,
-                &RoleSubject::Group("ops".to_string()),
-            )
+            .create_role_binding(&cli(), "auditor", &RoleSubject::Group("ops".to_string()))
             .await
             .unwrap();
 
@@ -924,25 +1067,25 @@ mod tests {
         let person = RoleSubject::User(user);
 
         let for_group = store
-            .create_role_binding(&cli(), Role::Admin, &group)
+            .create_role_binding(&cli(), "admin", &group)
             .await
             .unwrap()
             .unwrap();
         assert!(
             store
-                .create_role_binding(&cli(), Role::Admin, &group)
+                .create_role_binding(&cli(), "admin", &group)
                 .await
                 .unwrap()
                 .is_none()
         );
         let for_user = store
-            .create_role_binding(&cli(), Role::Admin, &person)
+            .create_role_binding(&cli(), "admin", &person)
             .await
             .unwrap()
             .unwrap();
         assert!(
             store
-                .create_role_binding(&cli(), Role::Admin, &person)
+                .create_role_binding(&cli(), "admin", &person)
                 .await
                 .unwrap()
                 .is_none()
@@ -950,7 +1093,7 @@ mod tests {
         // The same subject may hold another role.
         assert!(
             store
-                .create_role_binding(&cli(), Role::Auditor, &group)
+                .create_role_binding(&cli(), "auditor", &group)
                 .await
                 .unwrap()
                 .is_some()
@@ -976,27 +1119,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_roles_are_skipped_in_the_snapshot() {
+    async fn bindings_of_unknown_roles_stay_in_the_snapshot() {
         let Some(store) = test_store("axon_store_rbac_unknown_role").await else {
             return;
         };
-        // The check constraint only admits known roles, so drop it to plant one.
-        sqlx::query("alter table rbac_role_bindings drop constraint rbac_role_bindings_role_check")
-            .execute(&store.pool)
-            .await
-            .unwrap();
+        // No check constraint limits the role: a deleted custom role leaves its name behind.
         sqlx::query("insert into rbac_role_bindings (role, group_name) values ('root', 'ops')")
             .execute(&store.pool)
             .await
             .unwrap();
         store
-            .create_role_binding(&cli(), Role::Member, &RoleSubject::Group("ops".to_string()))
+            .create_role_binding(&cli(), "member", &RoleSubject::Group("ops".to_string()))
             .await
             .unwrap();
 
         let snapshot = store.rbac_snapshot().await.unwrap();
-        assert_eq!(snapshot.role_bindings.len(), 1);
-        assert_eq!(snapshot.role_bindings[0].role, Role::Member);
+        let roles: Vec<&str> = snapshot
+            .role_bindings
+            .iter()
+            .map(|binding| binding.role.as_str())
+            .collect();
+        assert_eq!(roles, ["root", "member"]);
+    }
+
+    #[tokio::test]
+    async fn custom_roles_round_trip_through_the_snapshot() {
+        let Some(store) = test_store("axon_store_rbac_roles").await else {
+            return;
+        };
+        let permissions = [Permission::BackendsView, Permission::AuditRead];
+
+        assert!(
+            store
+                .create_role(&cli(), "log-reader", Some("Reads logs"), &permissions)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .create_role(&cli(), "log-reader", None, &permissions)
+                .await
+                .unwrap()
+        );
+        let snapshot = store.rbac_snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.roles,
+            [RoleConfig {
+                name: "log-reader".to_string(),
+                description: Some("Reads logs".to_string()),
+                permissions: vec!["backends.view".to_string(), "audit.read".to_string()],
+            }]
+        );
+
+        assert!(
+            store
+                .update_role(&cli(), "log-reader", None, &[Permission::AuditRead])
+                .await
+                .unwrap()
+        );
+        // Unchanged and missing roles are no-ops.
+        assert!(
+            !store
+                .update_role(&cli(), "log-reader", None, &[Permission::AuditRead])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_role(&cli(), "missing", None, &[Permission::AuditRead])
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            audited(&store).await,
+            [
+                entry("role.create", "role:log-reader"),
+                entry("role.update", "role:log-reader"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_role_needs_force_when_bindings_name_it() {
+        let Some(store) = test_store("axon_store_rbac_role_delete").await else {
+            return;
+        };
+        let group = RoleSubject::Group("ops".to_string());
+        store
+            .create_role(&cli(), "log-reader", None, &[Permission::AuditRead])
+            .await
+            .unwrap();
+        store
+            .create_role(&cli(), "other", None, &[Permission::AuditRead])
+            .await
+            .unwrap();
+        store
+            .create_role_binding(&cli(), "log-reader", &group)
+            .await
+            .unwrap();
+        store
+            .create_role_binding(&cli(), "auditor", &group)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .delete_role(&cli(), "log-reader", false)
+                .await
+                .unwrap(),
+            RoleDeletion::HasBindings(1)
+        );
+        assert_eq!(count(&store, "rbac_roles").await, 2);
+        assert_eq!(count(&store, "rbac_role_bindings").await, 2);
+
+        assert_eq!(
+            store.delete_role(&cli(), "log-reader", true).await.unwrap(),
+            RoleDeletion::Deleted
+        );
+        assert_eq!(
+            store.delete_role(&cli(), "log-reader", true).await.unwrap(),
+            RoleDeletion::Missing
+        );
+        assert_eq!(
+            store.delete_role(&cli(), "other", false).await.unwrap(),
+            RoleDeletion::Deleted
+        );
+        assert_eq!(count(&store, "rbac_roles").await, 0);
+        // The built-in binding stays.
+        assert_eq!(count(&store, "rbac_role_bindings").await, 1);
+
+        let log = store.audit_log(1, None).await.unwrap();
+        assert_eq!(log[0].action, "role.delete");
+        assert_eq!(log[0].target, "role:other");
+        assert_eq!(log[0].details, json!({ "role_bindings": 0 }));
     }
 
     #[tokio::test]
@@ -1063,7 +1319,7 @@ mod tests {
         store.create_group(&actor, "ops", None).await.unwrap();
         store.add_member(&actor, "ops", user).await.unwrap();
         store
-            .create_role_binding(&actor, Role::Admin, &RoleSubject::User(user))
+            .create_role_binding(&actor, "admin", &RoleSubject::User(user))
             .await
             .unwrap();
 

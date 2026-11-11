@@ -1,4 +1,4 @@
-//! The JSON admin API under `/api/v1`: RBAC groups, grants, role bindings,
+//! The JSON admin API under `/api/v1`: RBAC groups, grants, roles, role bindings,
 //! users and the audit log (and, from `tokens_api`, personal access tokens and
 //! service accounts).
 //!
@@ -24,9 +24,9 @@ use uuid::Uuid;
 
 use super::{AppState, reject_cross_site_middleware, session};
 use crate::policy::{
-    GrantConfig, GrantView, GroupView, Permission, Role, RoleBinding, RoleSubject, Source,
+    GrantConfig, GrantView, GroupView, Permission, RoleBinding, RoleSource, RoleSubject, Source,
 };
-use crate::rbac::{Admin, AdminError, ManagedUser, resolve};
+use crate::rbac::{Admin, AdminError, ManagedUser, RoleEntry, resolve};
 use crate::store::{AuditRecord, SessionUser};
 
 const DEFAULT_USERS_LIMIT: i64 = 100;
@@ -162,6 +162,15 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             "/api/v1/role-bindings/{id}",
             delete(handle_delete_role_binding),
         )
+        .route(
+            "/api/v1/admin/roles",
+            get(handle_list_roles).post(handle_create_role),
+        )
+        .route(
+            "/api/v1/admin/roles/{name}",
+            put(handle_update_role).delete(handle_delete_role),
+        )
+        .route("/api/v1/admin/permissions", get(handle_list_permissions))
         .route("/api/v1/users", get(handle_list_users))
         .route("/api/v1/users/{id}", patch(handle_update_user))
         .route("/api/v1/audit", get(handle_list_audit))
@@ -244,9 +253,30 @@ fn binding_json(binding: &RoleBinding) -> Value {
     json!({
         "id": binding.id,
         "source": source_name(source),
-        "role": binding.role.as_str(),
+        "role": binding.role,
         "group": group,
         "user_id": user_id,
+    })
+}
+
+fn role_json(entry: &RoleEntry) -> Value {
+    let source = match entry.role.source {
+        RoleSource::Builtin => "builtin",
+        RoleSource::Config => "config",
+        RoleSource::Local => source_name(Source::Local),
+    };
+    json!({
+        "name": entry.role.name,
+        "description": entry.role.description,
+        "source": source,
+        "permissions": entry
+            .role
+            .permissions
+            .iter()
+            .copied()
+            .map(Permission::as_str)
+            .collect::<Vec<_>>(),
+        "bindings": entry.bindings,
     })
 }
 
@@ -293,7 +323,7 @@ async fn handle_me(
             "display_name": user.display_name,
         },
         "groups": groups,
-        "roles": permissions.roles().map(Role::as_str).collect::<Vec<_>>(),
+        "roles": permissions.roles().collect::<Vec<_>>(),
         "permissions": Permission::ALL
             .into_iter()
             .filter(|permission| permissions.has(*permission))
@@ -496,11 +526,11 @@ async fn handle_list_role_bindings(
     Ok(Json(json!({ "role_bindings": bindings })))
 }
 
-/// `POST /api/v1/role-bindings` body: the role and exactly one of `group` and
-/// `user_id`
+/// `POST /api/v1/role-bindings` body: the role (built-in or custom, by name) and
+/// exactly one of `group` and `user_id`
 #[derive(Debug, Deserialize)]
 struct RoleBindingBody {
-    role: Role,
+    role: String,
     group: Option<String>,
     user_id: Option<Uuid>,
 }
@@ -522,7 +552,7 @@ async fn handle_create_role_binding(
     };
     let id = admin(&state, &session)
         .await?
-        .create_role_binding(body.role, subject)
+        .create_role_binding(&body.role, subject)
         .await?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
@@ -538,6 +568,95 @@ async fn handle_delete_role_binding(
         .delete_role_binding(id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/admin/roles`: built-in, config and database roles
+async fn handle_list_roles(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+) -> ApiResult<Json<Value>> {
+    let roles = admin(&state, &session).await?.roles()?;
+    let roles: Vec<Value> = roles.iter().map(role_json).collect();
+    Ok(Json(json!({ "roles": roles })))
+}
+
+/// `POST /api/v1/admin/roles` body
+#[derive(Debug, Deserialize)]
+struct CreateRoleBody {
+    name: String,
+    description: Option<String>,
+    permissions: Vec<String>,
+}
+
+/// `POST /api/v1/admin/roles`
+async fn handle_create_role(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+    ApiJson(body): ApiJson<CreateRoleBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let role = admin(&state, &session)
+        .await?
+        .create_role(&body.name, body.description.as_deref(), &body.permissions)
+        .await?;
+    Ok((StatusCode::CREATED, Json(role_json(&role))))
+}
+
+/// `PUT /api/v1/admin/roles/{name}` body; a missing or null description clears it
+#[derive(Debug, Deserialize)]
+struct UpdateRoleBody {
+    description: Option<String>,
+    permissions: Vec<String>,
+}
+
+/// `PUT /api/v1/admin/roles/{name}`: replaces the description and permissions
+async fn handle_update_role(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+    ApiPath(name): ApiPath<String>,
+    ApiJson(body): ApiJson<UpdateRoleBody>,
+) -> ApiResult<Json<Value>> {
+    let role = admin(&state, &session)
+        .await?
+        .update_role(&name, body.description.as_deref(), &body.permissions)
+        .await?;
+    Ok(Json(role_json(&role)))
+}
+
+/// `DELETE /api/v1/admin/roles/{name}?force=`
+#[derive(Debug, Deserialize)]
+struct DeleteRoleQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+/// `DELETE /api/v1/admin/roles/{name}`: 409 while bindings name the role,
+/// unless `force=true`, which deletes them too
+async fn handle_delete_role(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(query): ApiQuery<DeleteRoleQuery>,
+) -> ApiResult<StatusCode> {
+    admin(&state, &session)
+        .await?
+        .delete_role(&name, query.force)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/admin/permissions`: every permission a role may carry
+async fn handle_list_permissions(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+) -> ApiResult<Json<Value>> {
+    let permissions = admin(&state, &session).await?.permission_catalog()?;
+    let permissions: Vec<Value> = permissions
+        .into_iter()
+        .map(|permission| {
+            json!({ "name": permission.as_str(), "description": permission.description() })
+        })
+        .collect();
+    Ok(Json(json!({ "permissions": permissions })))
 }
 
 /// `GET /api/v1/users?limit=`

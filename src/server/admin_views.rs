@@ -1,5 +1,5 @@
-//! HTML rendering (maud) for the admin pages: groups, grants, role bindings,
-//! users and the audit log.
+//! HTML rendering (maud) for the admin pages: groups, grants, roles, role
+//! bindings, users and the audit log.
 //!
 //! Like `views`, these are pure view functions. The page handlers and the
 //! htmx actions live in `admin_ui`; every section here is also the fragment an
@@ -13,9 +13,10 @@ use uuid::Uuid;
 use super::AppState;
 use super::views::{build_fingerprint, csrf_hx_headers, render_user_bar};
 use crate::policy::{
-    GrantView, GroupView, Permission, Permissions, Role, RoleBinding, RoleSubject, Source,
+    GrantView, GroupView, Permission, Permissions, RoleBinding, RoleSource, RoleSubject, RoleView,
+    Source,
 };
-use crate::rbac::ManagedUser;
+use crate::rbac::{ManagedUser, RoleEntry};
 use crate::store::{AuditRecord, ServiceAccount, SessionUser, User};
 
 /// Admin actions answer errors with 4xx/5xx and a flash fragment; htmx drops
@@ -96,12 +97,21 @@ pub(super) struct AdminOverview {
     pub groups: Vec<GroupRow>,
     pub grants: Vec<GrantView>,
     pub bindings: Vec<RoleBinding>,
+    /// Roles a binding may name, built-in ones first; a binding naming none of them
+    /// is shown as unknown
+    pub roles: Vec<RoleView>,
     /// Groups a grant or a role binding may name, `authenticated` first
     pub group_names: Vec<String>,
     /// Configured backends a grant may name
     pub backends: Vec<String>,
     /// Users a role binding may name; empty without the permission to list them
     pub users: Vec<User>,
+}
+
+/// Everything `/ui/admin/roles` shows
+pub(super) struct RolesPage {
+    pub access: Access,
+    pub roles: Vec<RoleEntry>,
 }
 
 /// Everything `/ui/admin/groups/{name}` shows
@@ -167,6 +177,18 @@ fn source_badge(source: Source) -> Markup {
     };
     html! {
         span class=(classes) { (label) }
+    }
+}
+
+fn role_source_badge(source: RoleSource) -> Markup {
+    match source {
+        RoleSource::Builtin => html! {
+            span class="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-semibold text-sky-800 dark:bg-sky-900/40 dark:text-sky-300" {
+                "built-in"
+            }
+        },
+        RoleSource::Config => source_badge(Source::Config),
+        RoleSource::Local => source_badge(Source::Local),
     }
 }
 
@@ -262,6 +284,11 @@ pub(super) fn render_admin_page(
                 p class="mt-3 text-sm" {
                     a href="/ui/admin/users" class=(LINK) { "Users" }
                 }
+                @if overview.access.manage_groups {
+                    p class="mt-3 text-sm" {
+                        a href="/ui/admin/scim" class=(LINK) { "SCIM provisioning" }
+                    }
+                }
                 @if state.personal.is_some() {
                     p class="mt-3 text-sm" {
                         a href="/ui/admin/personal-backends" class=(LINK) { "Personal MCP servers" }
@@ -272,6 +299,9 @@ pub(super) fn render_admin_page(
                 p class="mt-3 text-sm" {
                     a href="/ui/admin/service-accounts" class=(LINK) { "Service accounts" }
                 }
+            }
+            p class="mt-3 text-sm" {
+                a href="/ui/admin/roles" class=(LINK) { "Roles" }
             }
         }
         (render_flash_area(false))
@@ -507,7 +537,8 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
         section id="admin-bindings" class=(CARD) hx-swap-oob=[oob.then_some("true")] {
             h2 class=(HEADING) { "Role bindings" }
             p class=(format!("mt-1 {MUTED}")) {
-                "A role binding gives a role to every member of a group, or to one user."
+                "A role binding gives a role to every member of a group, or to one user. "
+                "A role you do not hold every permission of cannot be given away."
             }
             @if overview.bindings.is_empty() {
                 p class=(format!("mt-4 text-sm {FAINT}")) { "No role bindings yet." }
@@ -528,7 +559,15 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
                             @for binding in &overview.bindings {
                                 @let source = if binding.id.is_some() { Source::Local } else { Source::Config };
                                 tr {
-                                    td class=(TD) { code class=(CODE) { (binding.role.as_str()) } }
+                                    td class=(TD) {
+                                        code class=(CODE) { (binding.role) }
+                                        @if !overview.roles.iter().any(|role| role.name == binding.role) {
+                                            " "
+                                            span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
+                                                "unknown role"
+                                            }
+                                        }
+                                    }
                                     td class=(TD) {
                                         @match &binding.subject {
                                             RoleSubject::Group(group) => {
@@ -574,8 +613,8 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
                     label class=(LABEL) {
                         "Role"
                         select class=(INPUT) name="role" required {
-                            @for role in Role::ALL {
-                                option value=(role.as_str()) { (role.as_str()) }
+                            @for role in &overview.roles {
+                                option value=(role.name) { (role.name) }
                             }
                         }
                     }
@@ -600,6 +639,178 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
                     button class=(BUTTON) type="submit" { "Add role binding" }
                 }
             }
+        }
+    }
+}
+
+/// Roles page (`GET /ui/admin/roles`).
+pub(super) fn render_roles_page(state: &AppState, user: &SessionUser, page: &RolesPage) -> Markup {
+    let content = html! {
+        section class=(CARD) {
+            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
+            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                "Roles"
+            }
+            p class=(format!("mt-2 {MUTED}")) {
+                "A role is a named set of permissions, given to groups and users by role bindings. "
+                "The built-in roles are fixed; roles from config.toml are read-only."
+            }
+        }
+        (render_flash_area(false))
+        (render_roles_section(page))
+    };
+    render_layout(state, user, "Roles", &content)
+}
+
+/// One checkbox per permission, named `permissions`; the ones in `selected` start checked.
+fn permission_checkboxes(selected: &[Permission]) -> Markup {
+    html! {
+        div class="mt-2 grid gap-x-6 gap-y-1 sm:grid-cols-2" {
+            @for permission in Permission::ALL {
+                label class="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-200" {
+                    input
+                        class="mt-1"
+                        type="checkbox"
+                        name="permissions"
+                        value=(permission.as_str())
+                        checked[selected.contains(&permission)];
+                    span {
+                        code class=(CODE) { (permission.as_str()) }
+                        " "
+                        span class=(FAINT) { (permission.description()) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Roles table with the edit, delete and create forms, the swap target of `roles`
+/// actions.
+#[allow(clippy::too_many_lines)]
+pub(super) fn render_roles_section(page: &RolesPage) -> Markup {
+    let manage = page.access.manage_roles;
+
+    html! {
+        section id="admin-roles" class=(CARD) {
+            h2 class=(HEADING) { "Roles" }
+            div class=(TABLE_WRAP) {
+                table class=(TABLE) {
+                    thead class=(THEAD) {
+                        tr {
+                            th class=(TH) { "Name" }
+                            th class=(TH) { "Source" }
+                            th class=(TH) { "Description" }
+                            th class=(TH) { "Permissions" }
+                            th class=(TH) { "Bindings" }
+                            @if manage {
+                                th class=(TH) { "Actions" }
+                            }
+                        }
+                    }
+                    tbody class=(TBODY) {
+                        @for entry in &page.roles {
+                            @let role = &entry.role;
+                            tr {
+                                td class=(TD) { code class=(CODE) { (role.name) } }
+                                td class=(TD) { (role_source_badge(role.source)) }
+                                td class=(TD) {
+                                    @if let Some(description) = &role.description {
+                                        (description)
+                                    }
+                                }
+                                td class=(TD) {
+                                    @for permission in &role.permissions {
+                                        div { code class=(CODE) { (permission.as_str()) } }
+                                    }
+                                }
+                                td class=(TD) { (entry.bindings) }
+                                @if manage {
+                                    td class=(TD) {
+                                        @if role.source == RoleSource::Local {
+                                            (render_role_actions(entry))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if manage {
+                h3 class="mt-6 text-sm font-semibold text-slate-900 dark:text-slate-100" {
+                    "Create a role"
+                }
+                form
+                    class="mt-2"
+                    hx-post="/ui/actions/admin/roles"
+                    hx-target="#admin-roles"
+                    hx-swap="outerHTML"
+                {
+                    div class=(FORM_ROW) {
+                        label class=(LABEL) {
+                            "Name"
+                            input
+                                class=(INPUT)
+                                type="text"
+                                name="name"
+                                placeholder="log-reader"
+                                pattern="[a-z0-9][a-z0-9_\\-]{0,62}"
+                                required;
+                        }
+                        label class=(LABEL) {
+                            "Description"
+                            input class=(INPUT) type="text" name="description";
+                        }
+                    }
+                    (permission_checkboxes(&[]))
+                    button class=(format!("mt-4 {BUTTON}")) type="submit" { "Create role" }
+                }
+            }
+        }
+    }
+}
+
+/// Edit and delete forms of a database role.
+fn render_role_actions(entry: &RoleEntry) -> Markup {
+    let role = &entry.role;
+    let name = &role.name;
+
+    html! {
+        details class="mb-2" {
+            summary class="cursor-pointer text-xs text-slate-700 dark:text-slate-200" { "Edit" }
+            form
+                class="mt-2"
+                hx-post=(format!("/ui/actions/admin/roles/{name}/update"))
+                hx-target="#admin-roles"
+                hx-swap="outerHTML"
+            {
+                label class=(LABEL) {
+                    "Description"
+                    input
+                        class=(INPUT)
+                        type="text"
+                        name="description"
+                        value=(role.description.as_deref().unwrap_or_default());
+                }
+                (permission_checkboxes(&role.permissions))
+                button class=(format!("mt-3 {BUTTON_SMALL}")) type="submit" { "Save" }
+            }
+        }
+        form
+            class="flex items-center gap-2"
+            hx-post=(format!("/ui/actions/admin/roles/{name}/delete"))
+            hx-target="#admin-roles"
+            hx-swap="outerHTML"
+            hx-confirm=(format!("Delete the role {name}?"))
+        {
+            @if entry.bindings > 0 {
+                label class="flex items-center gap-1 text-xs text-slate-700 dark:text-slate-200" {
+                    input type="checkbox" name="force" value="true";
+                    "also delete its " (entry.bindings) " binding(s)"
+                }
+            }
+            button class=(BUTTON_DANGER) type="submit" { "Delete" }
         }
     }
 }
@@ -1051,6 +1262,15 @@ mod tests {
         }
     }
 
+    fn role_view(name: &str, source: RoleSource, permissions: &[Permission]) -> RoleView {
+        RoleView {
+            name: name.to_owned(),
+            description: Some(format!("<b>{name}</b>")),
+            source,
+            permissions: permissions.to_vec(),
+        }
+    }
+
     const FULL: Access = Access {
         manage_groups: true,
         manage_roles: true,
@@ -1087,14 +1307,23 @@ mod tests {
             bindings: vec![
                 RoleBinding {
                     id: None,
-                    role: Role::Auditor,
+                    role: String::from("auditor"),
                     subject: RoleSubject::Group(String::from("ops")),
                 },
                 RoleBinding {
                     id: Some(9),
-                    role: Role::BackendAdmin,
+                    role: String::from("backend-admin"),
                     subject: RoleSubject::User(Uuid::from_u128(1)),
                 },
+            ],
+            roles: vec![
+                role_view("auditor", RoleSource::Builtin, &[Permission::AuditRead]),
+                role_view(
+                    "backend-admin",
+                    RoleSource::Builtin,
+                    &[Permission::BackendsView],
+                ),
+                role_view("log-reader", RoleSource::Local, &[Permission::AuditRead]),
             ],
             group_names: vec![
                 String::from("authenticated"),
@@ -1122,6 +1351,59 @@ mod tests {
         assert!(html.contains(">local<"));
         // Subjects are named by email when the user is known.
         assert!(html.contains("bob@example.com"));
+    }
+
+    #[tokio::test]
+    async fn bindings_offer_custom_roles_and_flag_unknown_ones() {
+        let mut overview = overview(FULL);
+        overview.bindings.push(RoleBinding {
+            id: Some(10),
+            role: String::from("gone"),
+            subject: RoleSubject::Group(String::from("ops")),
+        });
+        let html = page(&overview);
+
+        assert!(html.contains("<option value=\"log-reader\">log-reader</option>"));
+        assert_eq!(html.matches("unknown role").count(), 1);
+        assert!(html.contains("href=\"/ui/admin/roles\""));
+    }
+
+    fn roles_page(access: Access) -> RolesPage {
+        let entry = |name, source, bindings| RoleEntry {
+            role: role_view(name, source, &[Permission::AuditRead]),
+            bindings,
+        };
+        RolesPage {
+            access,
+            roles: vec![
+                entry("auditor", RoleSource::Builtin, 2),
+                entry("from-config", RoleSource::Config, 0),
+                entry("log-reader", RoleSource::Local, 3),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn only_database_roles_can_be_edited_or_deleted() {
+        let html =
+            render_roles_page(&test_state(), &session(true), &roles_page(FULL)).into_string();
+
+        assert!(html.contains("/ui/actions/admin/roles/log-reader/update"));
+        assert!(html.contains("/ui/actions/admin/roles/log-reader/delete"));
+        assert!(!html.contains("/ui/actions/admin/roles/auditor/"));
+        assert!(!html.contains("/ui/actions/admin/roles/from-config/"));
+        assert!(html.contains("hx-post=\"/ui/actions/admin/roles\""));
+        assert!(html.contains("also delete its 3 binding(s)"));
+        assert!(html.contains(">built-in<"));
+        // The description is escaped.
+        assert!(html.contains("&lt;b&gt;log-reader&lt;/b&gt;"));
+        assert!(!html.contains("<b>log-reader</b>"));
+
+        let html =
+            render_roles_page(&test_state(), &session(false), &roles_page(AUDITOR)).into_string();
+        assert!(html.contains("log-reader"));
+        assert!(!html.contains("hx-post"));
+        assert!(!html.contains("name=\"permissions\""));
     }
 
     #[tokio::test]

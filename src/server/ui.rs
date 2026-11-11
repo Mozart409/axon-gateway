@@ -929,6 +929,7 @@ mod tests {
                 wiki,
             ],
             role_bindings: Vec::new(),
+            roles: Vec::new(),
         }
     }
 

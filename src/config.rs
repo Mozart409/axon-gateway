@@ -157,9 +157,37 @@ pub struct OidcProviderConfig {
     /// The `aud` an accepted access token must carry; defaults to `client_id`
     #[serde(default)]
     pub access_token_audience: Option<String>,
+    /// When an Entra ID token reports a groups overage (too many groups to
+    /// list), fetch the user's groups from Microsoft Graph with the app's own
+    /// client credentials. Needs `client_secret_env` and the application
+    /// permission `GroupMember.Read.All` (or `Directory.Read.All`).
+    #[serde(default)]
+    pub graph_overage: bool,
+    /// Base URL of Microsoft Graph, for sovereign clouds and tests; defaults to
+    /// `https://graph.microsoft.com`
+    #[serde(default)]
+    pub graph_url: Option<String>,
+    /// ID-token claim (a dotted path, like `groups_claim`) whose value a SCIM
+    /// `externalId` is matched against; defaults to `sub`
+    #[serde(default)]
+    pub scim_match_claim: Option<String>,
 }
 
 impl OidcProviderConfig {
+    /// The Graph base URL: `graph_url`, or the public cloud's, without a
+    /// trailing slash
+    pub fn graph_url(&self) -> &str {
+        self.graph_url
+            .as_deref()
+            .unwrap_or("https://graph.microsoft.com")
+            .trim_end_matches('/')
+    }
+
+    /// The claim a SCIM `externalId` is matched against: `scim_match_claim`, or `sub`
+    pub fn scim_match_claim(&self) -> &str {
+        self.scim_match_claim.as_deref().unwrap_or("sub")
+    }
+
     /// The audience of accepted access tokens: `access_token_audience`, or the client id
     pub fn access_token_audience(&self) -> &str {
         self.access_token_audience
@@ -944,6 +972,26 @@ impl Config {
             }
             if provider.access_token_audience.as_deref() == Some("") {
                 return Err(invalid("access_token_audience must not be empty"));
+            }
+            if provider.graph_overage && provider.client_secret_env.is_none() {
+                return Err(invalid(
+                    "graph_overage needs a client secret: set client_secret_env",
+                ));
+            }
+            if provider.graph_url.is_some() {
+                let Ok(graph) = reqwest::Url::parse(provider.graph_url()) else {
+                    return Err(invalid("graph_url is not a valid URL"));
+                };
+                let loopback =
+                    matches!(graph.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+                if graph.scheme() != "https" && !(graph.scheme() == "http" && loopback) {
+                    return Err(invalid(
+                        "graph_url must use https (http is only allowed for localhost)",
+                    ));
+                }
+            }
+            if provider.scim_match_claim.as_deref() == Some("") {
+                return Err(invalid("scim_match_claim must not be empty"));
             }
         }
         Ok(())
@@ -1841,6 +1889,57 @@ name = "same"
                 provider("a", "https://idp.example.com")
             );
             assert!(invalid_reason(&with_db(&extra)).contains("access_token_audience"));
+        }
+
+        #[test]
+        fn graph_overage_is_off_and_scim_matches_sub_by_default() {
+            let config = with_db(&provider("a", "https://idp.example.com"));
+            config.validate().expect("valid");
+            let [one] = config.auth.oidc.as_slice() else {
+                panic!("one provider");
+            };
+            assert!(!one.graph_overage);
+            assert_eq!(one.graph_url(), "https://graph.microsoft.com");
+            assert_eq!(one.scim_match_claim(), "sub");
+
+            let extra = format!(
+                "{}client_secret_env = \"S\"\ngraph_overage = true\ngraph_url = \"https://graph.microsoft.us/\"\nscim_match_claim = \"oid\"\n",
+                provider("a", "https://idp.example.com")
+            );
+            let config = with_db(&extra);
+            config.validate().expect("valid");
+            let [one] = config.auth.oidc.as_slice() else {
+                panic!("one provider");
+            };
+            assert!(one.graph_overage);
+            assert_eq!(one.graph_url(), "https://graph.microsoft.us");
+            assert_eq!(one.scim_match_claim(), "oid");
+        }
+
+        #[test]
+        fn graph_overage_needs_a_client_secret() {
+            let extra = format!(
+                "{}graph_overage = true\n",
+                provider("a", "https://idp.example.com")
+            );
+            assert!(invalid_reason(&with_db(&extra)).contains("client_secret_env"));
+        }
+
+        #[test]
+        fn rejects_a_bad_graph_url_and_an_empty_scim_claim() {
+            for (line, key) in [
+                ("graph_url = \"not a url\"", "graph_url"),
+                ("graph_url = \"http://graph.example.com\"", "graph_url"),
+                ("scim_match_claim = \"\"", "scim_match_claim"),
+            ] {
+                let extra = format!("{}{line}\n", provider("a", "https://idp.example.com"));
+                assert!(invalid_reason(&with_db(&extra)).contains(key), "{line}");
+            }
+            let extra = format!(
+                "{}graph_url = \"http://127.0.0.1:9000\"\n",
+                provider("a", "https://idp.example.com")
+            );
+            with_db(&extra).validate().expect("loopback http is fine");
         }
     }
 

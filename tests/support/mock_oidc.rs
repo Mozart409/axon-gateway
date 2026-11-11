@@ -5,6 +5,11 @@
 //! login form), the token endpoint and an end-session endpoint. ID tokens are
 //! signed with a P-256 key generated per provider (ES256), and the code flow
 //! enforces PKCE (S256), so the gateway runs a real login against it.
+//!
+//! Opt-in, for the Entra groups overage: [`MockOidc::set_overage`] makes the
+//! next ID tokens report one, and [`MockOidc::set_graph`] adds the
+//! `client_credentials` grant and a Microsoft Graph `transitiveMemberOf` on the
+//! same server (point the provider's `graph_url` at the issuer).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -13,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
-use axum::extract::{Form, Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Form, OriginalUri, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -29,6 +34,9 @@ const KID: &str = "mock-oidc-key";
 const TOKEN_LIFETIME: u64 = 300;
 const GRANT_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const GRANT_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+const GRANT_CLIENT_CREDENTIALS: &str = "client_credentials";
+/// Groups per page of the mock Graph answer.
+const GRAPH_PAGE_SIZE: usize = 2;
 
 fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -60,6 +68,8 @@ struct Grant {
     code_challenge: String,
 }
 
+// Opt-in switches of this test mock, each enabled by the tests that need it
+#[allow(clippy::struct_excessive_bools)]
 struct ProviderState {
     issuer: String,
     client_id: String,
@@ -79,6 +89,15 @@ struct ProviderState {
     refresh_valid: HashSet<String>,
     /// The form of every request the token endpoint got, oldest first.
     forms: Vec<HashMap<String, String>>,
+    /// Opt-in: the `client_credentials` grant answers `graph_at_<n>` and the
+    /// Graph route serves `graph_groups`.
+    graph: bool,
+    graph_groups: Vec<String>,
+    /// The Graph route answers 500 (after checking the bearer token).
+    graph_failing: bool,
+    graph_tokens: HashSet<String>,
+    /// The URI of every request the Graph route got, oldest first.
+    graph_requests: Vec<String>,
 }
 
 type Shared = Arc<Mutex<ProviderState>>;
@@ -124,6 +143,11 @@ impl MockOidc {
             issued: 0,
             refresh_valid: HashSet::new(),
             forms: Vec::new(),
+            graph: false,
+            graph_groups: Vec::new(),
+            graph_failing: false,
+            graph_tokens: HashSet::new(),
+            graph_requests: Vec::new(),
         }));
 
         let app = Router::new()
@@ -132,6 +156,10 @@ impl MockOidc {
             .route("/authorize", get(authorize))
             .route("/token", post(token))
             .route("/logout", get(logout))
+            .route(
+                "/v1.0/users/{oid}/transitiveMemberOf/microsoft.graph.group",
+                get(graph_member_of),
+            )
             .with_state(state.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve mock oidc");
@@ -151,6 +179,39 @@ impl MockOidc {
     /// Claims merged into the next ID tokens (sub, email, name, groups, ...).
     pub fn set_user(&self, claims: Value) {
         self.state.lock().unwrap().user = claims;
+    }
+
+    /// The next ID tokens report a groups overage as Entra does: no `groups`
+    /// claim, but `_claim_names` and `_claim_sources`, and an `oid` claim.
+    pub fn set_overage(&self, subject: &str, email: &str, oid: &str) {
+        self.set_user(json!({
+            "sub": subject,
+            "email": email,
+            "name": subject,
+            "oid": oid,
+            "_claim_names": {"groups": "src1"},
+            "_claim_sources": {"src1": {"endpoint": "https://graph.example.invalid/getMemberObjects"}},
+        }));
+    }
+
+    /// Turns on the `client_credentials` grant (it answers `graph_at_<n>`) and
+    /// the Graph route `/v1.0/users/{oid}/transitiveMemberOf/microsoft.graph.group`,
+    /// which needs such a token and lists `groups` for any user, two to a
+    /// page, the next page behind `@odata.nextLink`.
+    pub fn set_graph(&self, groups: &[&str]) {
+        let mut state = self.state.lock().unwrap();
+        state.graph = true;
+        state.graph_groups = groups.iter().map(|group| (*group).to_string()).collect();
+    }
+
+    /// Whether the Graph route answers 500 instead of its groups.
+    pub fn set_graph_failing(&self, failing: bool) {
+        self.state.lock().unwrap().graph_failing = failing;
+    }
+
+    /// The URI (path and query) of every Graph request so far, oldest first.
+    pub fn graph_requests(&self) -> Vec<String> {
+        self.state.lock().unwrap().graph_requests.clone()
     }
 
     /// Whether discovery advertises `end_session_endpoint`.
@@ -310,6 +371,7 @@ async fn token(State(state): State<Shared>, Form(form): Form<HashMap<String, Str
         GRANT_TOKEN_EXCHANGE | GRANT_JWT_BEARER if state.token_exchange => {
             exchange_grant(&mut state, &form)
         }
+        GRANT_CLIENT_CREDENTIALS if state.graph => graph_token_grant(&mut state, &form),
         _ => bad_request("unsupported_grant_type"),
     }
 }
@@ -385,6 +447,89 @@ fn exchange_grant(state: &mut ProviderState, form: &HashMap<String, String>) -> 
         "expires_in": TOKEN_LIFETIME,
     }))
     .into_response()
+}
+
+/// The app's client credentials, in the form body, for the Graph `.default`
+/// scope (the mock serves Graph itself, so that is `{issuer}/.default`).
+fn graph_token_grant(state: &mut ProviderState, form: &HashMap<String, String>) -> Response {
+    let get = |name: &str| form.get(name).map_or("", String::as_str);
+    if get("client_id") != state.client_id || get("client_secret").is_empty() {
+        return bad_request("invalid_client");
+    }
+    if get("scope") != format!("{}/.default", state.issuer) {
+        return bad_request("invalid_scope");
+    }
+    state.issued += 1;
+    let token = format!("graph_at_{}", state.issued);
+    state.graph_tokens.insert(token.clone());
+    Json(json!({
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": TOKEN_LIFETIME,
+    }))
+    .into_response()
+}
+
+/// Graph's `transitiveMemberOf/microsoft.graph.group`: a bearer token from the
+/// `client_credentials` grant, `$select=id,displayName` and `page` (the
+/// `@odata.nextLink` cursor, from 0) are required.
+async fn graph_member_of(
+    State(state): State<Shared>,
+    Path(oid): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    let mut state = state.lock().unwrap();
+    state.graph_requests.push(uri_text(&uri));
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !state.graph || !state.graph_tokens.contains(bearer) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "InvalidAuthenticationToken"})),
+        )
+            .into_response();
+    }
+    if state.graph_failing {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if query.get("$select").map(String::as_str) != Some("id,displayName") {
+        return bad_request("missing $select");
+    }
+    let page: usize = query
+        .get("page")
+        .and_then(|page| page.parse().ok())
+        .unwrap_or(0);
+    let groups: Vec<&String> = state
+        .graph_groups
+        .chunks(GRAPH_PAGE_SIZE)
+        .nth(page)
+        .map(|chunk| chunk.iter().collect())
+        .unwrap_or_default();
+    let value: Vec<Value> = groups
+        .into_iter()
+        .map(|group| {
+            json!({"@odata.type": "#microsoft.graph.group", "id": group, "displayName": group})
+        })
+        .collect();
+    let mut body = json!({"value": value});
+    if (page + 1) * GRAPH_PAGE_SIZE < state.graph_groups.len() {
+        body["@odata.nextLink"] = json!(format!(
+            "{}/v1.0/users/{oid}/transitiveMemberOf/microsoft.graph.group?$select=id,displayName&page={}",
+            state.issuer,
+            page + 1
+        ));
+    }
+    Json(body).into_response()
+}
+
+fn uri_text(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map_or_else(|| uri.path().to_string(), ToString::to_string)
 }
 
 async fn logout(

@@ -469,8 +469,55 @@ admin_groups = ["axon-admins"]
 
 Sessions use the `__Host-axon_session` cookie, which needs HTTPS. They expire
 after 12 h idle or 7 days absolute. For Entra ID, add a "groups" claim in the
-token configuration and emit groups as object IDs; users in more than ~200
-groups get no groups (overage) for now.
+token configuration and emit groups as object IDs. App roles (assign them to
+groups in the enterprise application and use `groups_claim = "roles"`) are the
+recommended way: the claim stays small however many groups a user is in. Users
+in more than ~200 groups get no groups claim from Entra (overage); see
+[Entra groups overage](#entra-groups-overage) for reading them from Microsoft
+Graph, and [SCIM](#scim-provisioning) for having the provider push users and
+groups instead.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `id`, `issuer`, `client_id` | required | provider id (used in URLs), issuer URL, client id |
+| `display_name` | the id | login button label |
+| `client_secret_env` | none (public PKCE client) | env var with the client secret |
+| `scopes` | `openid`, `profile`, `email` | requested scopes |
+| `groups_claim` | `groups` | ID-token claim with the groups, dotted paths allowed |
+| `allowed_email_domains` | none | only these (verified) email domains may log in |
+| `admin_groups` | none | members of these groups are admins |
+| `accept_access_tokens`, `access_token_audience` | `false`, `client_id` | [resource-server mode](#resource-server-mode-idp-access-tokens) |
+| `graph_overage` | `false` | read the groups from Microsoft Graph when Entra omits them; needs `client_secret_env` |
+| `graph_url` | `https://graph.microsoft.com` | Graph base URL, for sovereign clouds; must be `https` (`http` only for localhost) |
+| `scim_match_claim` | `sub` | ID-token claim a SCIM `externalId` is matched against, see [SCIM](#scim-provisioning); must not be empty |
+
+### Entra groups overage
+
+With more than about 200 groups, Entra leaves the groups claim out of the ID
+token and sends a pointer instead (`_claim_names.groups`). By default such a user
+logs in with no groups (the gateway logs a warning). With `graph_overage = true`
+the gateway reads the user's groups from Microsoft Graph at login instead:
+
+```toml
+[[auth.oidc]]
+id = "entra"
+issuer = "https://login.microsoftonline.com/<tenant>/v2.0"
+client_id = "axon"
+client_secret_env = "AXON_OIDC_SECRET"   # required
+graph_overage = true
+# graph_url = "https://graph.microsoft.us"   # sovereign clouds
+```
+
+Give the app registration the Microsoft Graph **application** permission
+`GroupMember.Read.All` and grant admin consent. The gateway gets an app token
+by client credentials (cached until shortly before it expires) and lists the
+user's transitive groups (`/users/{oid}/transitiveMemberOf`, following next-page
+links up to 50 pages, and only links under `graph_url`). The values are group
+object ids, as with the groups claim, so IdP mappings and `admin_groups` use
+object ids. A token with no usable `oid` claim gets no groups. Graph failures
+(no consent, timeout, too many pages) never block the login: they are logged and
+the user gets no groups for that login. Prefer app roles where you can; they
+need no Graph call.
 
 `allowed_email_domains` only trusts a verified address: the ID token must carry
 `email_verified: true`, or for Entra ID the optional `xms_edov` claim (add it
@@ -527,15 +574,85 @@ role = "auditor"
 group = "it"
 ```
 
-Roles are built in. Everyone is a `member` (add personal backends); users the
-provider marks in `admin_groups` are `admin` (everything). Bindings add more:
+Everyone is a `member` (add personal backends); users the provider marks in
+`admin_groups` are `admin` (everything). Bindings add more. Four roles are built
+in and fixed:
 
 | Role            | Allows                                                    |
 | --------------- | --------------------------------------------------------- |
 | `admin`         | everything, including managing groups, grants and roles   |
-| `backend-admin` | view and manage backends, manage the catalog              |
-| `auditor`       | read the audit log, view backends                         |
-| `member`        | add personal backends                                     |
+| `backend-admin` | `backends.view`, `backends.manage`, `catalog.manage`      |
+| `auditor`       | `audit.read`, `backends.view`                             |
+| `member`        | `personal_backends.create`                                |
+
+#### Custom roles
+
+A custom role is a named set of permissions. Declare it in `config.toml`, or
+create it at runtime on `/ui/admin/roles` or through the API; bind it like a
+built-in one, by name:
+
+```toml
+[[rbac.roles]]
+name = "log-reader"                # [a-z0-9][a-z0-9_-]{0,62}, not a built-in name
+description = "Read audit and usage"
+permissions = ["audit.read", "backends.view"]   # at least one
+
+[[rbac.role_bindings]]
+role = "log-reader"
+group = "it"
+```
+
+A role binding in config may name a built-in or a `[[rbac.roles]]` role; an
+unknown name is a startup error. These are the permissions a role may carry:
+
+| Permission | Allows |
+| --- | --- |
+| `gateway.admin` | Gateway settings, reload, break-glass operations |
+| `backends.view` | See shared backends and their status |
+| `backends.manage` | Create, edit and disable shared backends |
+| `catalog.manage` | Publish and edit catalog templates |
+| `personal_backends.create` | Add personal MCP servers |
+| `users.manage` | Disable users, assign roles, see users |
+| `groups.manage` | Groups, IdP mappings, memberships and grants |
+| `roles.manage` | Custom roles |
+| `service_accounts.manage` | Service accounts and their tokens |
+| `tokens.manage_all` | List and revoke any user's tokens |
+| `audit.read` | Audit log and usage views (metadata only) |
+| `audit.read_sensitive` | Read recorded tool arguments |
+
+Roles from `config.toml` are read-only, like other config entries (a write
+answers 409), and so are the built-in ones. A role binding that names a role
+that no longer exists (a deleted custom role) grants nothing.
+
+No one can hand out more than they hold:
+
+- creating or editing a role needs `roles.manage` and every permission the role
+  carries;
+- binding any role (built-in or custom) to a group or user needs `roles.manage`
+  and every permission of that role. Removing a binding needs only
+  `roles.manage`.
+
+An admin holds everything, so the rule only limits delegates: someone with just
+`roles.manage` can only create or bind roles made of `roles.manage`.
+
+| Endpoint | Method | Needs |
+| --- | --- | --- |
+| `/api/v1/admin/roles` | GET | `groups.manage`, `roles.manage` or `audit.read` |
+| `/api/v1/admin/roles` | POST | `roles.manage` and the role's permissions |
+| `/api/v1/admin/roles/{name}` | PUT, DELETE | the same; `DELETE ?force=true` |
+| `/api/v1/admin/permissions` | GET | as the role list |
+
+`GET` lists `{"roles": [{name, description, source, permissions, bindings}]}`
+with `source` `builtin`, `config` or `local` and `bindings` the number of
+bindings that name the role. `POST` takes `{"name", "description",
+"permissions": [...]}` and answers 201; `PUT` replaces `description` (missing or
+null clears it, at most 500 characters) and `permissions` of a `local` role.
+`DELETE` answers 204, or 409 while bindings name the role; with `?force=true` it
+deletes those bindings too. Errors: 400 for a bad name or an unknown or empty
+permission list, 403 without `roles.manage` or for a permission the caller does
+not hold, 404 for an unknown role, 409 for a built-in, config or existing name.
+`GET /api/v1/admin/permissions` answers `{"permissions": [{name, description}]}`.
+Every change is audited.
 
 Besides `config.toml`, admins manage the same things at runtime (the API below
 and the dashboard's admin pages). Those entries live in the database and are listed
@@ -554,13 +671,13 @@ are `{"error": "..."}` with 400 (invalid input, bad JSON), 403, 404, 409 or 503
 | Endpoint                                      | Method        | Needs                       |
 | --------------------------------------------- | ------------- | --------------------------- |
 | `/api/v1/me`                                  | GET           | a session                   |
-| `/api/v1/groups`                              | GET, POST     | reads `groups.manage` or `audit.read`; writes `groups.manage` |
+| `/api/v1/groups`                              | GET, POST     | reads `groups.manage`, `roles.manage` or `audit.read`; writes `groups.manage` |
 | `/api/v1/groups/{name}`                       | GET, PATCH, DELETE | reads as above; writes `groups.manage` |
 | `/api/v1/groups/{name}/idp-mappings`          | POST, DELETE  | `groups.manage`             |
 | `/api/v1/groups/{name}/members/{user_id}`     | PUT, DELETE   | `groups.manage`             |
-| `/api/v1/grants`                              | GET, POST     | reads `groups.manage` or `audit.read`; writes `groups.manage` |
+| `/api/v1/grants`                              | GET, POST     | reads `groups.manage`, `roles.manage` or `audit.read`; writes `groups.manage` |
 | `/api/v1/grants/{id}`                         | DELETE        | `groups.manage`             |
-| `/api/v1/role-bindings`                       | GET, POST     | reads `groups.manage` or `audit.read`; writes `roles.manage` |
+| `/api/v1/role-bindings`                       | GET, POST     | reads `groups.manage`, `roles.manage` or `audit.read`; writes `roles.manage` and the role's permissions |
 | `/api/v1/role-bindings/{id}`                  | DELETE        | `roles.manage`              |
 | `/api/v1/users?limit=`                        | GET           | `users.manage` or `groups.manage` (default 100, max 500) |
 | `/api/v1/audit?limit=&before=`                | GET           | `audit.read` (default 50, max 200; `before` is an entry id) |
@@ -695,6 +812,94 @@ Creating the link (`break_glass.link_created`) and using it
 (`break_glass.login`) are audited. To switch break-glass off, disable that user
 on `/ui/admin/users`. `--config` defaults to `AXON_GATEWAY_CONFIG`, then
 `config.toml`.
+
+### SCIM provisioning
+
+An identity provider that speaks SCIM 2.0 (Entra ID, Okta, ...) can push its
+users and groups to the gateway, so groups follow the directory without waiting
+for a login, and a user removed there loses access at once. It needs multi-user
+mode, and the provider must be one of the `[[auth.oidc]]` entries. The base URL
+for a provider is
+
+```text
+<base_url>/scim/v2/<provider id>
+```
+
+**Token.** Every SCIM request carries a bearer token that belongs to one
+provider. An admin with `users.manage` and `groups.manage` creates it on
+`/ui/admin/scim` or with `POST /api/v1/admin/scim/{provider}/token` (session and
+CSRF token like the rest of `/api/v1`; answers 201 with `{"token", "base_url"}`).
+The token (`axon_scim_...`) is shown once and only its hash is stored. Creating
+one again rotates it: the old token stops working. `DELETE` on the same path
+removes it, and `GET /api/v1/admin/scim` lists the providers with the token's
+age, last use and counts of SCIM users and groups. A request without a valid
+token answers 401; an unknown provider or no multi-user mode answers 404.
+Requests are limited to 600 a minute per provider (429), bodies to 1 MiB, and
+every answer is `application/scim+json`.
+
+**What it serves.**
+
+| Resource | Operations |
+| --- | --- |
+| `/Users` | `GET` (list, `startIndex`, `count`), `POST` |
+| `/Users/{id}` | `GET`, `PUT`, `PATCH`, `DELETE` |
+| `/Groups` | `GET` (list), `POST` |
+| `/Groups/{id}` | `GET`, `PUT`, `PATCH`, `DELETE` |
+| `/ServiceProviderConfig`, `/ResourceTypes`, `/Schemas` | `GET` |
+
+`filter` supports one `attribute eq "value"` and nothing else (any other filter
+is a 400 `invalidFilter`): `userName`, `externalId` and `id` on users,
+`displayName`, `externalId` and `id` on groups. A list returns at most 200
+resources (100 by default). Sorting, bulk, ETags and password changes are not
+supported. PATCH accepts the shapes Entra and Okta send (operation names and
+attributes are case-insensitive, `"False"` counts as false, an operation
+without a path carries an object); attributes the gateway has no use for, such
+as the enterprise extension, are accepted and dropped. A `userName` or group
+`displayName` that exists answers 409 `uniqueness`.
+
+**Linking a SCIM user to a login.** A SCIM user stands for the person who logs
+in with the same identity. The gateway links them, when SCIM creates or updates
+the user and again at the person's login, by
+
+1. the `externalId`, matched against the ID-token claim named by the provider's
+   `scim_match_claim` (default `sub`); else
+2. the `userName`, matched against the login's email, case-insensitively.
+
+A match that is not unique links nobody, and a login links to at most one SCIM
+user. A SCIM user with no login yet is kept and linked when that person first
+logs in. Because the claim is only known from an ID token, a provider whose
+`scim_match_claim` is not `sub` links by email when SCIM pushes the user and by
+the claim at the next login.
+
+**Groups.** For a linked user, the groups SCIM gives replace the groups of the
+ID token at every login (and are updated the moment SCIM changes a membership).
+Both the group's `externalId` and its `displayName` count as claim values, so
+an IdP mapping (`[[rbac.groups]]` `idp = [{ provider, value }]`) may name either,
+and `admin_groups` too. Deleting a group removes what it gave its members. A
+user that SCIM does not know keeps the groups from the ID token.
+
+**Disabling.** `active = false`, or `DELETE` on the user, disables the linked
+login the way an admin does: its sessions end and its tokens stop working. The
+user goes back to groups from the ID token after a `DELETE`. SCIM re-enables a
+user only when it was the one that disabled it; a user an admin disabled stays
+disabled when SCIM says `active = true`. SCIM changes are audited as
+`scim:<provider>`.
+
+**Entra ID.** Create the token for the provider, then in the enterprise
+application's Provisioning set the mode to Automatic with the **Tenant URL** the
+base URL above and the **Secret token** the SCIM token, and test the connection.
+Entra's `objectId` is the `oid` claim, not `sub`, so set `scim_match_claim =
+"oid"` and, in the provisioning attribute mappings for users, map `externalId`
+to `objectId`. Entra sends a group's object id as its `externalId`, so IdP mappings by group object id keep working.
+
+```toml
+[[auth.oidc]]
+id = "entra"
+issuer = "https://login.microsoftonline.com/<tenant>/v2.0"
+client_id = "axon"
+client_secret_env = "AXON_OIDC_SECRET"
+scim_match_claim = "oid"
+```
 
 ### Resource-server mode (IdP access tokens)
 

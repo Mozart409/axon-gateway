@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::FromRow;
+use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
 use super::rbac::{Actor, audit};
@@ -158,9 +158,52 @@ pub(super) fn random_secret() -> Result<String, StoreError> {
     Ok(hex::encode(raw))
 }
 
+/// [`Store::set_user_disabled`] inside the caller's transaction, which must be
+/// committed for the change to count (SCIM does this together with its own rows).
+pub(super) async fn set_user_disabled_in(
+    conn: &mut PgConnection,
+    actor: &Actor,
+    id: Uuid,
+    disabled: bool,
+) -> Result<bool, StoreError> {
+    let name: Option<String> = sqlx::query_scalar(
+        "update users set disabled_at = case when $2 then now() else null end \
+         where id = $1 and kind = 'user' and (disabled_at is not null) <> $2 \
+         returning coalesce(nullif(btrim(email), ''), subject)",
+    )
+    .bind(id)
+    .bind(disabled)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(name) = name else {
+        return Ok(false);
+    };
+    if disabled {
+        sqlx::query("delete from sessions where user_id = $1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    audit(
+        conn,
+        actor,
+        if disabled {
+            "user.disable"
+        } else {
+            "user.enable"
+        },
+        &format!("user:{name}"),
+        json!({ "user_id": id }),
+    )
+    .await?;
+    Ok(true)
+}
+
 impl Store {
     /// Creates the user or updates the existing one by `(issuer, subject)`,
     /// refreshing email, display name, groups and admin flag from the token.
+    /// The groups of a user whose groups come from SCIM (`groups_source`) are
+    /// left as they are.
     ///
     /// # Errors
     /// Fails when the query fails.
@@ -171,7 +214,8 @@ impl Store {
              on conflict (issuer, subject) do update set \
                  email = excluded.email, \
                  display_name = excluded.display_name, \
-                 groups = excluded.groups, \
+                 groups = case when users.groups_source = 'scim' \
+                               then users.groups else excluded.groups end, \
                  is_admin = excluded.is_admin, \
                  last_login_at = now() \
              returning id, issuer, subject, email, display_name, groups, is_admin",
@@ -246,36 +290,9 @@ impl Store {
         disabled: bool,
     ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let name: Option<String> = sqlx::query_scalar(
-            "update users set disabled_at = case when $2 then now() else null end \
-             where id = $1 and kind = 'user' and (disabled_at is not null) <> $2 \
-             returning coalesce(nullif(btrim(email), ''), subject)",
-        )
-        .bind(id)
-        .bind(disabled)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(name) = name else {
+        if !set_user_disabled_in(&mut tx, actor, id, disabled).await? {
             return Ok(false);
-        };
-        if disabled {
-            sqlx::query("delete from sessions where user_id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
         }
-        audit(
-            &mut tx,
-            actor,
-            if disabled {
-                "user.disable"
-            } else {
-                "user.enable"
-            },
-            &format!("user:{name}"),
-            json!({ "user_id": id }),
-        )
-        .await?;
         tx.commit().await?;
         Ok(true)
     }

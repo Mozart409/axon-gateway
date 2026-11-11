@@ -1,5 +1,5 @@
 //! The admin pages under `/ui/admin` and their htmx actions under
-//! `/ui/actions/admin`: RBAC groups, grants, role bindings, users and the
+//! `/ui/actions/admin`: RBAC groups, grants, roles, role bindings, users and the
 //! audit log.
 //! (The service account pages are in `tokens_ui`, which reuses the helpers
 //! here.)
@@ -24,11 +24,11 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use super::admin_views::{
-    self, Access, AdminOverview, GroupDetail, GroupRow, UsersPage, render_flash_area,
+    self, Access, AdminOverview, GroupDetail, GroupRow, RolesPage, UsersPage, render_flash_area,
 };
 use super::{AppState, FlashLevel, FlashMessage, views};
 use crate::gateway::GetDetailedStatus;
-use crate::policy::{AUTHENTICATED_GROUP, GrantConfig, Role, RoleSubject};
+use crate::policy::{AUTHENTICATED_GROUP, GrantConfig, RoleSubject};
 use crate::rbac::{Admin, AdminError, resolve};
 use crate::store::{ServiceAccount, SessionUser, User};
 
@@ -46,6 +46,7 @@ pub(super) fn page_routes() -> Router<AppState> {
         .route("/ui/admin/groups/{name}", get(handle_admin_group))
         .route("/ui/admin/audit", get(handle_admin_audit))
         .route("/ui/admin/users", get(handle_admin_users))
+        .route("/ui/admin/roles", get(handle_admin_roles))
 }
 
 /// The POST actions, to merge into the routes behind the CSRF and same-site
@@ -81,6 +82,15 @@ pub(super) fn action_routes() -> Router<AppState> {
         .route(
             "/ui/actions/admin/grants/{id}/delete",
             post(handle_admin_grant_delete),
+        )
+        .route("/ui/actions/admin/roles", post(handle_admin_role_create))
+        .route(
+            "/ui/actions/admin/roles/{name}/update",
+            post(handle_admin_role_update),
+        )
+        .route(
+            "/ui/actions/admin/roles/{name}/delete",
+            post(handle_admin_role_delete),
         )
         .route(
             "/ui/actions/admin/role-bindings",
@@ -270,6 +280,7 @@ async fn load_overview(
         groups: rows,
         grants: admin.grants()?,
         bindings: admin.role_bindings()?,
+        roles: admin.roles()?.into_iter().map(|entry| entry.role).collect(),
         group_names,
         backends: backend_names(state).await,
         users: load_users(admin).await?,
@@ -376,6 +387,42 @@ async fn load_users_page(
         viewer: session.user.id,
         users: admin.managed_users(USERS_LIMIT).await?,
     })
+}
+
+fn load_roles_page(
+    state: &AppState,
+    session: &SessionUser,
+    admin: &Admin<'_>,
+) -> Result<RolesPage, AdminError> {
+    Ok(RolesPage {
+        access: access_of(state, session),
+        roles: admin.roles()?,
+    })
+}
+
+/// The answer to an action on `/ui/admin/roles`: the re-rendered roles section, or
+/// the error.
+fn roles_fragment(state: &AppState, session: &SessionUser, admin: &Admin<'_>) -> Response {
+    match load_roles_page(state, session, admin) {
+        Ok(page) => fragment(&admin_views::render_roles_section(&page)),
+        Err(error) => error_response(&error),
+    }
+}
+
+/// Handle GET /ui/admin/roles - built-in, config and database roles
+pub(super) async fn handle_admin_roles(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+) -> Response {
+    let (session, admin) = match admin_for(&state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    match load_roles_page(&state, &session, &admin) {
+        Ok(page) => Html(admin_views::render_roles_page(&state, &session, &page).into_string())
+            .into_response(),
+        Err(error) => page_error(&state, &session, &error),
+    }
 }
 
 /// Handle GET /ui/admin/users - the human users and their state
@@ -752,12 +799,6 @@ pub(super) async fn handle_admin_binding_create(
         Ok(pair) => pair,
         Err(response) => return *response,
     };
-    let Some(role) = Role::parse(&form.role) else {
-        return error_response(&AdminError::Invalid(format!(
-            "unknown role {:?}",
-            form.role
-        )));
-    };
     let group = form.group.filter(|group| !group.is_empty());
     let user_id = form.user_id.filter(|user_id| !user_id.is_empty());
     let subject = match (group, user_id) {
@@ -772,7 +813,7 @@ pub(super) async fn handle_admin_binding_create(
             )));
         }
     };
-    if let Err(error) = admin.create_role_binding(role, subject).await {
+    if let Err(error) = admin.create_role_binding(&form.role, subject).await {
         return error_response(&error);
     }
     overview_fragment(&state, &session, &admin, |overview| {
@@ -798,4 +839,92 @@ pub(super) async fn handle_admin_binding_delete(
         admin_views::render_bindings_section(overview, false)
     })
     .await
+}
+
+/// The role forms: the permission checkboxes repeat one field, which a struct cannot
+/// take, so the body is read as `(field, value)` pairs.
+#[derive(Debug, Default)]
+struct RoleForm {
+    name: String,
+    description: Option<String>,
+    permissions: Vec<String>,
+    /// The checkbox of the delete form: also delete the role's bindings
+    force: bool,
+}
+
+impl RoleForm {
+    fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        let mut form = Self::default();
+        for (field, value) in pairs {
+            match field.as_str() {
+                "name" => value.trim().clone_into(&mut form.name),
+                "description" => form.description = Some(value),
+                "permissions" => form.permissions.push(value),
+                "force" => form.force = true,
+                _ => {}
+            }
+        }
+        form
+    }
+}
+
+/// Handle POST /ui/actions/admin/roles - create a role
+pub(super) async fn handle_admin_role_create(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+    AdminForm(pairs): AdminForm<Vec<(String, String)>>,
+) -> Response {
+    let (session, admin) = match admin_for(&state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let form = RoleForm::from_pairs(pairs);
+    if let Err(error) = admin
+        .create_role(&form.name, form.description.as_deref(), &form.permissions)
+        .await
+    {
+        return error_response(&error);
+    }
+    roles_fragment(&state, &session, &admin)
+}
+
+/// Handle POST /ui/actions/admin/roles/{name}/update - replace the description and
+/// permissions
+pub(super) async fn handle_admin_role_update(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+    Path(name): Path<String>,
+    AdminForm(pairs): AdminForm<Vec<(String, String)>>,
+) -> Response {
+    let (session, admin) = match admin_for(&state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let form = RoleForm::from_pairs(pairs);
+    if let Err(error) = admin
+        .update_role(&name, form.description.as_deref(), &form.permissions)
+        .await
+    {
+        return error_response(&error);
+    }
+    roles_fragment(&state, &session, &admin)
+}
+
+/// Handle POST /ui/actions/admin/roles/{name}/delete - delete a role, and its
+/// bindings when the form says so
+pub(super) async fn handle_admin_role_delete(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+    Path(name): Path<String>,
+    AdminForm(pairs): AdminForm<Vec<(String, String)>>,
+) -> Response {
+    let (session, admin) = match admin_for(&state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let form = RoleForm::from_pairs(pairs);
+    if let Err(error) = admin.delete_role(&name, form.force).await {
+        return error_response(&error);
+    }
+    roles_fragment(&state, &session, &admin)
 }

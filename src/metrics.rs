@@ -352,11 +352,14 @@ pub fn record_oidc_request(provider: &str, op: &str, ok: bool, duration_secs: f6
         "op" => op.to_string()
     )
     .record(duration_secs);
-    gauge!("axon_oidc_provider_up", "provider" => provider.to_string()).set(if ok {
-        1.0
-    } else {
-        0.0
-    });
+    // Graph is a separate service: its failures say nothing about the provider
+    if !op.starts_with("graph_") {
+        gauge!("axon_oidc_provider_up", "provider" => provider.to_string()).set(if ok {
+            1.0
+        } else {
+            0.0
+        });
+    }
 }
 
 /// Describe the user, authentication, sampler and OIDC metrics, so they show up
