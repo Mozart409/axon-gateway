@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
+    # Pin the resolver if backends are reached by hostname: the container
+    # keeps the host's DNS settings from when it started (README, DNS note).
+    # dns:
+    #   - 192.168.1.1
     environment:
       RUST_LOG: info
       # AXON_LOG_JSON: 1

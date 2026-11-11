@@ -107,6 +107,18 @@ argument (both example files already do this).
 > (`apk add --no-cache wget`) specifically to make that check pass. Drop that
 > line only if you also remove the `healthcheck:` blocks from the Compose files.
 
+> **DNS note:** the container's `/etc/resolv.conf` is fixed when it starts:
+> Podman and Docker copy the host's resolver settings at that moment. If a
+> backend is reached by hostname and the host's DNS setup changes later (a VPN
+> client such as Tailscale added or removed, a new DHCP lease), the container
+> keeps the old nameservers, and lookups fail with `Temporary failure in name
+> resolution`. The gateway keeps reconnecting with backoff, so the backend
+> comes back on its own as soon as resolution works again. To keep it working,
+> pin the container to a resolver that does not move: `dns:` in Compose (see
+> the commented line in the example files), or `--dns=<ip>`. With host
+> networking and a caching resolver on the host, that is `--dns=127.0.0.1`.
+> Without a pin, restart the container after changing the host's DNS.
+
 ## API Endpoints
 
 | Endpoint                                | Method | Description                                         |
