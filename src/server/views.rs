@@ -396,14 +396,17 @@ pub(super) fn render_ui_page(
                         p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
                             "Server-rendered dashboard with SSE updates and HTMX actions."
                         }
-                        div class="mt-4 flex flex-wrap gap-3" {
-                            button
-                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
-                                hx-post="/ui/actions/reload"
-                                hx-target="#flash"
-                                hx-swap="innerHTML"
-                            {
-                                "Reload Config"
+                        // Database mode has no config file to reload
+                        @if state.config_path.is_some() {
+                            div class="mt-4 flex flex-wrap gap-3" {
+                                button
+                                    class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                                    hx-post="/ui/actions/reload"
+                                    hx-target="#flash"
+                                    hx-swap="innerHTML"
+                                {
+                                    "Reload Config"
+                                }
                             }
                         }
                     }

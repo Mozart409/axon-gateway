@@ -557,17 +557,7 @@ async fn a_service_account_token_follows_its_groups_and_its_state() {
         assert_eq!(status, expected, "{name}");
     }
 
-    // Config groups take no members (they come from IdP mappings only), so
-    // the account joins a group of the database.
-    let (status, _) = h
-        .send(
-            Method::PUT,
-            &format!("/api/v1/groups/it/members/{id}"),
-            &admin,
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    // The account joins a group of its own, with one grant.
     let (status, _) = h
         .send(
             Method::POST,

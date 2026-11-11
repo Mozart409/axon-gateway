@@ -66,7 +66,7 @@ pub struct Config {
 
 /// `[personal_backends]` section: limits for per-user catalog credentials and
 /// the backends people add themselves. Not hot-reloadable: changes need a restart.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PersonalBackendsConfig {
     /// Let people add personal backends and store catalog credentials
     #[serde(default = "default_personal_enabled")]
@@ -123,7 +123,7 @@ pub struct AuthConfig {
 }
 
 /// A generic OIDC provider (Entra, Pocket ID, Keycloak, ...)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OidcProviderConfig {
     /// Stable id used in URLs and stored with each session: `[a-z0-9-]+`
     pub id: String,
@@ -133,9 +133,14 @@ pub struct OidcProviderConfig {
     /// Issuer URL; discovery is `{issuer}/.well-known/openid-configuration`
     pub issuer: String,
     pub client_id: String,
-    /// Env var holding the client secret; unset for a public (PKCE-only) client
+    /// Env var holding the client secret; unset for a public (PKCE-only) client.
+    /// Only read from a config file, where it is resolved into `client_secret`.
     #[serde(default)]
     pub client_secret_env: Option<String>,
+    /// The client secret: read from `client_secret_env` when a config file
+    /// loads, unsealed from the database otherwise. Runtime code reads only this.
+    #[serde(skip)]
+    pub client_secret: Option<String>,
     #[serde(default = "default_oidc_scopes")]
     pub scopes: Vec<String>,
     /// ID-token claim with the user's groups; a dotted path reaches into
@@ -171,6 +176,57 @@ pub struct OidcProviderConfig {
     /// `externalId` is matched against; defaults to `sub`
     #[serde(default)]
     pub scim_match_claim: Option<String>,
+}
+
+impl std::fmt::Debug for OidcProviderConfig {
+    // By hand, so the client secret can never end up in a log line.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OidcProviderConfig")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret_env", &self.client_secret_env)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scopes", &self.scopes)
+            .field("groups_claim", &self.groups_claim)
+            .field("allowed_email_domains", &self.allowed_email_domains)
+            .field("admin_groups", &self.admin_groups)
+            .field("accept_access_tokens", &self.accept_access_tokens)
+            .field("access_token_audience", &self.access_token_audience)
+            .field("graph_overage", &self.graph_overage)
+            .field("graph_url", &self.graph_url)
+            .field("scim_match_claim", &self.scim_match_claim)
+            .finish()
+    }
+}
+
+impl Default for OidcProviderConfig {
+    /// An empty id, issuer and client id (to fill in), with the defaults a file
+    /// would give every other key
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            display_name: None,
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret_env: None,
+            client_secret: None,
+            scopes: default_oidc_scopes(),
+            groups_claim: default_groups_claim(),
+            allowed_email_domains: Vec::new(),
+            admin_groups: Vec::new(),
+            accept_access_tokens: false,
+            access_token_audience: None,
+            graph_overage: false,
+            graph_url: None,
+            scim_match_claim: None,
+        }
+    }
 }
 
 impl OidcProviderConfig {
@@ -216,7 +272,7 @@ fn default_groups_claim() -> String {
 ///
 /// Expose subsets of tools via different endpoints, e.g. `/mcp/toolset/coding`
 /// only exposes tools matching the configured patterns.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ToolsetConfig {
     /// Toolset name used as path suffix: `/mcp/toolset/{name}`
     pub name: String,
@@ -258,6 +314,34 @@ pub struct GatewayConfig {
 /// Default value for `[gateway] idle_timeout_secs`
 const fn default_idle_timeout_secs() -> u64 {
     300
+}
+
+/// The settings of the gateway that live in the database (`gateway_settings`):
+/// the part of `[gateway]` and `[personal_backends]` that is not environment-only
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GatewaySettings {
+    /// Rate limit: max requests per minute per token (0 = unlimited)
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
+    /// Extra `Host` names the MCP endpoints accept, see [`GatewayConfig::allowed_hosts`]
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Seconds without a call before an HTTP/SSE backend connection is closed
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[serde(default)]
+    pub personal_backends: PersonalBackendsConfig,
+}
+
+impl Default for GatewaySettings {
+    fn default() -> Self {
+        Self {
+            rate_limit_per_minute: 0,
+            allowed_hosts: Vec::new(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+            personal_backends: PersonalBackendsConfig::default(),
+        }
+    }
 }
 
 /// `Host` values the MCP endpoints accept: loopback, the host (and `host:port`)
@@ -311,7 +395,7 @@ pub struct TokenConfig {
     pub metadata: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BackendConfig {
     /// Unique name, used as namespace prefix for tools
     pub name: String,
@@ -407,7 +491,7 @@ pub enum CredentialMode {
 }
 
 /// `[backends.oauth]`: the static OAuth client of an `oauth` backend
-#[derive(Clone, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct UpstreamOAuthConfig {
     pub client_id: String,
     /// Env var holding the client secret; unset for a public client
@@ -561,7 +645,7 @@ impl Default for BackendConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportType {
     Sse,
@@ -570,17 +654,70 @@ pub enum TransportType {
 }
 
 impl Config {
+    /// Loads a config file for standalone mode. A file with a `[database]`,
+    /// `[[auth.oidc]]` or `[rbac]` section or a per-user backend needs database
+    /// mode and is refused.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
+        Self::load_file(path.as_ref(), true)
+    }
+
+    /// Loads a config file for `admin import-config`: everything a file can
+    /// hold is accepted, and the checks that a database is configured are
+    /// skipped (the import writes into the database). The file's
+    /// `allow_stdio` is not checked either: stdio is `AXON_ALLOW_STDIO` now.
+    pub fn load_for_import(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::load_file(path.as_ref(), false)
+    }
+
+    fn load_file(path: &Path, standalone: bool) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&content)?;
         config.migrate_deprecated_groups();
+        if standalone {
+            config.refuse_database_sections()?;
+        }
 
         let env_vars = load_env_vars(path)?;
         config.resolve_env_vars(&env_vars)?;
 
-        config.validate()?;
+        config.validate_with(standalone)?;
         Ok(config)
+    }
+
+    /// The first part of the file that needs database mode, if any
+    fn refuse_database_sections(&self) -> Result<(), ConfigError> {
+        let rbac = &self.rbac;
+        let what = if self.database.is_some() {
+            Some("[database]".to_string())
+        } else if !self.auth.oidc.is_empty() {
+            Some("[[auth.oidc]]".to_string())
+        } else if !(rbac.groups.is_empty()
+            && rbac.grants.is_empty()
+            && rbac.role_bindings.is_empty()
+            && rbac.roles.is_empty())
+        {
+            Some("[rbac]".to_string())
+        } else {
+            self.backends
+                .iter()
+                .find(|backend| backend.is_per_user())
+                .map(|backend| format!("backend '{}' (credential_mode)", backend.name))
+        };
+        match what {
+            Some(what) => Err(ConfigError::NeedsDatabaseMode { what }),
+            None => Ok(()),
+        }
+    }
+
+    /// The part of this config that lives in the database settings row
+    #[must_use]
+    pub fn settings(&self) -> GatewaySettings {
+        GatewaySettings {
+            rate_limit_per_minute: self.gateway.rate_limit_per_minute,
+            allowed_hosts: self.gateway.allowed_hosts.clone(),
+            idle_timeout_secs: self.gateway.idle_timeout_secs,
+            personal_backends: self.personal_backends.clone(),
+        }
     }
 
     /// [`Config::load`] for async contexts: the file and `.env` reads are
@@ -601,6 +738,7 @@ impl Config {
         self.toolsets.append(&mut self.groups);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolve_env_vars(&mut self, env_vars: &HashMap<String, String>) -> Result<(), ConfigError> {
         self.gateway.bind = resolve_placeholders(&self.gateway.bind, "gateway.bind", env_vars)?;
         self.gateway.base_url =
@@ -684,6 +822,18 @@ impl Config {
             }
         }
 
+        for provider in &mut self.auth.oidc {
+            if let Some(var) = &provider.client_secret_env {
+                let Some(secret) = env_vars.get(var).filter(|secret| !secret.is_empty()) else {
+                    return Err(ConfigError::InvalidOidcProvider {
+                        id: provider.id.clone(),
+                        reason: format!("client_secret_env names {var}, which is unset or empty"),
+                    });
+                };
+                provider.client_secret = Some(secret.clone());
+            }
+        }
+
         for (index, toolset) in self.toolsets.iter_mut().enumerate() {
             toolset.name =
                 resolve_placeholders(&toolset.name, &format!("toolsets[{index}].name"), env_vars)?;
@@ -707,7 +857,14 @@ impl Config {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Checks the whole config, a database being configured (database mode)
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(true)
+    }
+
+    /// [`Config::validate`]; `require_database` false skips the checks that
+    /// per-user backends and OIDC providers have a `[database]` to live in
+    fn validate_with(&self, require_database: bool) -> Result<(), ConfigError> {
         for backend in &self.backends {
             // Reject bad custom headers here instead of silently dropping them
             // when the backend connects.
@@ -744,9 +901,10 @@ impl Config {
             }
         }
 
-        self.validate_per_user_backends()?;
+        self.validate_per_user_backends(require_database)?;
 
-        if !self.gateway.allow_stdio {
+        // An import (`require_database` false) leaves stdio to AXON_ALLOW_STDIO
+        if require_database && !self.gateway.allow_stdio {
             let stdio: Vec<&str> = self
                 .backends
                 .iter()
@@ -769,7 +927,7 @@ impl Config {
             }
         }
 
-        self.validate_auth()?;
+        self.validate_auth(require_database)?;
         self.validate_rbac()
     }
 
@@ -777,7 +935,7 @@ impl Config {
     /// database to store the connections in, and the settings of their mode.
     /// `per_user` is HTTP/SSE with well-formed credential fields; the others
     /// are HTTP only.
-    fn validate_per_user_backends(&self) -> Result<(), ConfigError> {
+    fn validate_per_user_backends(&self, require_database: bool) -> Result<(), ConfigError> {
         for backend in &self.backends {
             let name = &backend.name;
             let invalid = |reason: String| ConfigError::InvalidPerUserBackend {
@@ -858,7 +1016,7 @@ impl Config {
                 }
                 CredentialMode::Shared => {}
             }
-            if self.database.is_none() {
+            if require_database && self.database.is_none() {
                 return Err(ConfigError::PerUserRequiresDatabase { name: name.clone() });
             }
         }
@@ -923,7 +1081,7 @@ impl Config {
             if passthrough.scope.is_none() {
                 return Err("the entra_obo grant needs passthrough.scope".into());
             }
-            if provider.client_secret_env.is_none() {
+            if provider.client_secret.is_none() {
                 return Err(format!(
                     "the entra_obo grant needs a client secret: set client_secret_env on provider '{}'",
                     provider.id
@@ -941,11 +1099,11 @@ impl Config {
             .map_err(ConfigError::InvalidRbac)
     }
 
-    fn validate_auth(&self) -> Result<(), ConfigError> {
+    fn validate_auth(&self, require_database: bool) -> Result<(), ConfigError> {
         if self.auth.oidc.is_empty() {
             return Ok(());
         }
-        if self.database.is_none() {
+        if require_database && self.database.is_none() {
             return Err(ConfigError::OidcRequiresDatabase);
         }
 
@@ -985,7 +1143,7 @@ impl Config {
             if provider.access_token_audience.as_deref() == Some("") {
                 return Err(invalid("access_token_audience must not be empty"));
             }
-            if provider.graph_overage && provider.client_secret_env.is_none() {
+            if provider.graph_overage && provider.client_secret.is_none() {
                 return Err(invalid(
                     "graph_overage needs a client secret: set client_secret_env",
                 ));
@@ -1676,7 +1834,7 @@ name = "old"
             std::fs::write(&path, toml).unwrap();
 
             let config = Config::load(&path).expect("should load");
-            assert!(config.groups.is_empty());
+            assert!(config.groups.is_empty(), "{:?}", config.groups);
             let names: Vec<_> = config.toolsets.iter().map(|t| t.name.as_str()).collect();
             assert_eq!(names, ["new", "old"]);
         }
@@ -1697,6 +1855,105 @@ name = "same"
             let error = config.validate().expect_err("duplicate must fail");
             assert!(
                 matches!(&error, ConfigError::DuplicateToolset { name } if name == "same"),
+                "{error:?}"
+            );
+        }
+    }
+
+    mod standalone_load {
+        use super::*;
+
+        const BASE: &str = r#"
+            [gateway]
+            bind = "127.0.0.1:0"
+
+            [[backends]]
+            name = "b"
+            transport = "http"
+            url = "http://localhost:9000"
+        "#;
+
+        fn write(dir: &tempfile::TempDir, extra: &str) -> std::path::PathBuf {
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, format!("{BASE}\n{extra}")).unwrap();
+            path
+        }
+
+        const PROVIDER: &str =
+            "[[auth.oidc]]\nid = \"a\"\nissuer = \"https://idp.example.com\"\nclient_id = \"c\"\n";
+        const GROUP: &str =
+            "[[rbac.groups]]\nname = \"ops\"\nidp = [{ provider = \"a\", value = \"x\" }]\n";
+        const GRANT: &str = "[[rbac.grants]]\ngroup = \"ops\"\nbackend = \"b\"\n";
+        const PER_USER: &str = "[[backends]]\nname = \"u\"\ntransport = \"http\"\nurl = \"http://localhost:9001\"\ncredential_mode = \"per_user\"\ncredential_fields = [{ name = \"t\", header = \"Authorization\" }]\n";
+
+        /// Sections a standalone gateway refuses, with the text that names each
+        const DATABASE_SECTIONS: [(&str, &str); 5] = [
+            ("[database]\n", "[database]"),
+            (PROVIDER, "[[auth.oidc]]"),
+            (GROUP, "[rbac]"),
+            (GRANT, "[rbac]"),
+            (PER_USER, "credential_mode"),
+        ];
+
+        #[test]
+        fn a_plain_file_loads() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config::load(write(&dir, "")).expect("should load");
+            assert!(config.database.is_none());
+        }
+
+        #[test]
+        fn database_sections_are_refused_with_the_import_hint() {
+            let dir = tempfile::tempdir().unwrap();
+            for (extra, what) in DATABASE_SECTIONS {
+                let error = Config::load(write(&dir, extra)).expect_err(extra);
+                assert!(
+                    matches!(&error, ConfigError::NeedsDatabaseMode { .. }),
+                    "{extra}: {error:?}"
+                );
+                let message = error.to_string();
+                assert!(message.contains(what), "{message}");
+                assert!(message.contains("admin import-config"), "{message}");
+                assert!(message.contains("AXON_DATABASE_URL"), "{message}");
+            }
+        }
+
+        #[test]
+        fn import_accepts_the_database_sections() {
+            let dir = tempfile::tempdir().unwrap();
+            let all = format!("[database]\n{PROVIDER}{GROUP}{GRANT}{PER_USER}");
+            let config = Config::load_for_import(write(&dir, &all)).expect("should load");
+            assert!(config.database.is_some());
+            assert_eq!(config.auth.oidc.len(), 1);
+            assert_eq!(config.backends.len(), 2);
+
+            // without a [database] section too: the import writes into one
+            let no_database = format!("{PROVIDER}{GROUP}{GRANT}{PER_USER}");
+            Config::load_for_import(write(&dir, &no_database)).expect("should load");
+        }
+
+        #[test]
+        fn import_resolves_the_client_secret_env() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "{BASE}\n[[auth.oidc]]\nid = \"a\"\nissuer = \"https://idp.example.com\"\nclient_id = \"c\"\nclient_secret_env = \"AXON_TEST_OIDC_SECRET\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(".env"), "AXON_TEST_OIDC_SECRET=s3cret\n").unwrap();
+
+            let config = Config::load_for_import(&path).expect("should load");
+            assert_eq!(config.auth.oidc[0].client_secret.as_deref(), Some("s3cret"));
+            let debug = format!("{:?}", config.auth.oidc[0]);
+            assert!(!debug.contains("s3cret"), "{debug}");
+
+            std::fs::write(dir.path().join(".env"), "").unwrap();
+            let error = Config::load_for_import(&path).expect_err("variable unset");
+            assert!(
+                matches!(&error, ConfigError::InvalidOidcProvider { id, .. } if id == "a"),
                 "{error:?}"
             );
         }
@@ -1760,7 +2017,7 @@ name = "same"
         #[test]
         fn absent_auth_is_empty() {
             let config = parse("");
-            assert!(config.auth.oidc.is_empty());
+            assert!(config.auth.oidc.is_empty(), "{:?}", config.auth.oidc);
             config.validate().expect("no providers is valid");
         }
 
@@ -1918,7 +2175,9 @@ name = "same"
                 "{}client_secret_env = \"S\"\ngraph_overage = true\ngraph_url = \"https://graph.microsoft.us/\"\nscim_match_claim = \"oid\"\n",
                 provider("a", "https://idp.example.com")
             );
-            let config = with_db(&extra);
+            let mut config = with_db(&extra);
+            // a file load reads the secret from the variable
+            config.auth.oidc[0].client_secret = Some("s3cret".to_string());
             config.validate().expect("valid");
             let [one] = config.auth.oidc.as_slice() else {
                 panic!("one provider");
@@ -2290,10 +2549,16 @@ name = "same"
         }
 
         fn passthrough(table: &str, oidc: &str) -> Config {
-            with_mode(
+            let mut config = with_mode(
                 "passthrough",
                 &format!("[backends.passthrough]\n{table}\n[database]\n{oidc}"),
-            )
+            );
+            // a file load reads the secret from the variable
+            for provider in &mut config.auth.oidc {
+                provider.client_secret =
+                    provider.client_secret_env.as_ref().map(|_| "s".to_string());
+            }
+            config
         }
 
         #[test]

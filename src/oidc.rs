@@ -324,64 +324,113 @@ impl Discovery {
     }
 }
 
-/// The configured providers, in config order. Cheap to clone.
-#[derive(Clone, Debug)]
+/// The current providers, in config order. Providers can be replaced while
+/// the gateway runs, see [`OidcProviders::replace`]; lookups hand out owned
+/// handles, so a request in flight keeps the provider it started with.
+#[derive(Debug)]
 pub struct OidcProviders {
-    providers: Arc<Vec<Provider>>,
+    /// `{base_url}/auth/callback`, shared by all providers.
+    redirect_url: String,
+    providers: std::sync::RwLock<Arc<Vec<Arc<Provider>>>>,
 }
 
 impl OidcProviders {
-    /// Builds the providers from config. Reads each client secret from its
-    /// environment variable now, but does not talk to any provider.
+    /// Builds the providers from config, possibly none. Takes each client
+    /// secret from `client_secret` now, but does not talk to any provider.
     /// `redirect_url` is `{base_url}/auth/callback`, shared by all of them.
     ///
     /// # Errors
-    /// Fails on an unset or empty client secret variable, an unparseable
-    /// redirect URL or an HTTP client that cannot be built: config mistakes,
-    /// which should stop the gateway at startup.
+    /// Fails on a missing or empty client secret, an unparseable redirect URL
+    /// or an HTTP client that cannot be built: config mistakes, which should
+    /// stop the gateway at startup.
     pub fn new(configs: &[OidcProviderConfig], redirect_url: &str) -> Result<Self, OidcError> {
         let providers = configs
             .iter()
-            .map(|config| Provider::new(config, redirect_url))
+            .map(|config| Provider::new(config, redirect_url).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            providers: Arc::new(providers),
+            redirect_url: redirect_url.to_owned(),
+            providers: std::sync::RwLock::new(Arc::new(providers)),
         })
+    }
+
+    /// Replaces the provider set with `configs`, atomically. A provider whose
+    /// config is unchanged keeps its handle, and with it the discovery, key
+    /// set and Graph token it has cached. On an error nothing changes.
+    ///
+    /// # Errors
+    /// The same as [`OidcProviders::new`].
+    pub fn replace(&self, configs: &[OidcProviderConfig]) -> Result<(), OidcError> {
+        let current = self.snapshot();
+        let providers = configs
+            .iter()
+            .map(
+                |config| match current.iter().find(|provider| provider.config == *config) {
+                    Some(kept) => Ok(Arc::clone(kept)),
+                    None => Provider::new(config, &self.redirect_url).map(Arc::new),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        *self
+            .providers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(providers);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Arc<Vec<Arc<Provider>>> {
+        Arc::clone(
+            &self
+                .providers
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// The provider with this `id`.
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<&Provider> {
-        self.providers.iter().find(|provider| provider.id == id)
+    pub fn get(&self, id: &str) -> Option<Arc<Provider>> {
+        self.snapshot()
+            .iter()
+            .find(|provider| provider.id == id)
+            .cloned()
     }
 
     /// The `id` of the provider with this issuer.
     #[must_use]
-    pub fn id_for_issuer(&self, issuer: &str) -> Option<&str> {
-        self.providers
+    pub fn id_for_issuer(&self, issuer: &str) -> Option<String> {
+        self.snapshot()
             .iter()
             .find(|provider| provider.issuer == issuer)
-            .map(|provider| provider.id.as_str())
+            .map(|provider| provider.id.clone())
     }
 
     /// The provider that issued `token` (by its unverified `iss`) when it
     /// accepts access tokens. Only picks who must verify the token: nothing
     /// here is trusted until [`Provider::verify_access_token`] has run.
     #[must_use]
-    pub fn access_token_provider(&self, token: &str) -> Option<&Provider> {
+    pub fn access_token_provider(&self, token: &str) -> Option<Arc<Provider>> {
         #[derive(Deserialize)]
         struct Unverified {
             iss: String,
         }
         let Unverified { iss } = jsonwebtoken::dangerous::insecure_decode_claims(token).ok()?;
-        self.providers
+        self.snapshot()
             .iter()
             .find(|provider| provider.accept_access_tokens && provider.issuer == iss)
+            .cloned()
     }
 
     /// The providers in config order.
-    pub fn iter(&self) -> impl Iterator<Item = &Provider> {
-        self.providers.iter()
+    #[must_use]
+    pub fn list(&self) -> Vec<Arc<Provider>> {
+        self.snapshot().as_ref().clone()
+    }
+
+    /// Whether no provider is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.snapshot().is_empty()
     }
 }
 
@@ -408,6 +457,9 @@ pub struct Provider {
     graph_token: Mutex<Option<GraphToken>>,
     http: reqwest::Client,
     discovery: RwLock<Option<Arc<Discovery>>>,
+    /// The config this provider was built from, to tell on a replace whether
+    /// it changed.
+    config: OidcProviderConfig,
 }
 
 impl fmt::Debug for Provider {
@@ -430,17 +482,15 @@ impl Provider {
             provider: config.id.clone(),
             message,
         };
-        let client_secret = match &config.client_secret_env {
-            Some(var) => match std::env::var(var) {
-                Ok(secret) if !secret.is_empty() => Some(ClientSecret::new(secret)),
-                _ => {
-                    return Err(OidcError::MissingSecret {
-                        provider: config.id.clone(),
-                        var: var.clone(),
-                    });
-                }
-            },
-            None => None,
+        let client_secret = match (&config.client_secret, &config.client_secret_env) {
+            (Some(secret), _) if !secret.is_empty() => Some(ClientSecret::new(secret.clone())),
+            (_, Some(var)) => {
+                return Err(OidcError::MissingSecret {
+                    provider: config.id.clone(),
+                    var: var.clone(),
+                });
+            }
+            _ => None,
         };
         let redirect_url = RedirectUrl::new(redirect_url.to_owned())
             .map_err(|source| error(format!("redirect URL: {source}")))?;
@@ -475,6 +525,7 @@ impl Provider {
             graph_token: Mutex::new(None),
             http,
             discovery: RwLock::new(None),
+            config: config.clone(),
         })
     }
 
@@ -2018,6 +2069,7 @@ mod tests {
             issuer: issuer.to_owned(),
             client_id: CLIENT.to_owned(),
             client_secret_env: None,
+            client_secret: None,
             scopes: vec!["profile".to_owned(), "email".to_owned()],
             groups_claim: "groups".to_owned(),
             allowed_email_domains: Vec::new(),
@@ -2032,6 +2084,69 @@ mod tests {
 
     fn providers_for(config: &OidcProviderConfig) -> OidcProviders {
         OidcProviders::new(std::slice::from_ref(config), REDIRECT).unwrap()
+    }
+
+    fn named(id: &str, issuer: &str) -> OidcProviderConfig {
+        let mut config = config_for(issuer);
+        id.clone_into(&mut config.id);
+        config
+    }
+
+    #[test]
+    fn an_empty_provider_set_works() {
+        let providers = OidcProviders::new(&[], REDIRECT).unwrap();
+        assert!(providers.is_empty());
+        assert!(providers.list().is_empty());
+        assert!(providers.get("test").is_none());
+        assert_eq!(providers.id_for_issuer(ISSUER), None);
+    }
+
+    #[test]
+    fn replace_adds_removes_and_changes_providers() {
+        let providers = OidcProviders::new(&[named("a", "http://a.example")], REDIRECT).unwrap();
+        let mut changed = named("a", "http://a.example");
+        changed.client_id = "other".to_owned();
+        providers
+            .replace(&[changed, named("b", "http://b.example")])
+            .unwrap();
+        let ids: Vec<String> = providers.list().iter().map(|p| p.id().to_owned()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(
+            providers.id_for_issuer("http://b.example").as_deref(),
+            Some("b")
+        );
+        providers
+            .replace(&[named("b", "http://b.example")])
+            .unwrap();
+        assert!(providers.get("a").is_none());
+        assert!(providers.get("b").is_some());
+        providers.replace(&[]).unwrap();
+        assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_provider_keeps_its_identity() {
+        let a = named("a", "http://a.example");
+        let providers = OidcProviders::new(std::slice::from_ref(&a), REDIRECT).unwrap();
+        let before = providers.get("a").unwrap();
+        let mut changed = a.clone();
+        changed.client_id = "other".to_owned();
+        providers
+            .replace(&[a.clone(), named("b", "http://b.example")])
+            .unwrap();
+        assert!(Arc::ptr_eq(&before, &providers.get("a").unwrap()));
+        providers.replace(&[changed]).unwrap();
+        assert!(!Arc::ptr_eq(&before, &providers.get("a").unwrap()));
+    }
+
+    #[test]
+    fn a_failed_replace_changes_nothing() {
+        let a = named("a", "http://a.example");
+        let providers = OidcProviders::new(std::slice::from_ref(&a), REDIRECT).unwrap();
+        let mut broken = named("b", "http://b.example");
+        broken.client_secret_env = Some("AXON_TEST_OIDC_SECRET_THAT_IS_NEVER_SET_9F2C".to_owned());
+        assert!(providers.replace(&[a, broken]).is_err());
+        assert_eq!(providers.list().len(), 1);
     }
 
     /// The claims of a good token from the fake provider.
@@ -2085,11 +2200,11 @@ mod tests {
         let key = Key::rsa("k1");
         let (issuer, fake) = fake_provider(&[&key]).await;
         let providers = providers_for(&config_for(&issuer));
-        assert!(providers.iter().next().is_some());
+        assert!(!providers.is_empty());
         let provider = providers.get("test").unwrap();
         assert_eq!(provider.id(), "test");
         assert_eq!(provider.display_name(), "test");
-        assert_eq!(providers.iter().count(), 1);
+        assert_eq!(providers.list().len(), 1);
         assert!(providers.get("other").is_none());
 
         let redirect = provider.authorize().await.unwrap();
@@ -2449,7 +2564,10 @@ mod tests {
         config.accept_access_tokens = true;
         let providers = providers_for(&config);
         assert_eq!(
-            providers.access_token_provider(&token).map(Provider::id),
+            providers
+                .access_token_provider(&token)
+                .as_deref()
+                .map(Provider::id),
             Some("test")
         );
 

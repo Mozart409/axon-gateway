@@ -297,7 +297,8 @@ async fn load_group_detail(
     let providers: Vec<String> = state
         .multi_user()
         .map(|(_, oidc)| {
-            oidc.iter()
+            oidc.list()
+                .iter()
                 .map(|provider| provider.id().to_owned())
                 .collect()
         })
@@ -409,7 +410,7 @@ fn roles_fragment(state: &AppState, session: &SessionUser, admin: &Admin<'_>) ->
     }
 }
 
-/// Handle GET /ui/admin/roles - built-in, config and database roles
+/// Handle GET /ui/admin/roles - built-in and custom roles
 pub(super) async fn handle_admin_roles(
     State(state): State<AppState>,
     user: Option<Extension<SessionUser>>,

@@ -46,7 +46,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use kameo::actor::ActorRef;
 use serde::Serialize;
@@ -69,6 +69,9 @@ mod audit_ui;
 mod audit_views;
 mod auth;
 mod break_glass;
+mod config_api;
+mod config_ui;
+mod config_views;
 mod mcp;
 mod mcp_sessions;
 mod oauth;
@@ -119,16 +122,19 @@ pub struct AppState {
     /// `notifications/tools/list_changed` wait on it
     pub changes: crate::changes::ChangeBus,
     /// `Host` values the MCP endpoints accept (DNS rebinding protection of the
-    /// rmcp transport); empty accepts any
-    pub mcp_allowed_hosts: Vec<String>,
+    /// rmcp transport), read per request and swapped on a reload; empty accepts any
+    pub mcp_allowed_hosts: Arc<std::sync::RwLock<Vec<String>>>,
     /// Users' own and catalog backends; `None` without a database or with
     /// `[personal_backends] enabled = false`
     pub personal: Option<Arc<crate::personal::PersonalHub>>,
+    /// What the configuration admin API needs to write the stored configuration;
+    /// `None` in standalone mode
+    pub db_config: Option<crate::dbconfig::DbConfigContext>,
 }
 
 impl AppState {
-    /// The store and providers when the dashboard has a login (an
-    /// `[auth.oidc]` provider and a `[database]`); `None` in standalone mode.
+    /// The store and providers when the dashboard has a login (database mode,
+    /// where the provider list may be empty); `None` in standalone mode.
     pub(crate) fn multi_user(&self) -> Option<(&crate::store::Store, &crate::oidc::OidcProviders)> {
         Some((self.store.as_ref()?, self.oidc.as_deref()?))
     }
@@ -140,6 +146,7 @@ pub enum UiEvent {
     ConfigReloaded {
         added: Vec<String>,
         removed: Vec<String>,
+        changed: Vec<String>,
         errors: Vec<String>,
     },
     Flash(FlashMessage),
@@ -183,6 +190,7 @@ fn ui_action_routes(state: &AppState) -> Router<AppState> {
             post(ui::handle_ui_tool_opt_out),
         )
         .merge(admin_ui::action_routes())
+        .merge(config_ui::action_routes())
         .merge(tokens_ui::action_routes())
         .merge(oauth_ui::action_routes())
         .merge(audit_ui::action_routes())
@@ -201,11 +209,15 @@ fn ui_action_routes(state: &AppState) -> Router<AppState> {
 fn mcp_routes(state: &AppState) -> Router<AppState> {
     let service = mcp::mcp_service(state);
     let owners = mcp_sessions::SessionOwners::new(state.store.as_ref());
+    let handler = move || {
+        let service = service.clone();
+        any(move |request: axum::extract::Request| async move { service.handle(request).await })
+    };
     Router::new()
-        .route_service("/mcp", service.clone())
-        .route_service("/mcp/toolset/{toolset_name}", service.clone())
+        .route("/mcp", handler())
+        .route("/mcp/toolset/{toolset_name}", handler())
         // Deprecated alias for the toolset endpoint, removed after one minor release
-        .route_service("/mcp/group/{toolset_name}", service)
+        .route("/mcp/group/{toolset_name}", handler())
         .route_layer(middleware::from_fn_with_state(
             (state.clone(), owners),
             mcp::authenticate_mcp,
@@ -225,6 +237,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ui/events", get(ui::handle_ui_events))
         .route("/ui/partials/backends", get(ui::handle_ui_backends_partial))
         .merge(admin_ui::page_routes())
+        .merge(config_ui::page_routes())
         .merge(tokens_ui::page_routes())
         .merge(oauth_ui::page_routes())
         .merge(audit_ui::page_routes())
@@ -271,6 +284,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(break_glass::routes())
         // JSON admin API
         .merge(admin_api::router(state.clone()))
+        .merge(config_api::router(state.clone()))
         .merge(audit_api::router(state.clone()))
         .merge(scim_admin::api_router(state.clone()))
         // SCIM provisioning by an identity provider (multi-user mode only)
@@ -518,13 +532,12 @@ mod tests {
             metrics_handle: test_metrics_handle(),
             store: None,
             oidc: None,
-            policy: Arc::new(crate::rbac::PolicyHandle::new(
-                crate::policy::RbacConfig::default(),
-            )),
+            policy: Arc::new(crate::rbac::PolicyHandle::new()),
             audit: None,
             changes: crate::changes::ChangeBus::new(),
-            mcp_allowed_hosts: Vec::new(),
+            mcp_allowed_hosts: Arc::new(std::sync::RwLock::new(Vec::new())),
             personal: None,
+            db_config: None,
         }
     }
 

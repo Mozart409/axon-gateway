@@ -264,7 +264,8 @@ async fn load_accounts(
         });
     }
     let issuers = state.multi_user().map_or_else(Vec::new, |(_, oidc)| {
-        oidc.iter()
+        oidc.list()
+            .iter()
             .filter(|provider| provider.accepts_access_tokens())
             .map(|provider| provider.issuer().to_owned())
             .collect()

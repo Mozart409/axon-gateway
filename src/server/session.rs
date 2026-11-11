@@ -243,6 +243,7 @@ pub(super) async fn login_index(
 
     let return_to = safe_return_to(query.return_to.as_deref());
     let options: Vec<LoginOption> = providers
+        .list()
         .iter()
         .map(|provider| LoginOption {
             display_name: provider.display_name().to_owned(),

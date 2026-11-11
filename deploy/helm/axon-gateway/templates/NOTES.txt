@@ -13,16 +13,33 @@ Try it locally:
   curl http://localhost:{{ .Values.service.port }}/readyz
 {{- end }}
 
+{{- if .Values.database.enabled }}
+
+Database mode: the gateway reads no config file. Manage backends, toolsets,
+OIDC providers and settings in the dashboard ({{ .Values.baseUrl }}/ui/admin) or
+the API; replicas pick changes up within seconds. Changes to Secrets or `env`
+need: kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "axon-gateway.fullname" . }}
+{{- if not .Values.oidc.issuer }}
+
+No bootstrap OIDC provider is set. Log in with the break-glass link:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "axon-gateway.fullname" . }} -- axon-gateway admin login-link
+{{- end }}
+{{- if .Values.import.enabled }}
+
+The config import ran as a hook Job. New service-account tokens are on its log,
+shown once:
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "axon-gateway.fullname" . }}-import
+Set import.enabled=false now: every upgrade with it on overwrites what was
+changed in the dashboard with the file.
+{{- end }}
+{{- else }}
+
 Config changes (values `config`) hot-reload without a restart; the kubelet may
 take up to a minute to refresh the mounted file. Changes to Secrets or `env`
 need: kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "axon-gateway.fullname" . }}
-{{- if and (gt (int .Values.replicaCount) 1) (not .Values.existingSecret) }}
+{{- if gt (int .Values.replicaCount) 1 }}
 
 Warning: {{ .Values.replicaCount }} replicas need a shared database. Set
-existingSecret (with AXON_DATABASE_URL) and a [database] section in `config`.
+database.enabled, or run one replica.
 {{- end }}
-{{- if not .Values.kek.existingSecret }}
-
-Note: kek.existingSecret is unset. Personal backends and catalog credentials
-need AXON_KEK_FILE or AXON_KEK.
 {{- end }}

@@ -603,7 +603,7 @@ fn render_entry(view: &CatalogView) -> Markup {
                     span class=(BADGE_OFF) { "disabled" }
                 }
                 @if item.source == CatalogSource::Config {
-                    span class=(BADGE_OFF) { "from config file" }
+                    span class=(BADGE_OFF) { "from backend config" }
                 }
                 @if let Some(description) = &item.description {
                     span class=(MUTED) { (description) }
@@ -1060,7 +1060,7 @@ mod tests {
         ];
         let html = render_catalog_section(&entries, true).into_string();
 
-        assert!(html.contains("from config file"));
+        assert!(html.contains("from backend config"));
         assert!(!html.contains("/ui/actions/catalog/fromfile/update"));
         assert!(!html.contains("/ui/actions/catalog/fromfile/delete"));
         assert!(html.contains("/ui/actions/catalog/indb/update"));

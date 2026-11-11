@@ -284,7 +284,8 @@ async fn handle_revoke_account_token(
 /// `accept_access_tokens`: a binding to it could never match a token.
 pub(super) fn require_accepting_issuer(state: &AppState, issuer: &str) -> Result<(), AdminError> {
     let accepted = state.multi_user().is_some_and(|(_, oidc)| {
-        oidc.iter()
+        oidc.list()
+            .iter()
             .any(|provider| provider.accepts_access_tokens() && provider.issuer() == issuer.trim())
     });
     if accepted {

@@ -170,7 +170,7 @@ impl PrincipalPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{GrantConfig, IdpMapping, Policy, RbacConfig, RbacGroupConfig};
+    use crate::policy::{GrantConfig, IdpMapping, Policy, RbacGroupConfig, RbacSnapshot};
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()
@@ -212,21 +212,20 @@ mod tests {
     }
 
     /// `it` gets all of `prom`, `dev` gets `get_*` of `forgejo` and a mandatory `whoami`
-    fn config() -> RbacConfig {
-        RbacConfig {
+    fn snapshot() -> RbacSnapshot {
+        RbacSnapshot {
             groups: vec![group("it"), group("dev")],
             grants: vec![
-                grant("it", "prom", &["*"], false),
-                grant("dev", "forgejo", &["get_*"], false),
-                grant("dev", "forgejo", &["whoami"], true),
+                (1, grant("it", "prom", &["*"], false)),
+                (2, grant("dev", "forgejo", &["get_*"], false)),
+                (3, grant("dev", "forgejo", &["whoami"], true)),
             ],
-            role_bindings: Vec::new(),
-            roles: Vec::new(),
+            ..RbacSnapshot::default()
         }
     }
 
     fn principal(groups: &[&str], opt_outs: OptOuts, scope: TokenScope) -> PrincipalPolicy {
-        let effective = Policy::from_config(&config()).effective(&strings(groups));
+        let effective = Policy::from_snapshot(&snapshot()).effective(&strings(groups));
         PrincipalPolicy::new("alice@example.com".to_string(), effective, opt_outs, scope)
     }
 

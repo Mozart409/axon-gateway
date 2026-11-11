@@ -377,10 +377,8 @@ pub(super) async fn handle_ui_enable_backend(
 pub(super) async fn handle_ui_reload_config(
     State(state): State<AppState>,
 ) -> Result<Html<String>, StatusCode> {
-    let config_path = state.config_path.as_ref().ok_or_else(|| {
-        tracing::error!("Config path not set, cannot reload from UI action");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Database mode has no config file: changes apply when they are saved
+    let config_path = state.config_path.as_ref().ok_or(StatusCode::NOT_FOUND)?;
 
     let flash = match Config::load_async(config_path).await {
         Ok(new_config) => {
@@ -415,13 +413,15 @@ fn reload_flash<E: std::fmt::Debug>(
                 UiEvent::ConfigReloaded {
                     added: result.added.clone(),
                     removed: result.removed.clone(),
+                    changed: result.changed.clone(),
                     errors: result.errors.clone(),
                 },
             );
             let message = format!(
-                "Config reloaded (added: {}, removed: {}, errors: {})",
+                "Config reloaded (added: {}, removed: {}, restarted: {}, errors: {})",
                 result.added.len(),
                 result.removed.len(),
+                result.changed.len(),
                 result.errors.len()
             );
             FlashMessage {
@@ -474,6 +474,7 @@ fn ui_event_to_sse(event: UiEvent) -> Event {
         UiEvent::ConfigReloaded {
             added,
             removed,
+            changed,
             errors,
         } => Event::default().event("config_reloaded").data(
             views::render_flash(&FlashMessage {
@@ -483,9 +484,10 @@ fn ui_event_to_sse(event: UiEvent) -> Event {
                     FlashLevel::Info
                 },
                 message: format!(
-                    "Config reloaded (added: {}, removed: {}, errors: {})",
+                    "Config reloaded (added: {}, removed: {}, restarted: {}, errors: {})",
                     added.len(),
                     removed.len(),
+                    changed.len(),
                     errors.len()
                 ),
             })
@@ -643,7 +645,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::policy::{GrantConfig, IdpMapping, Policy, RbacConfig, RbacGroupConfig};
+    use crate::policy::{GrantConfig, IdpMapping, Policy, RbacGroupConfig, RbacSnapshot};
     use crate::server::create_router;
     use crate::server::tests::test_state;
     use crate::types::{BackendInfo, BackendState, NamespacedTool, ToolDefinition};
@@ -907,12 +909,12 @@ mod tests {
 
     /// Group `it` (claim `it-claim` from `pocket`); `files` is granted in pieces,
     /// `wiki` read-only, `mail` not at all.
-    fn tools_config() -> RbacConfig {
+    fn tools_snapshot() -> RbacSnapshot {
         let mut wiki = grant("authenticated", "wiki", &["*"], &[]);
         wiki.read_only = true;
         let mut audit = grant("authenticated", "files", &["audit_log"], &[]);
         audit.mandatory = true;
-        RbacConfig {
+        RbacSnapshot {
             groups: vec![RbacGroupConfig {
                 name: String::from("it"),
                 description: Some(String::from("<b>IT</b> staff")),
@@ -922,19 +924,24 @@ mod tests {
                 }],
                 service_accounts: Vec::new(),
             }],
-            grants: vec![
+            memberships: Vec::new(),
+            grants: [
                 grant("authenticated", "files", &["read_*"], &[]),
                 audit,
                 grant("it", "files", &["*"], &["delete_*"]),
                 wiki,
-            ],
+            ]
+            .into_iter()
+            .zip(1..)
+            .map(|(grant, id)| (id, grant))
+            .collect(),
             role_bindings: Vec::new(),
             roles: Vec::new(),
         }
     }
 
     fn tools_policy() -> Policy {
-        Policy::from_config(&tools_config())
+        Policy::from_snapshot(&tools_snapshot())
     }
 
     fn files_backend() -> BackendInfo {
@@ -1050,7 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn my_tools_page_lists_groups_and_escapes_descriptions() {
         let mut state = test_state();
-        state.policy = Arc::new(crate::rbac::PolicyHandle::new(tools_config()));
+        state.policy = Arc::new(crate::rbac::PolicyHandle::from_snapshot(&tools_snapshot()));
         let user = test_session_user(false);
         let policy = state.policy.current();
         let groups = policy.groups_for(user.user.id, "pocket", &[String::from("it-claim")]);

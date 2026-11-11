@@ -27,8 +27,8 @@ const SESSION_COOKIE: &str = "__Host-axon_session";
 const LOGIN_COOKIE: &str = "__Host-axon_login";
 const DATABASE_ENV: &str = "AXON_TEST_GATEWAY_DATABASE_URL";
 
-/// `ops` and the role `config-reader` are declared in config and read-only
-/// through the API.
+/// `ops` and the role `config-reader` come from the imported file and are
+/// ordinary (local) objects.
 const RBAC: &str = r#"
 [[rbac.groups]]
 name = "ops"
@@ -652,27 +652,21 @@ async fn deleting_a_bound_role_needs_force_and_removes_the_access() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn built_in_and_config_roles_are_fixed_and_names_are_checked() {
+async fn built_in_roles_are_fixed_imported_roles_are_not_and_names_are_checked() {
     let Some(h) = Harness::start("axon_custom_roles_fixed").await else {
         return;
     };
     let admin = h.login_as("root", "root@example.com", &["admins"]).await;
 
-    // The listing: built-ins first, then the config role.
+    // The listing: built-ins first, then the imported role, which is local.
     let admin_role = listed_role(&h, &admin, "admin").await.unwrap();
     assert_eq!(admin_role["source"], "builtin");
     assert_eq!(admin_role["permissions"].as_array().unwrap().len(), 12);
     let config_role = listed_role(&h, &admin, "config-reader").await.unwrap();
-    assert_eq!(config_role["source"], "config");
+    assert_eq!(config_role["source"], "local");
     assert_eq!(config_role["permissions"], json!(["audit.read"]));
 
-    for name in [
-        "admin",
-        "backend-admin",
-        "auditor",
-        "member",
-        "config-reader",
-    ] {
+    for name in ["admin", "backend-admin", "auditor", "member"] {
         let (status, body) = h
             .send(
                 Method::POST,
@@ -711,13 +705,42 @@ async fn built_in_and_config_roles_are_fixed_and_names_are_checked() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // A config role binds like a built-in one.
+    // The imported role's name is taken, but the role is editable and
+    // deletable like any local one.
+    let (status, body) = h
+        .send(
+            Method::POST,
+            "/api/v1/admin/roles",
+            &admin,
+            Some(json!({ "name": "config-reader", "permissions": ["audit.read"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, body) = h.bind(&admin, "config-reader", "group", "ops").await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(
         listed_role(&h, &admin, "config-reader").await.unwrap()["bindings"],
         1
     );
+    let (status, body) = h
+        .send(
+            Method::PUT,
+            "/api/v1/admin/roles/config-reader",
+            &admin,
+            Some(json!({ "permissions": ["audit.read", "backends.view"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .send(
+            Method::DELETE,
+            "/api/v1/admin/roles/config-reader?force=true",
+            &admin,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(listed_role(&h, &admin, "config-reader").await.is_none());
 
     // Bad names and permission lists.
     for (name, permissions) in [

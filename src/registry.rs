@@ -477,6 +477,28 @@ impl Message<GetBackendStatus> for RegistryActor {
     }
 }
 
+/// Replace the toolset definitions (config reload). Toolsets only filter the
+/// cached tool list, so the cache stays valid; open MCP connections are told
+/// because their toolset may have changed.
+pub struct SetToolsets {
+    pub toolsets: Vec<ToolsetConfig>,
+}
+
+impl Message<SetToolsets> for RegistryActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SetToolsets,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self.toolsets != msg.toolsets {
+            self.toolsets = msg.toolsets;
+            self.publish_tools_changed();
+        }
+    }
+}
+
 /// Remove a backend from the registry
 #[derive(Clone)]
 pub struct RemoveBackend {

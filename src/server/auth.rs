@@ -12,7 +12,7 @@ use chrono::DateTime;
 use uuid::Uuid;
 
 use super::AppState;
-use crate::auth::{AuthError, TokenIdentity};
+use crate::auth::AuthError;
 use crate::gateway::Caller;
 use crate::oidc::{OidcError, Provider};
 use crate::policy::OptOuts;
@@ -118,7 +118,7 @@ pub(super) async fn authenticate(
         && looks_like_jwt(provided_token)
         && let Some(provider) = oidc.access_token_provider(provided_token)
     {
-        return authenticate_jwt(provided_token, provider, state).await;
+        return authenticate_jwt(provided_token, &provider, state).await;
     }
 
     let auth_manager = state.auth_manager.load();
@@ -137,23 +137,11 @@ pub(super) async fn authenticate(
         return Err(Box::new(unauthorized()));
     }
 
-    if let Some((store, _)) = state.multi_user() {
-        // Multi-user mode counts in Postgres, so the replicas share one limit
-        // The shared token has no identity to put under RBAC
-        let Ok(Some(identity)) = auth_manager.identify(provided_token) else {
-            crate::metrics::record_authn("service_token", "invalid");
-            return Err(Box::new(unauthorized()));
-        };
-        let limit = auth_manager.effective_limit(identity.rate_limit_per_minute);
-        within_rate_limit(
-            store,
-            "service_token",
-            &format!("config:{}", identity.name),
-            limit,
-        )
-        .await?;
-        crate::metrics::record_authn("service_token", "ok");
-        return Ok(config_account(&identity, state));
+    if state.multi_user().is_some() {
+        // Config-file service accounts are gone: multi-user mode authenticates only
+        // database tokens, so a `[[tokens]]` entry is refused like an unknown token
+        crate::metrics::record_authn("service_token", "invalid");
+        return Err(Box::new(unauthorized()));
     }
 
     match auth_manager.validate_token(provided_token) {
@@ -208,26 +196,6 @@ async fn within_rate_limit(
     }
 }
 
-/// A `[[tokens]]` entry in multi-user mode: a service account declared in config, under
-/// the policy of the config groups that list it. Its `allowed_*` narrow it like a token
-/// scope; it has no opt-outs.
-fn config_account(identity: &TokenIdentity, state: &AppState) -> Caller {
-    let policy = state.policy.current();
-    let groups = policy.groups_for_config_account(&identity.name);
-    Caller::Principal(
-        PrincipalPolicy::new(
-            format!("config:{}", identity.name),
-            policy.effective(&groups),
-            OptOuts::default(),
-            TokenScope {
-                backends: identity.allowed_backends.clone(),
-                tools: identity.allowed_tools.clone(),
-            },
-        )
-        .with_service_account(),
-    )
-}
-
 /// A personal access token or a service account's token.
 async fn authenticate_pat(
     token: &str,
@@ -263,11 +231,11 @@ async fn authenticate_pat(
     let owner = &principal.owner;
     let policy = state.policy.current();
     let groups = if principal.is_service_account {
-        policy.groups_for_service_account(owner.id, &owner.subject)
+        policy.groups_for_service_account(owner.id)
     } else {
         // No configured provider for the issuer: no IdP mapping applies
-        let provider_id = oidc.id_for_issuer(&owner.issuer).unwrap_or("");
-        policy.groups_for(owner.id, provider_id, &owner.groups)
+        let provider_id = oidc.id_for_issuer(&owner.issuer).unwrap_or_default();
+        policy.groups_for(owner.id, &provider_id, &owner.groups)
     };
     let opt_outs = opt_outs(store, owner.id).await?;
 
@@ -372,7 +340,7 @@ async fn authenticate_jwt(
 
     let policy = state.policy.current();
     let groups = if is_service_account {
-        policy.groups_for_service_account(owner.id, &owner.subject)
+        policy.groups_for_service_account(owner.id)
     } else {
         let claim_groups = claims.groups.as_ref().unwrap_or(&owner.groups);
         policy.groups_for(owner.id, provider.id(), claim_groups)

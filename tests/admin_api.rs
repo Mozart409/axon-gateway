@@ -28,7 +28,7 @@ const SESSION_COOKIE: &str = "__Host-axon_session";
 const LOGIN_COOKIE: &str = "__Host-axon_login";
 const DATABASE_ENV: &str = "AXON_TEST_GATEWAY_DATABASE_URL";
 
-/// `ops` is declared in config and read-only through the API.
+/// `ops` comes from the imported file and is an ordinary group.
 const RBAC: &str = r#"
 [[rbac.groups]]
 name = "ops"
@@ -328,13 +328,14 @@ async fn an_admin_grants_a_tool_to_a_group_and_its_members_see_it() {
 
     // The listings show the group and the grant.
     let (_, groups) = h.send(Method::GET, "/api/v1/groups", &admin, None).await;
-    let names: Vec<&str> = groups["groups"]
+    let mut names: Vec<&str> = groups["groups"]
         .as_array()
         .unwrap()
         .iter()
         .map(|group| group["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["ops", "devs"]);
+    names.sort_unstable();
+    assert_eq!(names, ["devs", "ops"]);
     let (_, group) = h
         .send(Method::GET, "/api/v1/groups/devs", &admin, None)
         .await;
@@ -438,7 +439,7 @@ async fn non_admins_cannot_write_or_list() {
 }
 
 #[tokio::test]
-async fn config_groups_are_read_only() {
+async fn groups_from_the_imported_file_are_ordinary_groups() {
     let Some(h) = Harness::start("axon_admin_api_config").await else {
         return;
     };
@@ -447,33 +448,50 @@ async fn config_groups_are_read_only() {
     let (_, group) = h
         .send(Method::GET, "/api/v1/groups/ops", &admin, None)
         .await;
-    assert_eq!(group["source"], "config");
+    assert_eq!(group["source"], "local");
+    assert_eq!(group["description"], "Operations");
 
-    for (method, path, body) in [
-        (
+    let (status, body) = h
+        .send(
             Method::PATCH,
             "/api/v1/groups/ops",
+            &admin,
             Some(json!({ "description": "x" })),
-        ),
-        (Method::DELETE, "/api/v1/groups/ops", None),
-        (
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h
+        .send(
             Method::POST,
             "/api/v1/groups/ops/idp-mappings",
+            &admin,
             Some(json!({ "provider": "mock", "value": "ops" })),
-        ),
-        (
-            Method::POST,
-            "/api/v1/groups",
-            Some(json!({ "name": "ops" })),
-        ),
-    ] {
-        let (status, body) = h.send(method, path, &admin, body).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
-    }
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     let (_, group) = h
         .send(Method::GET, "/api/v1/groups/ops", &admin, None)
         .await;
-    assert_eq!(group["description"], "Operations");
+    assert_eq!(group["description"], "x");
+
+    // The name is taken, as for any group.
+    let (status, body) = h
+        .send(
+            Method::POST,
+            "/api/v1/groups",
+            &admin,
+            Some(json!({ "name": "ops" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = h
+        .send(Method::DELETE, "/api/v1/groups/ops", &admin, None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = h
+        .send(Method::GET, "/api/v1/groups/ops", &admin, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Bad input and unknown things.
     let (status, _) = h
@@ -616,7 +634,16 @@ async fn the_audit_log_lists_the_writes_with_their_actor() {
         .iter()
         .map(|entry| entry["action"].as_str().unwrap())
         .collect();
-    assert_eq!(actions, ["group.delete", "group.create", "group.create"]);
+    // the oldest entry is the harness's import of the config file
+    assert_eq!(
+        actions,
+        [
+            "group.delete",
+            "group.create",
+            "group.create",
+            "config.import"
+        ]
+    );
     assert_eq!(entries[0]["actor"], "root@example.com");
     assert_eq!(entries[0]["target"], "group:one");
     assert!(entries[0]["actor_user_id"].is_string());

@@ -48,7 +48,7 @@ async fn adding_a_backend_hot_reloads_new_tools() {
 
     // Start with no backends.
     let empty = ConfigBuilder::new(&bind).render();
-    let server = Gateway::start(&empty, &base).await;
+    let mut server = Gateway::start(&empty, &base).await;
     let client = reqwest::Client::new();
     assert_eq!(tool_count(&client, &server.base).await, 0);
 
@@ -81,7 +81,7 @@ async fn atomic_replace_of_config_hot_reloads() {
 
     // Start with no backends.
     let empty = ConfigBuilder::new(&bind).render();
-    let server = Gateway::start(&empty, &base).await;
+    let mut server = Gateway::start(&empty, &base).await;
     let client = reqwest::Client::new();
     assert_eq!(tool_count(&client, &server.base).await, 0);
 
@@ -172,7 +172,7 @@ async fn removing_a_backend_hot_reloads_tools_away() {
     let with_backend = ConfigBuilder::new(&bind)
         .http_backend("mock", &backend.url())
         .render();
-    let server = Gateway::start(&with_backend, &base).await;
+    let mut server = Gateway::start(&with_backend, &base).await;
     let client = reqwest::Client::new();
 
     // Wait for the backend to connect and expose its tool.
@@ -213,7 +213,7 @@ async fn token_change_applies_on_hot_reload() {
     let base = format!("http://{bind}");
 
     let config = ConfigBuilder::new(&bind).auth_token("old-token").render();
-    let server = Gateway::start(&config, &base).await;
+    let mut server = Gateway::start(&config, &base).await;
     let client = reqwest::Client::new();
     assert_eq!(
         status_with_token(&client, &server.base, "old-token").await,

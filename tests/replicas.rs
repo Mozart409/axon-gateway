@@ -1,7 +1,8 @@
 //! Two gateway replicas on one database: a policy or per-user change made
 //! through one reaches the clients of the other as `list_changed`, a session
-//! opened on one is restored by the other and stays bound to its principal, and
-//! the per-token rate limit is shared.
+//! opened on one is restored by the other and stays bound to its principal, the
+//! per-token rate limit is shared, and a backend added through one replica's
+//! configuration API is served by the other.
 //!
 //! The tests skip themselves unless `AXON_TEST_DATABASE_URL` is set (see
 //! `oidc_login.rs`); each uses its own schema.
@@ -420,6 +421,83 @@ async fn the_rate_limit_is_counted_across_replicas() {
         StatusCode::TOO_MANY_REQUESTS,
         "the fourth request of the minute should be limited: {body}"
     );
+}
+
+#[tokio::test]
+async fn a_backend_added_on_one_replica_is_served_by_the_other() {
+    let Some(fleet) = Fleet::start("axon_replicas_backends", |config| config.rbac(RBAC)).await
+    else {
+        return;
+    };
+    let extra = MockBackend::start(&["ping"]).await;
+    let admin = fleet.login("root", &["admins"]).await;
+    let alice = fleet.login("alice", &["it-claim"]).await;
+    let pat = fleet.pat(&alice, json!({ "name": "mcp" })).await;
+
+    // Alice's client is connected to B, which serves the imported backend only.
+    let recorder = Recorder::default();
+    let client = connect(&format!("{}/mcp", fleet.b.base), &pat, &recorder).await;
+    settle().await;
+    assert_eq!(
+        tool_names(&client).await.expect("tools"),
+        ["files_list_files", "files_read_file"]
+    );
+
+    // An admin adds a backend through A and grants it to the group.
+    let (status, body) = fleet
+        .api(
+            &admin,
+            Method::POST,
+            "/api/v1/admin/config/backends",
+            json!({ "name": "extra", "url": extra.url(), "transport": "http" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // A grant is checked against the backends A runs, which it starts after the
+    // write: retry until it knows `extra`.
+    let granted = poll_until(100, Duration::from_millis(200), || async {
+        let (status, _) = fleet
+            .api(
+                &admin,
+                Method::POST,
+                "/api/v1/grants",
+                json!({ "group": "it", "backend": "extra", "include": ["ping"] }),
+            )
+            .await;
+        (status == StatusCode::CREATED).then_some(())
+    })
+    .await;
+    assert!(granted.is_some(), "A never accepted a grant on `extra`");
+
+    // B learns about it through the database notification; its 30 s poll is
+    // the backstop, so allow it more than that.
+    let names = poll_until(450, Duration::from_millis(100), || async {
+        tool_names(&client)
+            .await
+            .filter(|names| names.iter().any(|name| name == "extra_ping"))
+    })
+    .await
+    .expect("replica B should serve the backend added on A within 30 s");
+    assert_eq!(names, ["extra_ping", "files_list_files", "files_read_file"]);
+
+    // Deleting it on A takes it away from B again.
+    let (status, body) = fleet
+        .api(
+            &admin,
+            Method::DELETE,
+            "/api/v1/admin/config/backends/extra",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let names = poll_until(450, Duration::from_millis(100), || async {
+        tool_names(&client)
+            .await
+            .filter(|names| names.iter().all(|name| name != "extra_ping"))
+    })
+    .await
+    .expect("replica B should drop the backend deleted on A within 30 s");
+    assert_eq!(names, ["files_list_files", "files_read_file"]);
 }
 
 // Dashboard login and the JSON API, as in `transport.rs`: the tests need users

@@ -116,6 +116,7 @@ impl AuthManager {
     /// Identify a bearer token like [`validate_token`](Self::validate_token), but
     /// without counting the request against the in-memory rate limit, for callers
     /// that count elsewhere (multi-user mode counts in Postgres).
+    #[cfg(test)]
     pub fn identify(&self, provided: &str) -> Result<Option<TokenIdentity>, AuthError> {
         Ok(match self.resolve(provided)? {
             Resolved::Named(identity) => Some(identity),
@@ -155,14 +156,6 @@ impl AuthManager {
         }
 
         Err(AuthError::InvalidToken)
-    }
-
-    /// Names of the `[[tokens]]` entries
-    pub fn token_names(&self) -> Vec<String> {
-        self.token_map
-            .values()
-            .map(|identity| identity.name.clone())
-            .collect()
     }
 
     /// Check if auth is required (any token configured)

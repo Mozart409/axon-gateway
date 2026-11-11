@@ -2,7 +2,7 @@ apiVersion: v2
 name: axon-gateway
 description: A Helm chart for axon-gateway, an MCP gateway that aggregates Model Context Protocol servers behind one endpoint
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.4.2"
 kubeVersion: ">=1.27.0-0"
 home: https://github.com/Mozart409/axon-gateway

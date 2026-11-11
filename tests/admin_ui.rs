@@ -29,7 +29,7 @@ const SESSION_COOKIE: &str = "__Host-axon_session";
 const LOGIN_COOKIE: &str = "__Host-axon_login";
 const DATABASE_ENV: &str = "AXON_TEST_GATEWAY_DATABASE_URL";
 
-/// `ops` is declared in config and read-only through the API.
+/// `ops` comes from the imported file and is an ordinary group.
 const RBAC: &str = r#"
 [[rbac.groups]]
 name = "ops"
@@ -489,22 +489,24 @@ async fn an_action_without_the_csrf_token_is_forbidden() {
 }
 
 #[tokio::test]
-async fn deleting_a_config_group_answers_a_conflict_flash() {
+async fn a_group_from_the_imported_file_has_forms_and_can_be_deleted() {
     let Some(h) = Harness::start("axon_admin_ui_config").await else {
         return;
     };
     let admin = h.login_as("root", "root@example.com", &["admins"]).await;
 
-    // The config group has no forms on its page.
+    // The imported group is an ordinary one, with its forms.
     let page = h.page("/ui/admin/groups/ops", &admin, StatusCode::OK).await;
-    assert!(!page.contains("/ui/actions/admin/groups/ops/"));
+    assert!(page.contains("/ui/actions/admin/groups/ops/"));
+    assert!(!page.contains("read-only"));
 
     let resp = h
         .post("/ui/actions/admin/groups/ops/delete", &admin, &[])
         .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(header(&resp, "hx-retarget"), "#admin-flash");
-    assert!(resp.text().await.unwrap().contains("read-only"));
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "hx-redirect"), "/ui/admin");
+    let page = h.page("/ui/admin", &admin, StatusCode::OK).await;
+    assert!(!page.contains("/ui/admin/groups/ops"));
 
     let resp = h
         .post(

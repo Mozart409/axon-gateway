@@ -20,7 +20,6 @@ use reqwest::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 use reqwest::{Response, StatusCode};
 use support::mock_oidc::MockOidc;
 use support::{ConfigBuilder, Gateway, free_port};
-use tempfile::NamedTempFile;
 
 const BIN: &str = env!("CARGO_BIN_EXE_axon-gateway");
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -34,7 +33,6 @@ struct Harness {
     _idp: MockOidc,
     client: reqwest::Client,
     database_url: String,
-    config: NamedTempFile,
 }
 
 impl Harness {
@@ -59,9 +57,6 @@ impl Harness {
         )
         .await;
 
-        let mut file = NamedTempFile::new().expect("create temp config");
-        std::io::Write::write_all(&mut file, config.as_bytes()).expect("write config");
-
         Some(Self {
             gateway,
             _idp: idp,
@@ -70,7 +65,6 @@ impl Harness {
                 .build()
                 .expect("client should build"),
             database_url,
-            config: file,
         })
     }
 
@@ -82,9 +76,9 @@ impl Harness {
     /// the link and the code.
     fn login_link(&self) -> (String, String) {
         let output = Command::new(BIN)
-            .args(["admin", "login-link", "--config"])
-            .arg(self.config.path())
-            .env(DATABASE_ENV, &self.database_url)
+            .args(["admin", "login-link"])
+            .env("AXON_DATABASE_URL", &self.database_url)
+            .env("AXON_BASE_URL", &self.gateway.base)
             .env("RUST_LOG", "warn")
             .current_dir(MANIFEST_DIR)
             .output()
@@ -218,7 +212,7 @@ async fn a_login_link_opens_an_admin_session_once() {
     let page = resp.text().await.unwrap();
     assert!(page.contains("Link expired"), "{page}");
 
-    // Both steps are in the audit log.
+    // Both steps are in the audit log, after the import.
     let pool = sqlx::PgPool::connect(&h.database_url).await.unwrap();
     let rows: Vec<(String, String)> =
         sqlx::query_as("select action, actor from audit_log order by id")
@@ -229,6 +223,8 @@ async fn a_login_link_opens_an_admin_session_once() {
     assert_eq!(
         rows,
         [
+            // the harness imports the config file first
+            ("config.import".to_owned(), "cli".to_owned()),
             ("break_glass.link_created".to_owned(), "cli".to_owned()),
             ("break_glass.login".to_owned(), "break-glass".to_owned()),
         ]

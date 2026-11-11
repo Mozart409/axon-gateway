@@ -1081,8 +1081,8 @@ pub(super) async fn authenticate_oauth_token(
     let owner = &principal.owner;
     let policy = state.policy.current();
     // No configured provider for the issuer: no IdP mapping applies
-    let provider_id = oidc.id_for_issuer(&owner.issuer).unwrap_or("");
-    let groups = policy.groups_for(owner.id, provider_id, &owner.groups);
+    let provider_id = oidc.id_for_issuer(&owner.issuer).unwrap_or_default();
+    let groups = policy.groups_for(owner.id, &provider_id, &owner.groups);
     let opt_outs = store
         .opt_outs(owner.id)
         .await

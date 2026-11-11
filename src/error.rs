@@ -18,6 +18,11 @@ pub enum ConfigError {
     #[error("invalid TOML in config file")]
     ParseError(#[from] toml::de::Error),
 
+    #[error(
+        "{what} needs database mode: set AXON_DATABASE_URL and import this file with `axon-gateway admin import-config`"
+    )]
+    NeedsDatabaseMode { what: String },
+
     #[error("backends use the stdio transport but [gateway] allow_stdio is false: {names}")]
     StdioNotAllowed { names: String },
 

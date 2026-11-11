@@ -1,19 +1,41 @@
 # Every optional feature on, for `helm template` in `just axon-deploy-check`.
 replicaCount: 3
 
-config: |
-  [gateway]
-  bind = "0.0.0.0:8080"
-  base_url = "https://axon.example.com"
+# Database mode: no config ConfigMap, everything through environment.
+database:
+  enabled: true
+  existingSecret: axon-gateway-db
+  key: url
 
-  [database]
-  url_env = "AXON_DATABASE_URL"
+baseUrl: https://axon.example.com
+bind: "0.0.0.0:8080"
+allowStdio: false
 
-  [[backends]]
-  name = "docs"
-  url = "https://mcp.example.com/mcp"
-  transport = "http"
-  enabled = true
+oidc:
+  issuer: https://id.example.com
+  clientId: axon
+  id: sso
+  displayName: Example SSO
+  adminGroups:
+    - axon-admins
+  clientSecret:
+    existingSecret: axon-gateway-oidc
+    key: client-secret
+
+# The one-shot import hook, with a config that uses a ${VAR} reference.
+import:
+  enabled: true
+  dryRun: true
+  config: |
+    [gateway]
+    rate_limit_per_minute = 100
+
+    [[backends]]
+    name = "docs"
+    url = "https://mcp.example.com/mcp"
+    transport = "http"
+    enabled = true
+    auth_token = "${DOCS_TOKEN}"
 
 existingSecret: axon-gateway-env
 

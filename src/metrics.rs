@@ -419,11 +419,11 @@ pub fn describe_user_metrics() {
 mod tests {
     use super::*;
     use crate::auth::TokenIdentity;
-    use crate::policy::{OptOuts, Policy, RbacConfig};
+    use crate::policy::{OptOuts, Policy, RbacSnapshot};
     use crate::principal::{PrincipalPolicy, TokenScope};
 
     fn principal(label: &str, owner: Option<Uuid>, service: bool) -> Caller {
-        let effective = Policy::from_config(&RbacConfig::default()).effective(&[]);
+        let effective = Policy::from_snapshot(&RbacSnapshot::default()).effective(&[]);
         let policy = PrincipalPolicy::new(
             label.to_owned(),
             effective,

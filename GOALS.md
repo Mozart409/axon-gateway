@@ -9,7 +9,7 @@ A self-hosted MCP (Model Context Protocol) gateway written in Rust that aggregat
 1. **Single endpoint for all MCP servers** — Agents connect to one URL and get access to all homelab tools
 2. **Automatic namespacing** — Tools are prefixed with backend name to avoid collisions (e.g., `homeassistant_turn_on`)
 3. **Transport agnostic** — Support SSE, Streamable HTTP, and stdio backends
-4. **Minimal configuration** — Simple TOML config, no database required for basic usage
+4. **Minimal configuration** — Simple TOML config, no database required for basic usage; with a database, configuration lives there and is edited in the dashboard
 5. **Resilient** — Backend failures don't crash the gateway; automatic reconnection
 
 ## Architecture Decisions
@@ -60,7 +60,7 @@ Expose the gateway via Streamable HTTP (`POST /mcp`) as primary transport. SSE (
 
 ### Phase 3: Features ✅
 
-- [x] **Hot reload** — Watch config file, add/remove backends without restart
+- [x] **Hot reload** — Watch config file, add/remove backends without restart (database mode: applied on save, every replica within seconds)
 - [x] **Tool filtering** — `allowed_tools` config to expose subset of backend tools
 - [x] **Resource proxying** — Forward MCP `resources/list` and `resources/read`
 - [x] **Prompt proxying** — Forward MCP `prompts/list` and `prompts/get`

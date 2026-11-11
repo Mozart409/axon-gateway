@@ -119,11 +119,11 @@ mod tests {
     use super::*;
     use crate::auth::TokenIdentity;
     use crate::policy::OptOuts;
-    use crate::policy::{Policy, RbacConfig};
+    use crate::policy::{Policy, RbacSnapshot};
     use crate::principal::{PrincipalPolicy, TokenScope};
 
     fn principal(owner: Option<Uuid>) -> Caller {
-        let effective = Policy::from_config(&RbacConfig::default()).effective(&[]);
+        let effective = Policy::from_snapshot(&RbacSnapshot::default()).effective(&[]);
         let policy = PrincipalPolicy::new(
             String::from("config:ci"),
             effective,

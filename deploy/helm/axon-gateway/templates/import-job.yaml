@@ -1,0 +1,113 @@
+{{- if .Values.import.enabled }}
+{{- if not .Values.database.enabled }}
+{{- fail "import.enabled needs database.enabled: the import writes into the database" }}
+{{- end }}
+{{- $_ := required "kek.existingSecret is required when import.enabled" .Values.kek.existingSecret }}
+{{- /*
+  One-shot import of a config.toml (admin import-config). Both objects are
+  Helm hooks, so the ConfigMap exists before the Job on a first install. The
+  Job is kept after it finishes (hook-delete-policy before-hook-creation only)
+  because the new service-account tokens are on its log; the TTL removes it a
+  day later. The import runs before the Deployment is rolled, so a new
+  version's migrations run here first.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "axon-gateway.fullname" . }}-import
+  labels:
+    {{- include "axon-gateway.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  config.toml: |
+    {{- required "values.import.config (the config.toml text to import) is required" .Values.import.config | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "axon-gateway.fullname" . }}-import
+  labels:
+    {{- include "axon-gateway.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      # Not the selector labels of the Deployment: the Service must not route to
+      # this pod.
+      labels:
+        app.kubernetes.io/name: {{ include "axon-gateway.name" . }}-import
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: import
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - admin
+            - import-config
+            - /config/config.toml
+            {{- if .Values.import.dryRun }}
+            - --dry-run
+            {{- end }}
+          env:
+            {{- include "axon-gateway.databaseUrlEnv" . | nindent 12 }}
+            - name: AXON_KEK_FILE
+              value: /etc/axon-kek/{{ .Values.kek.key }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.existingSecret .Values.envFrom }}
+          envFrom:
+            {{- if .Values.existingSecret }}
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+            {{- end }}
+            {{- with .Values.envFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: kek
+              mountPath: /etc/axon-kek
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "axon-gateway.fullname" . }}-import
+        - name: tmp
+          emptyDir: {}
+        - name: kek
+          secret:
+            secretName: {{ .Values.kek.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.kek.key }}
+                path: {{ .Values.kek.key }}
+{{- end }}

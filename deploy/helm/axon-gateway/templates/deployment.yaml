@@ -23,10 +23,11 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- /*
-        No checksum/config annotation on purpose: the gateway watches the
-        mounted config file and hot-reloads it, so a config change must not
-        roll the pods. Secrets and env are only read at start, so changing
-        them needs `kubectl rollout restart`.
+        No checksum/config annotation on purpose: standalone, the gateway
+        watches the mounted config file and hot-reloads it, and in database
+        mode there is no file, so a config change must not roll the pods.
+        Secrets and env are only read at start, so changing them needs
+        `kubectl rollout restart`.
       */}}
       {{- with .Values.podAnnotations }}
       annotations:
@@ -53,8 +54,13 @@ spec:
               containerPort: 8080
               protocol: TCP
           env:
+            {{- if .Values.database.enabled }}
+            {{- $_ := required "kek.existingSecret is required when database.enabled" .Values.kek.existingSecret }}
+            {{- include "axon-gateway.databaseModeEnv" . | nindent 12 }}
+            {{- else }}
             - name: AXON_GATEWAY_CONFIG
               value: /etc/axon/config.toml
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
             {{- if .Values.logJson }}
@@ -105,9 +111,11 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            {{- if not .Values.database.enabled }}
             - name: config
               mountPath: /etc/axon
               readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
             {{- if .Values.kek.existingSecret }}
@@ -115,12 +123,19 @@ spec:
               mountPath: /etc/axon-kek
               readOnly: true
             {{- end }}
+            {{- if and .Values.database.enabled .Values.oidc.issuer .Values.oidc.clientSecret.existingSecret }}
+            - name: oidc-client-secret
+              mountPath: /etc/axon-oidc
+              readOnly: true
+            {{- end }}
       volumes:
+        {{- if not .Values.database.enabled }}
         # The whole ConfigMap is mounted as a directory (no subPath), so the
         # kubelet's atomic `..data` symlink swap reaches the hot-reload watcher.
         - name: config
           configMap:
             name: {{ include "axon-gateway.fullname" . }}-config
+        {{- end }}
         - name: tmp
           emptyDir: {}
         {{- if .Values.kek.existingSecret }}
@@ -131,6 +146,15 @@ spec:
             items:
               - key: {{ .Values.kek.key }}
                 path: {{ .Values.kek.key }}
+        {{- end }}
+        {{- if and .Values.database.enabled .Values.oidc.issuer .Values.oidc.clientSecret.existingSecret }}
+        - name: oidc-client-secret
+          secret:
+            secretName: {{ .Values.oidc.clientSecret.existingSecret }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.oidc.clientSecret.key }}
+                path: {{ .Values.oidc.clientSecret.key }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

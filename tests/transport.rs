@@ -372,7 +372,7 @@ async fn adding_a_backend_by_config_reload_sends_list_changed() {
     let before = ConfigBuilder::new(&bind)
         .http_backend("one", &one.url())
         .render();
-    let server = Gateway::start(&before, &base).await;
+    let mut server = Gateway::start(&before, &base).await;
 
     let recorder = Recorder::default();
     let client = connect(&format!("{base}/mcp"), None, &recorder).await;

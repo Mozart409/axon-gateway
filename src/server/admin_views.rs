@@ -14,7 +14,6 @@ use super::AppState;
 use super::views::{build_fingerprint, csrf_hx_headers, render_user_bar};
 use crate::policy::{
     GrantView, GroupView, Permission, Permissions, RoleBinding, RoleSource, RoleSubject, RoleView,
-    Source,
 };
 use crate::rbac::{ManagedUser, RoleEntry};
 use crate::store::{AuditRecord, ServiceAccount, SessionUser, User};
@@ -118,7 +117,7 @@ pub(super) struct RolesPage {
 pub(super) struct GroupDetail {
     pub access: Access,
     pub group: GroupView,
-    /// Ids of the users added by hand (database groups only)
+    /// Ids of the users added by hand
     pub members: Vec<Uuid>,
     pub users: Vec<User>,
     /// Service accounts that may be members too; empty without the permission to list them
@@ -128,9 +127,9 @@ pub(super) struct GroupDetail {
 }
 
 impl GroupDetail {
-    /// Whether the user may edit this group: config groups are read-only.
+    /// Whether the user may edit this group.
     fn editable(&self) -> bool {
-        self.access.manage_groups && self.group.source == Source::Local
+        self.access.manage_groups
     }
 }
 
@@ -164,22 +163,6 @@ fn group_href(name: &str) -> String {
     format!("/ui/admin/groups/{name}")
 }
 
-fn source_badge(source: Source) -> Markup {
-    let (label, classes) = match source {
-        Source::Config => (
-            "config",
-            "rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300",
-        ),
-        Source::Local => (
-            "local",
-            "rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
-        ),
-    };
-    html! {
-        span class=(classes) { (label) }
-    }
-}
-
 fn role_source_badge(source: RoleSource) -> Markup {
     match source {
         RoleSource::Builtin => html! {
@@ -187,8 +170,11 @@ fn role_source_badge(source: RoleSource) -> Markup {
                 "built-in"
             }
         },
-        RoleSource::Config => source_badge(Source::Config),
-        RoleSource::Local => source_badge(Source::Local),
+        RoleSource::Local => html! {
+            span class="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300" {
+                "local"
+            }
+        },
     }
 }
 
@@ -264,7 +250,7 @@ pub(super) fn render_admin_page(
                 "Admin"
             }
             p class=(format!("mt-2 {MUTED}")) {
-                "Groups, grants and role bindings. Entries from config.toml are read-only."
+                "Groups, grants and role bindings."
             }
             @if overview.access.read_audit {
                 p class="mt-3 text-sm" {
@@ -303,6 +289,17 @@ pub(super) fn render_admin_page(
             p class="mt-3 text-sm" {
                 a href="/ui/admin/roles" class=(LINK) { "Roles" }
             }
+            @if state.db_config.is_some() {
+                p class="mt-3 text-sm" {
+                    a href="/ui/admin/config/backends" class=(LINK) { "Backends" }
+                    " / "
+                    a href="/ui/admin/config/toolsets" class=(LINK) { "Toolsets" }
+                    " / "
+                    a href="/ui/admin/config/oidc-providers" class=(LINK) { "OIDC providers" }
+                    " / "
+                    a href="/ui/admin/config/settings" class=(LINK) { "Gateway settings" }
+                }
+            }
         }
         (render_flash_area(false))
         (render_groups_section(overview, false))
@@ -330,7 +327,6 @@ pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Mark
                         thead class=(THEAD) {
                             tr {
                                 th class=(TH) { "Name" }
-                                th class=(TH) { "Source" }
                                 th class=(TH) { "Description" }
                                 th class=(TH) { "IdP mappings" }
                                 th class=(TH) { "Members" }
@@ -344,7 +340,6 @@ pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Mark
                                             (row.group.name)
                                         }
                                     }
-                                    td class=(TD) { (source_badge(row.group.source)) }
                                     td class=(TD) {
                                         @if let Some(description) = &row.group.description {
                                             (description)
@@ -359,13 +354,7 @@ pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Mark
                                             }
                                         }
                                     }
-                                    td class=(TD) {
-                                        @if row.group.source == Source::Local {
-                                            (row.members)
-                                        } @else {
-                                            span class=(FAINT) { "-" }
-                                        }
-                                    }
+                                    td class=(TD) { (row.members) }
                                 }
                             }
                         }
@@ -439,7 +428,6 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                                 th class=(TH) { "Exclude" }
                                 th class=(TH) { "Read-only" }
                                 th class=(TH) { "Mandatory" }
-                                th class=(TH) { "Source" }
                                 @if manage {
                                     th class=(TH) { "Actions" }
                                 }
@@ -454,10 +442,9 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                                     td class=(TD) { (globs(&view.grant.exclude)) }
                                     td class=(TD) { (yes_no(view.grant.read_only)) }
                                     td class=(TD) { (yes_no(view.grant.mandatory)) }
-                                    td class=(TD) { (source_badge(view.source)) }
                                     @if manage {
                                         td class=(TD) {
-                                            @if let (Source::Local, Some(id)) = (view.source, view.id) {
+                                            @if let Some(id) = view.id {
                                                 button
                                                     class=(BUTTON_DANGER)
                                                     type="button"
@@ -549,7 +536,6 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
                             tr {
                                 th class=(TH) { "Role" }
                                 th class=(TH) { "Subject" }
-                                th class=(TH) { "Source" }
                                 @if manage {
                                     th class=(TH) { "Actions" }
                                 }
@@ -557,7 +543,6 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
                         }
                         tbody class=(TBODY) {
                             @for binding in &overview.bindings {
-                                @let source = if binding.id.is_some() { Source::Local } else { Source::Config };
                                 tr {
                                     td class=(TD) {
                                         code class=(CODE) { (binding.role) }
@@ -580,7 +565,6 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
                                             }
                                         }
                                     }
-                                    td class=(TD) { (source_badge(source)) }
                                     @if manage {
                                         td class=(TD) {
                                             @if let Some(id) = binding.id {
@@ -653,7 +637,7 @@ pub(super) fn render_roles_page(state: &AppState, user: &SessionUser, page: &Rol
             }
             p class=(format!("mt-2 {MUTED}")) {
                 "A role is a named set of permissions, given to groups and users by role bindings. "
-                "The built-in roles are fixed; roles from config.toml are read-only."
+                "The built-in roles are fixed."
             }
         }
         (render_flash_area(false))
@@ -826,11 +810,6 @@ pub(super) fn render_group_page(
             a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
             h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
                 (detail.group.name)
-                " "
-                (source_badge(detail.group.source))
-            }
-            @if detail.group.source == Source::Config {
-                p class=(format!("mt-2 {MUTED}")) { "Defined in config.toml, read-only." }
             }
         }
         (render_flash_area(false))
@@ -964,28 +943,22 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
     html! {
         section id="group-members" class=(CARD) {
             h2 class=(HEADING) { "Members" }
-            @if detail.group.source == Source::Config {
-                p class=(format!("mt-1 {MUTED}")) {
-                    "Members of a config group come from its IdP mappings only."
-                }
+            p class=(format!("mt-1 {MUTED}")) { "Users added by hand, besides the IdP mappings." }
+            @if detail.members.is_empty() {
+                p class=(format!("mt-4 text-sm {FAINT}")) { "No members added by hand." }
             } @else {
-                p class=(format!("mt-1 {MUTED}")) { "Users added by hand, besides the IdP mappings." }
-                @if detail.members.is_empty() {
-                    p class=(format!("mt-4 text-sm {FAINT}")) { "No members added by hand." }
-                } @else {
-                    ul class="mt-4 space-y-2 text-sm" {
-                        @for id in &detail.members {
-                            li class="flex items-center gap-3" {
-                                span { (member_label(detail, *id)) }
-                                @if editable {
-                                    form
-                                        hx-post=(format!("/ui/actions/admin/groups/{name}/members/remove"))
-                                        hx-target="#group-members"
-                                        hx-swap="outerHTML"
-                                    {
-                                        input type="hidden" name="user_id" value=(id);
-                                        button class=(BUTTON_SMALL) type="submit" { "Remove" }
-                                    }
+                ul class="mt-4 space-y-2 text-sm" {
+                    @for id in &detail.members {
+                        li class="flex items-center gap-3" {
+                            span { (member_label(detail, *id)) }
+                            @if editable {
+                                form
+                                    hx-post=(format!("/ui/actions/admin/groups/{name}/members/remove"))
+                                    hx-target="#group-members"
+                                    hx-swap="outerHTML"
+                                {
+                                    input type="hidden" name="user_id" value=(id);
+                                    button class=(BUTTON_SMALL) type="submit" { "Remove" }
                                 }
                             }
                         }
@@ -1235,11 +1208,10 @@ mod tests {
         }
     }
 
-    fn group(name: &str, description: Option<&str>, source: Source) -> GroupView {
+    fn group(name: &str, description: Option<&str>) -> GroupView {
         GroupView {
             name: name.to_owned(),
             description: description.map(str::to_owned),
-            source,
             idp: vec![IdpMapping {
                 provider: String::from("pocket"),
                 value: String::from("it-staff"),
@@ -1247,10 +1219,9 @@ mod tests {
         }
     }
 
-    fn grant(id: Option<i64>, group: &str, source: Source) -> GrantView {
+    fn grant(id: i64, group: &str) -> GrantView {
         GrantView {
-            id,
-            source,
+            id: Some(id),
             grant: GrantSummary {
                 group: group.to_owned(),
                 backend: String::from("files"),
@@ -1292,21 +1263,18 @@ mod tests {
             access,
             groups: vec![
                 GroupRow {
-                    group: group("ops", Some("Operations"), Source::Config),
+                    group: group("ops", Some("Operations")),
                     members: 0,
                 },
                 GroupRow {
-                    group: group("devs", Some("<b>Developers</b>"), Source::Local),
+                    group: group("devs", Some("<b>Developers</b>")),
                     members: 3,
                 },
             ],
-            grants: vec![
-                grant(None, "ops", Source::Config),
-                grant(Some(7), "devs", Source::Local),
-            ],
+            grants: vec![grant(5, "ops"), grant(7, "devs")],
             bindings: vec![
                 RoleBinding {
-                    id: None,
+                    id: Some(8),
                     role: String::from("auditor"),
                     subject: RoleSubject::Group(String::from("ops")),
                 },
@@ -1340,15 +1308,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_rows_are_read_only() {
+    async fn every_grant_and_binding_can_be_deleted() {
         let html = page(&overview(FULL));
 
-        // Only the local grant and binding have a delete button.
-        assert_eq!(html.matches("/delete\"").count(), 2);
+        assert_eq!(html.matches("/delete\"").count(), 4);
+        assert!(html.contains("/ui/actions/admin/grants/5/delete"));
         assert!(html.contains("/ui/actions/admin/grants/7/delete"));
+        assert!(html.contains("/ui/actions/admin/role-bindings/8/delete"));
         assert!(html.contains("/ui/actions/admin/role-bindings/9/delete"));
-        assert!(html.contains(">config<"));
-        assert!(html.contains(">local<"));
         // Subjects are named by email when the user is known.
         assert!(html.contains("bob@example.com"));
     }
@@ -1377,21 +1344,19 @@ mod tests {
             access,
             roles: vec![
                 entry("auditor", RoleSource::Builtin, 2),
-                entry("from-config", RoleSource::Config, 0),
                 entry("log-reader", RoleSource::Local, 3),
             ],
         }
     }
 
     #[tokio::test]
-    async fn only_database_roles_can_be_edited_or_deleted() {
+    async fn only_custom_roles_can_be_edited_or_deleted() {
         let html =
             render_roles_page(&test_state(), &session(true), &roles_page(FULL)).into_string();
 
         assert!(html.contains("/ui/actions/admin/roles/log-reader/update"));
         assert!(html.contains("/ui/actions/admin/roles/log-reader/delete"));
         assert!(!html.contains("/ui/actions/admin/roles/auditor/"));
-        assert!(!html.contains("/ui/actions/admin/roles/from-config/"));
         assert!(html.contains("hx-post=\"/ui/actions/admin/roles\""));
         assert!(html.contains("also delete its 3 binding(s)"));
         assert!(html.contains(">built-in<"));
@@ -1407,10 +1372,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_group_page_has_no_forms() {
+    async fn a_group_page_without_the_permission_has_no_forms() {
         let detail = GroupDetail {
-            access: FULL,
-            group: group("ops", None, Source::Config),
+            access: AUDITOR,
+            group: group("ops", None),
             members: Vec::new(),
             users: vec![user(1, "bob@example.com")],
             accounts: Vec::new(),
@@ -1418,15 +1383,14 @@ mod tests {
         };
         let html = render_group_page(&test_state(), &session(true), &detail).into_string();
 
-        assert!(html.contains("read-only"));
         assert!(!html.contains("hx-post"));
     }
 
     #[tokio::test]
-    async fn local_group_page_offers_edits() {
+    async fn group_page_offers_edits() {
         let detail = GroupDetail {
             access: FULL,
-            group: group("devs", None, Source::Local),
+            group: group("devs", None),
             members: vec![Uuid::from_u128(1)],
             users: vec![user(1, "bob@example.com"), user(2, "eve@example.com")],
             accounts: vec![ServiceAccount {
@@ -1473,7 +1437,6 @@ mod tests {
             group: GroupView {
                 name: String::from("<i>x</i>"),
                 description: Some(String::from("<script>alert(1)</script>")),
-                source: Source::Local,
                 idp: vec![IdpMapping {
                     provider: String::from("pocket"),
                     value: String::from("\"><img src=x>"),

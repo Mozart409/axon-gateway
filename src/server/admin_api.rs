@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use super::{AppState, reject_cross_site_middleware, session};
 use crate::policy::{
-    GrantConfig, GrantView, GroupView, Permission, RoleBinding, RoleSource, RoleSubject, Source,
+    GrantConfig, GrantView, GroupView, Permission, RoleBinding, RoleSource, RoleSubject,
 };
 use crate::rbac::{Admin, AdminError, ManagedUser, RoleEntry, resolve};
 use crate::store::{AuditRecord, SessionUser};
@@ -33,6 +33,9 @@ const DEFAULT_USERS_LIMIT: i64 = 100;
 const MAX_USERS_LIMIT: i64 = 500;
 const DEFAULT_AUDIT_LIMIT: i64 = 50;
 const MAX_AUDIT_LIMIT: i64 = 200;
+
+/// The `source` of every group, grant and binding: they all live in the database
+const LOCAL_SOURCE: &str = "local";
 
 pub(super) type ApiResult<T> = Result<T, ApiError>;
 
@@ -207,18 +210,11 @@ pub(super) async fn admin<'a>(state: &'a AppState, session: &SessionUser) -> Api
         .ok_or_else(|| AdminError::NotFound.into())
 }
 
-fn source_name(source: Source) -> &'static str {
-    match source {
-        Source::Config => "config",
-        Source::Local => "local",
-    }
-}
-
 fn group_json(group: &GroupView) -> Value {
     json!({
         "name": group.name,
         "description": group.description,
-        "source": source_name(group.source),
+        "source": LOCAL_SOURCE,
         "idp_mappings": group
             .idp
             .iter()
@@ -230,7 +226,7 @@ fn group_json(group: &GroupView) -> Value {
 fn grant_json(view: &GrantView) -> Value {
     json!({
         "id": view.id,
-        "source": source_name(view.source),
+        "source": LOCAL_SOURCE,
         "group": view.grant.group,
         "backend": view.grant.backend,
         "include": view.grant.include,
@@ -245,14 +241,9 @@ fn binding_json(binding: &RoleBinding) -> Value {
         RoleSubject::Group(group) => (Some(group.as_str()), None),
         RoleSubject::User(user_id) => (None, Some(*user_id)),
     };
-    let source = if binding.id.is_some() {
-        Source::Local
-    } else {
-        Source::Config
-    };
     json!({
         "id": binding.id,
-        "source": source_name(source),
+        "source": LOCAL_SOURCE,
         "role": binding.role,
         "group": group,
         "user_id": user_id,
@@ -262,8 +253,7 @@ fn binding_json(binding: &RoleBinding) -> Value {
 fn role_json(entry: &RoleEntry) -> Value {
     let source = match entry.role.source {
         RoleSource::Builtin => "builtin",
-        RoleSource::Config => "config",
-        RoleSource::Local => source_name(Source::Local),
+        RoleSource::Local => LOCAL_SOURCE,
     };
     json!({
         "name": entry.role.name,
@@ -368,7 +358,7 @@ async fn handle_create_group(
     let group = json!({
         "name": body.name,
         "description": description,
-        "source": source_name(Source::Local),
+        "source": LOCAL_SOURCE,
         "idp_mappings": [],
         "members": [],
     });
@@ -570,7 +560,7 @@ async fn handle_delete_role_binding(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /api/v1/admin/roles`: built-in, config and database roles
+/// `GET /api/v1/admin/roles`: built-in and custom roles
 async fn handle_list_roles(
     State(state): State<AppState>,
     Extension(session): Extension<SessionUser>,

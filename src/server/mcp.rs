@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
+    body::Body,
     extract::{RawPathParams, Request, State},
     http::{StatusCode, header},
     middleware::Next,
@@ -214,7 +215,7 @@ fn session_store_unavailable() -> Response {
 /// know a session id restores it from there. Without one they live in this process
 /// only. Replies are plain JSON rather than an event stream, and `mcp_allowed_hosts`
 /// guards against DNS rebinding.
-pub(super) fn mcp_service(state: &AppState) -> StreamableHttpService<AxonMcp, LocalSessionManager> {
+pub(super) fn mcp_service(state: &AppState) -> McpService {
     crate::metrics::describe_mcp_metrics();
     let handler = AxonMcp {
         state: state.clone(),
@@ -222,15 +223,38 @@ pub(super) fn mcp_service(state: &AppState) -> StreamableHttpService<AxonMcp, Lo
     let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(true)
         .with_json_response(true)
-        .with_allowed_hosts(state.mcp_allowed_hosts.clone());
+        .disable_allowed_hosts();
     if let Some(store) = &state.store {
         config.session_store = Some(Arc::new(PgSessionStore(store.clone())));
     }
-    StreamableHttpService::new(
-        move || Ok(handler.clone()),
-        Arc::new(LocalSessionManager::default()),
-        config,
-    )
+    McpService {
+        inner: StreamableHttpService::new(
+            move || Ok(handler.clone()),
+            Arc::new(LocalSessionManager::default()),
+            config,
+        ),
+        allowed_hosts: Arc::clone(&state.mcp_allowed_hosts),
+    }
+}
+
+/// The rmcp service with the allowed `Host` values read per request, so a
+/// configuration reload takes effect without rebuilding the service (and
+/// dropping its sessions)
+#[derive(Clone)]
+pub(super) struct McpService {
+    inner: StreamableHttpService<AxonMcp, LocalSessionManager>,
+    allowed_hosts: Arc<std::sync::RwLock<Vec<String>>>,
+}
+
+impl McpService {
+    pub(super) async fn handle(&self, request: Request) -> Response {
+        let mut service = self.inner.clone();
+        service.config.allowed_hosts = self.allowed_hosts.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |hosts| hosts.clone(),
+        );
+        service.handle(request).await.map(Body::new)
+    }
 }
 
 /// The MCP handler: asks the gateway actor for everything and relays its answer.

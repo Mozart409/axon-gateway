@@ -145,6 +145,7 @@ fn base_url(state: &AppState, provider: &str) -> String {
 
 async fn load(state: &AppState, session: &SessionUser) -> Result<Vec<Row>, AdminError> {
     let (store, providers) = authorize(state, session)?;
+    let providers = providers.list();
     let ids: Vec<String> = providers
         .iter()
         .map(|provider| provider.id().to_owned())

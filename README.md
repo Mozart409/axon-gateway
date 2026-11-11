@@ -10,7 +10,7 @@ A lightweight, self-hosted MCP (Model Context Protocol) gateway that aggregates 
 - **Streamable HTTP**: Clients connect per the MCP spec and hear `notifications/tools/list_changed` when their tools change
 - **Multi-token auth**: Named API tokens with fine-grained permissions (allowed tools/backends)
 - **Toolsets**: Expose subsets of tools via different path prefixes
-- **Hot reload**: Config file watching with automatic backend updates; Kubernetes ConfigMap updates (the `..data` symlink swap) are picked up too
+- **Hot reload**: Config file watching with automatic backend updates; Kubernetes ConfigMap updates (the `..data` symlink swap) are picked up too. With a database the configuration lives there instead and every replica applies a change within seconds (see [Database mode](#database-mode))
 - **Prometheus metrics**: Built-in metrics endpoint for monitoring
 - **Resource/Prompt proxying**: Forward MCP resources and prompts from backends
 - **Auto-reconnect**: Exponential backoff reconnection with circuit breaker
@@ -71,6 +71,9 @@ cargo run -- config.toml
 MCP_GATEWAY_CONFIG=config.toml cargo run
 ```
 
+This is standalone mode. For users, RBAC and a configuration that lives in
+Postgres, see [Database mode](#database-mode).
+
 3. **Connect your agent** to the gateway:
 
 ```json
@@ -100,6 +103,10 @@ podman compose -f compose.yml up -d   # or: docker compose
 Mount your config read-only at `/app/config.toml` and pass it as the command
 argument (both example files already do this).
 
+In [database mode](#database-mode) mount no config: set `AXON_DATABASE_URL`, a KEK
+and the other variables of that section, and start the container without the
+file argument.
+
 > **Healthcheck note:** the runtime image is the minimal Chainguard
 > `wolfi-base`, which ships **no HTTP client** — no `curl`, no `wget`, and its
 > busybox has no `wget` applet. The Compose healthchecks probe `/health` with
@@ -121,22 +128,30 @@ argument (both example files already do this).
 
 ## Kubernetes (Helm)
 
-The chart is in [`deploy/helm/axon-gateway`](deploy/helm/axon-gateway). The
-gateway config is raw TOML in the `config` value; secrets are not part of it.
-`existingSecret` names a Secret whose keys all become environment variables
-(`AXON_DATABASE_URL`, client secrets, backend tokens), `env` and `envFrom` add
-more, and `kek.existingSecret` mounts the key-encryption key as a file for
-`AXON_KEK_FILE`. Roll the pods after changing a Secret. Exposure is a Gateway
-API `HTTPRoute` (there is no Ingress). A `ServiceMonitor`, a `PrometheusRule`
-and a Grafana dashboard ConfigMap are optional, and all off by default:
+The chart is in [`deploy/helm/axon-gateway`](deploy/helm/axon-gateway). It runs
+in one of the two modes. Database mode (`database.enabled`) is configured with
+environment variables: the database URL comes from a Secret, the KEK is mounted
+from a Secret as a file, and no config file is mounted. Backends, toolsets and
+providers are then managed in the dashboard. Standalone mode (the default) takes
+the gateway config as raw TOML in the `config` value. Secrets are never part of
+it: `existingSecret` names a Secret whose keys all become environment
+variables (client secrets, backend tokens), and `env` and `envFrom` add more.
+Roll the pods after changing a Secret. Exposure is a Gateway API `HTTPRoute`
+(there is no Ingress). A `ServiceMonitor`, a `PrometheusRule` and a Grafana
+dashboard ConfigMap are optional, and all off by default.
 
 ```yaml
-config: |
-  [gateway]
-  base_url = "https://axon.example.com"
-  [database]
-  url_env = "AXON_DATABASE_URL"
-existingSecret: axon-gateway-env
+# database mode
+database:
+  enabled: true
+  existingSecret: {name: axon-db, key: url}   # the AXON_DATABASE_URL
+kek:
+  existingSecret: axon-kek                    # mounted for AXON_KEK_FILE
+baseUrl: https://axon.example.com
+oidc:                                          # optional bootstrap provider
+  issuer: https://id.example.com
+  clientId: axon
+  adminGroups: [axon-admins]
 httpRoute:
   enabled: true
   parentRefs: [{name: public-gateway}]
@@ -145,6 +160,14 @@ serviceMonitor: {enabled: true}
 prometheusRule: {enabled: true}
 grafanaDashboard: {enabled: true}
 ```
+
+To move an existing `config.toml` into the database, set `import.enabled` and
+give the file as `import.config`: a `pre-install,pre-upgrade` hook Job runs
+`axon-gateway admin import-config` on it. It is off by default, and it prints
+the new service-account tokens to the Job log once, so read them there and turn
+the value off again (see [Migrating a config file](#migrating-a-config-file)).
+The values are documented in the chart's
+[README](deploy/helm/axon-gateway/README.md).
 
 ```bash
 helm install axon deploy/helm/axon-gateway -f my-values.yaml
@@ -174,7 +197,7 @@ has the same dashboard JSON and Prometheus rules.
 | `/ui/actions/backends/{name}/reconnect` | POST   | HTMX action: reconnect backend                      |
 | `/ui/actions/backends/{name}/disable`   | POST   | HTMX action: disable backend                        |
 | `/ui/actions/backends/{name}/enable`    | POST   | HTMX action: enable backend                         |
-| `/ui/actions/reload`                    | POST   | HTMX action: reload config                          |
+| `/ui/actions/reload`                    | POST   | HTMX action: reload config (standalone mode only)   |
 | `/ui/tools`                             | GET    | "My tools" page (multi-user mode)                   |
 | `/ui/tokens`                            | GET    | Personal access tokens page (multi-user mode)       |
 | `/api/v1/...`                           | any    | JSON admin API for RBAC (multi-user mode, see RBAC) |
@@ -212,7 +235,7 @@ The gateway sends `notifications/tools/list_changed` to the callers a change
 concerns, after a short debounce so a burst becomes one notification:
 
 - a backend connects, disconnects or changes its tools (every caller)
-- a grant, group or role changes, in config or the database (every caller)
+- a grant, group or role changes (every caller)
 - a user changes their opt-outs or toolsets (that user's callers)
 
 Progress notifications and cancellation pass through to the backend that runs
@@ -294,6 +317,11 @@ When your agent calls `homeassistant_turn_on`, the gateway:
 
 ## Authentication
 
+Standalone mode only: in [database mode](#database-mode) there is no shared
+token and no `[[tokens]]`, callers use personal access tokens and service
+accounts (see [RBAC](#rbac)), and `axon-gateway admin import-config` turns the
+`[[tokens]]` of an old file into service accounts.
+
 ### Simple Token Auth
 
 Enable auth by setting `auth_token` in config:
@@ -364,7 +392,8 @@ Semantics:
   one row per token and minute, aligned to the wall-clock minute), so the limit
   holds across all replicas.
 - **Personal access tokens and service-account tokens** are limited by the
-  global `[gateway] rate_limit_per_minute` too.
+  global `rate_limit_per_minute` too (a gateway setting in the dashboard and
+  the API in database mode).
 - **Fail-open**: if the counter cannot be updated, the request is let through
   and a warning is logged. The limit protects the backends; it is not an access
   check.
@@ -388,25 +417,182 @@ tools = ["*_read", "*_list", "*_get"]
 description = "Read-only operations"
 ```
 
-Access a toolset at `/mcp/toolset/{toolset_name}` instead of `/mcp`.
+Access a toolset at `/mcp/toolset/{toolset_name}` instead of `/mcp`. In
+database mode the same fields are managed under `/ui/admin/config/toolsets`.
 
 `[[groups]]`, `/mcp/group/{name}` and `/status/groups` are deprecated aliases
 (`groups` now means RBAC groups) and will be removed after one minor release.
 
-## Database
+## Database mode
 
-An optional Postgres store; without a `[database]` section the gateway runs
-standalone. The connection URL is read from an environment variable, never from
-the config file, and migrations run at startup. The section is not
-hot-reloadable: changes need a restart.
+The gateway runs in one of two modes, chosen by the environment:
 
-```toml
-[database]
-url_env = "AXON_DATABASE_URL" # default
+- **Standalone**: `AXON_DATABASE_URL` is not set. The gateway reads the TOML
+  file (see the sections below), watches it for changes and has no users, no
+  RBAC and no sessions. The file may not carry `[database]`, `[[auth.oidc]]`,
+  `[rbac]` or a per-user backend (`credential_mode` other than `shared`): such
+  a file is refused at load with a message that points here.
+- **Database mode**: `AXON_DATABASE_URL` is set. Everything that used to be
+  the file lives in Postgres and is managed in the dashboard or through the
+  API: shared backends, gateway toolsets, OIDC providers and the global
+  settings, next to the groups, grants and roles of [RBAC](#rbac). Database
+  mode is always multi-user. The gateway reads **no config file**: if one is
+  named anyway (argument or `AXON_GATEWAY_CONFIG`) it exits and says to import
+  the file once and start without it. Migrations run at startup.
+  A change to where a backend or provider connects (transport, URL, command,
+  arguments, passthrough provider, OIDC issuer) is refused unless its stored
+  secrets are entered again or cleared in the same request.
+
+The bootstrap settings can not live in the database (the gateway needs them to
+reach it), so they are environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AXON_DATABASE_URL` | none | Postgres URL; setting it selects database mode |
+| `AXON_KEK_FILE` or `AXON_KEK` | none, required | key-encryption key (a path, or the text); backend and provider secrets are sealed with it, see Encryption under [Personal MCP servers](#personal-mcp-servers-and-the-catalog) |
+| `AXON_BASE_URL` | `http://localhost:8080` | public URL, used for OIDC redirects and links |
+| `AXON_BIND` | `0.0.0.0:8080` | listen address |
+| `AXON_ALLOW_STDIO` | off | `true` or `1` lets stdio backends run. Only this switch turns it on; the dashboard and the API cannot |
+| `AXON_OIDC_ISSUER` | none | with it, a bootstrap OIDC provider is configured |
+| `AXON_OIDC_CLIENT_ID` | none | its client id; required with the issuer |
+| `AXON_OIDC_CLIENT_SECRET_FILE` | none | file with its client secret (content trimmed); leave it out for a public PKCE client |
+| `AXON_OIDC_ADMIN_GROUPS` | none | comma separated groups whose members are admins |
+| `AXON_OIDC_ID` | `sso` | its id (used in URLs) |
+| `AXON_OIDC_DISPLAY_NAME` | the id | its login button label |
+
+The bootstrap provider uses the defaults of every other provider key. It is
+listed first in the dashboard with source `env` and is read-only there. A
+provider in the database with the same id is ignored, and the gateway warns.
+
+`/readyz` also pings the database and returns 503 (`database unreachable`)
+when it does not answer within 2 s.
+
+### First start
+
+A new database needs only the environment: the database URL, a KEK
+(`pwgen -s 48 1` makes one), the base URL, and optionally the bootstrap
+provider.
+
+```sh
+export AXON_DATABASE_URL=postgres://axon:...@db/axon
+export AXON_KEK_FILE=/run/secrets/axon-kek
+export AXON_BASE_URL=https://axon.example.com
+export AXON_OIDC_ISSUER=https://id.example.com
+export AXON_OIDC_CLIENT_ID=axon
+export AXON_OIDC_CLIENT_SECRET_FILE=/run/secrets/axon-oidc-secret
+export AXON_OIDC_ADMIN_GROUPS=axon-admins
+axon-gateway
 ```
 
-When configured, `/readyz` also pings the database and returns 503
-(`database unreachable`) when it does not answer within 2 s.
+With a bootstrap provider, members of `AXON_OIDC_ADMIN_GROUPS` log in and are
+admins. Without any provider, the way in is the break-glass link: run
+`axon-gateway admin login-link` (same environment, see
+Break-glass login under [RBAC](#rbac)), open the printed URL and add a provider and
+backends on the admin pages. The gateway starts with no backends, and a
+database with no OIDC provider has no other login.
+
+### Managing the configuration
+
+Admins with the right permission edit the configuration under `/ui/admin`
+(Backends, Toolsets, OIDC providers and Settings, linked from the admin page)
+or through the JSON API. Backends and gateway toolsets need `backends.manage`
+to write and `backends.view` or `backends.manage` to read; OIDC providers and
+the settings need `gateway.admin`. The `admin` role holds both. A stdio
+backend can only be saved while the gateway runs with `AXON_ALLOW_STDIO=true`
+(otherwise 400). Every write is validated against the whole configuration
+before it is stored, so a 400 carries the first problem, and every write is
+audited in its transaction (`backend.create|update|delete`,
+`toolset.create|update|delete`, `oidc_provider.create|update|delete`,
+`settings.update`; the details name the secret keys that changed, never a
+value).
+
+The API uses the session cookie and CSRF token like the RBAC API, and answers
+404 outside database mode.
+
+| Endpoint | Method | Needs |
+| --- | --- | --- |
+| `/api/v1/admin/config/backends` | GET, POST | reads `backends.view` or `backends.manage`; writes `backends.manage` |
+| `/api/v1/admin/config/backends/{name}` | GET, PUT, DELETE | as above |
+| `/api/v1/admin/config/toolsets` | GET, POST | as the backends |
+| `/api/v1/admin/config/toolsets/{name}` | GET, PUT, DELETE | as the backends |
+| `/api/v1/admin/config/oidc-providers` | GET, POST | `gateway.admin` |
+| `/api/v1/admin/config/oidc-providers/{id}` | GET, PUT, DELETE | `gateway.admin` |
+| `/api/v1/admin/config/settings` | GET, PUT | `gateway.admin` |
+
+The bodies use the TOML key names (`url`, `transport`, `enabled`, `headers`,
+`oauth`, ... for a backend; `issuer`, `client_id`, `scopes`, `admin_groups`, ...
+for a provider; `rate_limit_per_minute`, `allowed_hosts`, `idle_timeout_secs`
+and `personal_backends` for the settings). Toolsets here are the gateway's
+`[[toolsets]]`, not the per-user ones.
+
+**Secrets.** A backend's `auth_token`, its `headers` and `env` values and its
+OAuth client secret (`oauth_client_secret`), and a provider's `client_secret`,
+are sealed in the database with the KEK. They are write-only: responses carry
+only `auth_token_set`, `oauth_client_secret_set`, `client_secret_set` and, for
+the maps, the key names with the value `"set"`. On `PUT`, a secret field that
+is absent or `null` keeps the stored value, `""` clears it, and any other value
+sets it. In `headers` and `env`, a key with the value `null` keeps its stored
+value and a key left out is removed. `POST` takes the values as given. All
+header and env values count as secrets. A secret that cannot be unsealed (a
+KEK that was dropped before `rewrap-secrets`) skips that row with a warning
+instead of stopping the gateway.
+
+**Applying a change.** Every write fires a `config` notification on the
+`axon_changes` channel. Every replica, the one that took the write included,
+reloads the configuration from the database within seconds: it restarts the
+backends whose config changed (not only the added and removed ones), and
+updates the toolsets, the idle timeout, the rate limit, the allowed hosts and
+the OIDC providers. A poll of the stored config version every 30 seconds is the
+backstop when a notification is lost. There is no file watcher and no
+"reload config" button in database mode.
+
+Two things need a restart: the environment settings above, and the
+`personal_backends` settings (they apply to live per-user connections, so they
+are read at startup).
+
+### Migrating a config file
+
+`axon-gateway admin import-config <file> [--dry-run]` writes an existing
+`config.toml` into the database, with the same environment as the gateway
+(database URL and KEK). It loads the file like the gateway does (`${VAR}`
+references, the `.env` next to it, `client_secret_env`), so the secrets the
+file refers to must be set where you run it. It runs in one transaction and
+the file wins: it creates what is missing and updates what differs.
+
+Imported: the gateway settings (`rate_limit_per_minute`, `allowed_hosts`,
+`idle_timeout_secs`), `[personal_backends]`, `[[backends]]` with their
+secrets, `[[toolsets]]`, `[[auth.oidc]]` providers, and the RBAC parts:
+groups, IdP mappings, grants (added when no identical one exists), custom
+roles, role bindings, and the `service_accounts` listed in `[[rbac.groups]]`
+(the account is created when missing, then made a member). Each `[[tokens]]`
+entry becomes a service account of that name, created when missing, with a
+fresh token. Its `allowed_tools` and `allowed_backends` are not carried over:
+what it may call comes from its groups.
+
+```sh
+axon-gateway admin import-config config.toml --dry-run   # report, write nothing
+axon-gateway admin import-config config.toml > tokens.tsv
+```
+
+The summary (created, updated and unchanged per kind) and all warnings go to
+stderr. `--dry-run` rolls the transaction back and only reports. A real run
+records one `config.import` audit entry with the counts.
+
+New tokens are the only thing on **stdout**: one line per service account,
+`name<TAB>axon_pat_...`. A token is shown once and cannot be read back, so
+capture it. It expires after the service-token lifetime (365 days, the note on
+stderr gives the date): plan to rotate it. An existing account gets no new
+token.
+
+Warnings name the keys that are environment-only now and are not imported:
+`[gateway]` `bind`, `base_url`, `auth_token` (use a service account token) and
+`allow_stdio`, and `[database]`. Set `AXON_BIND`, `AXON_BASE_URL`,
+`AXON_ALLOW_STDIO` and `AXON_DATABASE_URL` instead. The import does not remove
+anything: rows that are not in the file stay.
+
+After the import, start the gateway without the file. An import can be repeated
+to bring a file's changes in again; once the dashboard is the source of truth,
+do not.
 
 ## Multiple replicas
 
@@ -415,22 +601,23 @@ need no sticky routing.
 
 Changes fan out through Postgres. Triggers run `NOTIFY axon_changes` when
 groups, IdP mappings, memberships, grants or role bindings change (payload kind
-`policy`), when a user's opt-outs, toolsets or personal servers change (kind `user`), and when the catalog changes (kind `catalog`). Every
-replica LISTENs on the channel: a policy notice reloads its policy, and a user
+`policy`), when a user's opt-outs, toolsets or personal servers change (kind `user`), when the catalog changes (kind `catalog`), and when the configuration of [database mode](#database-mode) changes (kind `config`). Every
+replica LISTENs on the channel: a policy notice reloads its policy, a config notice reloads the
+configuration, and a user
 notice sends `notifications/tools/list_changed` to that user's MCP clients.
 Changes made with `axon-gateway admin` or straight in SQL propagate the same way.
 Payloads name the schema and replicas ignore other schemas, so gateways in
 different schemas can share one database.
 
 If the listen connection drops, the replica reloads its policy and tells all
-clients their tool list may have changed. The 30-second policy poll stays as a
-backstop.
+clients their tool list may have changed. The 30-second policy poll and a
+30-second poll of the configuration version stay as the backstop.
 
 With a database, MCP session state for `2025-06-18` and `2025-11-25` is stored
 in the `mcp_sessions` table, keyed by the SHA-256 of the session id. Any replica
 can serve such a session, and one that does not know it restores it from the
-database. Each session is bound to the principal that opened it (user, config
-service account, legacy token or open), and another principal gets HTTP 404.
+database. Each session is bound to the principal that opened it (user, service
+account, legacy token or open), and another principal gets HTTP 404.
 Sessions unused for 24 hours are purged. Without a database, sessions and their
 binding live in the process only. `2026-07-28` requests are stateless and need
 nothing shared.
@@ -449,10 +636,18 @@ call travel on the connection that made the call.
 
 ## Dashboard login (OIDC)
 
-Multi-user mode turns on with a `[database]` section plus at least one
-`[[auth.oidc]]` provider; any OIDC provider works (Entra ID, Pocket ID,
-Keycloak, ...). Register `{base_url}/auth/callback` as the redirect URI and
-`{base_url}/` as the post-logout redirect.
+Multi-user mode is [database mode](#database-mode). Dashboard login needs at
+least one OIDC provider (without one, only the break-glass link gets in); any
+OIDC provider works (Entra ID, Pocket ID, Keycloak, ...). Register
+`{base_url}/auth/callback` as the redirect URI and `{base_url}/` as the
+post-logout redirect.
+
+Providers are managed under `/ui/admin/config/oidc-providers` and the API of
+[Database mode](#database-mode), or set up once with `AXON_OIDC_*` variables.
+The client secret is sealed in the database. The TOML below shows the keys; it
+is also the file format `admin import-config` reads, with
+`client_secret_env` resolved at import time. A standalone file may not carry
+`[[auth.oidc]]`.
 
 ```toml
 [[auth.oidc]]
@@ -481,7 +676,7 @@ groups instead.
 | --- | --- | --- |
 | `id`, `issuer`, `client_id` | required | provider id (used in URLs), issuer URL, client id |
 | `display_name` | the id | login button label |
-| `client_secret_env` | none (public PKCE client) | env var with the client secret |
+| `client_secret_env` (file import) | none (public PKCE client) | env var with the client secret; in the dashboard and the API the field is `client_secret` |
 | `scopes` | `openid`, `profile`, `email` | requested scopes |
 | `groups_claim` | `groups` | ID-token claim with the groups, dotted paths allowed |
 | `allowed_email_domains` | none | only these (verified) email domains may log in |
@@ -547,13 +742,11 @@ backend outside the policy is listed nowhere. Without a valid token in
 multi-user mode the endpoints answer 401 with `WWW-Authenticate: Bearer`. In
 multi-user mode the shared `gateway.auth_token` is refused (401) and the
 gateway warns at startup that it is ignored. Use service accounts instead, and
-`axon-gateway admin login-link` for emergencies. A `[[tokens]]` entry becomes a
-service account declared in config, under RBAC like any other principal. It
-gets the tools of the config groups that list its `name` in
-`service_accounts`, narrowed by its `allowed_tools` and `allowed_backends`. A
-token in no group can call nothing, and the gateway warns about it at startup.
-Its rate limit still applies. Logs name it `config:<name>`. Standalone (no
-`[database]`), `auth_token` and `[[tokens]]` behave as before.
+`axon-gateway admin login-link` for emergencies. Groups, IdP mappings, grants,
+roles and bindings live in the database and are managed in the dashboard and
+the API; the TOML below is the shape `admin import-config` reads from an old
+file (see [Migrating a config file](#migrating-a-config-file)). A `[[tokens]]`
+entry in such a file becomes a service account.
 
 ```toml
 [[rbac.groups]]
@@ -587,9 +780,8 @@ in and fixed:
 
 #### Custom roles
 
-A custom role is a named set of permissions. Declare it in `config.toml`, or
-create it at runtime on `/ui/admin/roles` or through the API; bind it like a
-built-in one, by name:
+A custom role is a named set of permissions. Create it on `/ui/admin/roles` or
+through the API, or import it from a file; bind it like a built-in one, by name:
 
 ```toml
 [[rbac.roles]]
@@ -602,14 +794,14 @@ role = "log-reader"
 group = "it"
 ```
 
-A role binding in config may name a built-in or a `[[rbac.roles]]` role; an
-unknown name is a startup error. These are the permissions a role may carry:
+An imported role binding may name a built-in or a `[[rbac.roles]]` role; an
+unknown name fails the import. These are the permissions a role may carry:
 
 | Permission | Allows |
 | --- | --- |
-| `gateway.admin` | Gateway settings, reload, break-glass operations |
+| `gateway.admin` | Gateway settings, OIDC providers, break-glass operations |
 | `backends.view` | See shared backends and their status |
-| `backends.manage` | Create, edit and disable shared backends |
+| `backends.manage` | Create, edit and disable shared backends and gateway toolsets |
 | `catalog.manage` | Publish and edit catalog templates |
 | `personal_backends.create` | Add personal MCP servers |
 | `users.manage` | Disable users, assign roles, see users |
@@ -620,8 +812,7 @@ unknown name is a startup error. These are the permissions a role may carry:
 | `audit.read` | Audit log and usage views (metadata only) |
 | `audit.read_sensitive` | Read recorded tool arguments |
 
-Roles from `config.toml` are read-only, like other config entries (a write
-answers 409), and so are the built-in ones. A role binding that names a role
+The built-in roles are read-only. A role binding that names a role
 that no longer exists (a deleted custom role) grants nothing.
 
 No one can hand out more than they hold:
@@ -643,24 +834,22 @@ An admin holds everything, so the rule only limits delegates: someone with just
 | `/api/v1/admin/permissions` | GET | as the role list |
 
 `GET` lists `{"roles": [{name, description, source, permissions, bindings}]}`
-with `source` `builtin`, `config` or `local` and `bindings` the number of
+with `source` `builtin` or `local` and `bindings` the number of
 bindings that name the role. `POST` takes `{"name", "description",
 "permissions": [...]}` and answers 201; `PUT` replaces `description` (missing or
 null clears it, at most 500 characters) and `permissions` of a `local` role.
 `DELETE` answers 204, or 409 while bindings name the role; with `?force=true` it
 deletes those bindings too. Errors: 400 for a bad name or an unknown or empty
 permission list, 403 without `roles.manage` or for a permission the caller does
-not hold, 404 for an unknown role, 409 for a built-in, config or existing name.
+not hold, 404 for an unknown role, 409 for a built-in or existing name.
 `GET /api/v1/admin/permissions` answers `{"permissions": [{name, description}]}`.
 Every change is audited.
 
-Besides `config.toml`, admins manage the same things at runtime (the API below
-and the dashboard's admin pages). Those entries live in the database and are listed
-next to the config ones. Entries from `config.toml` are read-only: a write to
-them answers 409, and a config group wins over a database group of the same
-name. Every change is written to the audit log in the same transaction. A
-change applies at once on the replica that took it; other replicas reload the
-database rows every 30 s.
+Admins manage groups, grants and roles at runtime (the API below and the
+dashboard's admin pages); the entries live in the database. Every change is
+written to the audit log in the same transaction. Every replica applies a
+change within seconds, by database notification, with a 30 s poll as the
+backstop.
 
 All `/api/v1` routes need a dashboard session (the session cookie); without one
 they answer 401 `{"error": "not signed in"}`. Writes also need the session's
@@ -683,7 +872,7 @@ are `{"error": "..."}` with 400 (invalid input, bad JSON), 403, 404, 409 or 503
 | `/api/v1/audit?limit=&before=`                | GET           | `audit.read` (default 50, max 200; `before` is an entry id) |
 
 Bodies: group `{"name", "description"}` (PATCH: `{"description"}`, null clears),
-IdP mapping `{"provider", "value"}` (provider is a configured `[[auth.oidc]]`
+IdP mapping `{"provider", "value"}` (provider is a configured OIDC provider
 id), grant like `[[rbac.grants]]` (`group`, `backend`, optional `include`,
 `exclude`, `read_only`, `mandatory`), role binding `{"role", "group"}` or
 `{"role", "user_id"}`. Lists answer `{"groups": [...]}`, `{"grants": [...]}`,
@@ -693,8 +882,7 @@ The dashboard has the same under `/ui/admin` (an "Admin" link in the user bar,
 shown to users with `groups.manage` or `audit.read`): groups with their IdP
 mappings and members at `/ui/admin/groups/{name}`, grants, role bindings and
 the audit log at `/ui/admin/audit`. It goes through the same service as the
-API, so permissions, validation, audit entries and the read-only config rows
-behave the same; users without a write permission see the tables only.
+API, so permissions, validation and audit entries behave the same; users without a write permission see the tables only.
 
 ### Personal access tokens and service accounts
 
@@ -743,25 +931,18 @@ held by the `admin` role) for agents and scripts that belong to no person. It
 has a name (`[a-z0-9_-]+`, like a group), an optional description, and no
 login. Because it is a user row of its own kind, it joins groups like a user:
 add it on a group's page (the member list marks it as a service account) or
-with `PUT /api/v1/groups/{name}/members/{id}`, and give that group grants. A group
-declared in `config.toml` cannot take database members (the write answers 409),
-but lists service accounts by name in `service_accounts`, which applies to
-database accounts and `[[tokens]]` entries of that name alike. A database
-account cannot take the name of a `[[tokens]]` entry (409), so it cannot
-inherit that entry's config groups. Listing a database account by name trusts
-whoever holds `service_accounts.manage` to create it. Its groups are
-exactly its memberships, without the built-in `authenticated` group. Disabling
+with `PUT /api/v1/groups/{name}/members/{id}`, and give that group grants. Its
+groups are exactly its memberships, without the built-in `authenticated` group. Disabling
 the account stops all its tokens at once (enabling it restores them), and
 deleting it removes its tokens and memberships. Each token records when it was
 last used and from which address: the peer, or, when the peer is a loopback or
 private address (a reverse proxy), the rightmost `X-Forwarded-For` entry. Admins
 manage accounts on `/ui/admin/service-accounts` (linked from `/ui/admin`).
 
-```toml
-[[rbac.groups]]
-name = "agents"
-service_accounts = ["ci-bot", "hermes"]
-```
+`admin import-config` creates the service accounts that a file lists in
+`[[rbac.groups]]` `service_accounts` and one for each `[[tokens]]` entry (with
+a fresh token that expires after at most 365 days; see
+[Migrating a config file](#migrating-a-config-file)).
 
 | Endpoint                                                 | Method           | Needs                      |
 | -------------------------------------------------------- | ---------------- | -------------------------- |
@@ -802,7 +983,7 @@ stop working until re-enabled. An admin cannot disable themselves. API:
 reaches the database:
 
 ```sh
-axon-gateway admin login-link --config /path/to/config.toml
+axon-gateway admin login-link
 ```
 
 It prints `<base_url>/auth/break-glass?code=...`. The link works once and
@@ -810,15 +991,15 @@ expires after 15 minutes. Opening it shows a confirmation button; confirming
 starts a one-hour admin session as the built-in user "Break-glass admin".
 Creating the link (`break_glass.link_created`) and using it
 (`break_glass.login`) are audited. To switch break-glass off, disable that user
-on `/ui/admin/users`. `--config` defaults to `AXON_GATEWAY_CONFIG`, then
-`config.toml`.
+on `/ui/admin/users`. The command takes no config file: it reads the
+database mode environment (`AXON_DATABASE_URL`, `AXON_BASE_URL`).
 
 ### SCIM provisioning
 
 An identity provider that speaks SCIM 2.0 (Entra ID, Okta, ...) can push its
 users and groups to the gateway, so groups follow the directory without waiting
 for a login, and a user removed there loses access at once. It needs multi-user
-mode, and the provider must be one of the `[[auth.oidc]]` entries. The base URL
+mode, and the provider must be one of the configured OIDC providers. The base URL
 for a provider is
 
 ```text
@@ -876,7 +1057,7 @@ the claim at the next login.
 **Groups.** For a linked user, the groups SCIM gives replace the groups of the
 ID token at every login (and are updated the moment SCIM changes a membership).
 Both the group's `externalId` and its `displayName` count as claim values, so
-an IdP mapping (`[[rbac.groups]]` `idp = [{ provider, value }]`) may name either,
+an IdP mapping (`{ provider, value }`) may name either,
 and `admin_groups` too. Deleting a group removes what it gave its members. A
 user that SCIM does not know keeps the groups from the ID token.
 
@@ -924,7 +1105,7 @@ algorithms the provider advertises only, keys fetched again on an unknown
 that holds the audience), `exp` (required) and `nbf`/`iat`, with 60 seconds of
 clock leeway. A token with a `nonce` claim or the type `ID` is an ID token and
 is refused, so the token of a dashboard login cannot be replayed as a bearer
-token. Any failure answers 401. The `[database]` every provider needs also
+token. Any failure answers 401. The database every provider needs also
 stores the users and bindings below.
 
 The default audience is the provider's `client_id`. Entra ID v2 access tokens
@@ -1034,6 +1215,10 @@ client_secret_env = "TRACKER_CLIENT_SECRET"   # leave out for a public client
 scopes = ["read", "write"]                    # empty: what the backend advertises
 ```
 
+Changing the URL of a catalog entry that has a stored client secret needs the
+secret entered again (or cleared) in the same edit, so it cannot be sent to a
+new host unseen.
+
 A user presses **Connect** on `/ui/catalog` (or calls `POST
 /api/v1/me/connections/{backend}`, below), signs in at the backend and is sent
 back to `<base_url>/oauth/upstream/callback`, which needs their dashboard
@@ -1105,7 +1290,8 @@ separated in the form) and `oauth_client_secret`. The secret is write-only and
 never returned (`oauth_client_secret_set` says whether one is stored): on
 `PATCH`, leaving it out or `null` keeps the stored one and `""` clears it; the
 edit form keeps it when the field is empty and has a "clear" box. Passthrough
-entries are config-only.
+entries are not created here: set `credential_mode = "passthrough"` on a backend of the
+Backends admin pages or API ([Database mode](#database-mode)).
 
 ```sh
 curl -X POST https://axon.example.com/api/v1/catalog \
@@ -1130,12 +1316,12 @@ gateway cannot read or an authorization server that cannot be used 502.
 ## Tool-call audit
 
 In multi-user mode every `tools/call` made by a user or service account
-principal is recorded. Legacy `[[tokens]]` callers outside multi-user mode and
-the `auth_token` are not.
+principal is recorded. Standalone `[[tokens]]` callers and the `auth_token`
+are not.
 
 **What is recorded.** One row per call: the time, the user, the principal
-label, the token id and its kind (`pat`, or `config_token` for a config
-`[[tokens]]` principal), the backend, the original tool name, the outcome, the
+label, the token id and its kind (`pat`, or `config_token` for a
+standalone `[[tokens]]` principal), the backend, the original tool name, the outcome, the
 JSON-RPC error code and message, the duration, the trace id, the client IP and
 the `User-Agent` (cut at 200 characters). The outcome is `ok`, `error` (a
 JSON-RPC error, which includes a tool the principal may not call: it is
@@ -1259,6 +1445,9 @@ and are on by default (`[personal_backends] enabled = true`). Their
 connections are per user and per replica; nothing here touches the shared
 backends.
 
+In database mode `[personal_backends]` is part of the gateway settings (the
+settings page and API); a change applies after a restart.
+
 ```toml
 [personal_backends]
 enabled = true
@@ -1298,11 +1487,13 @@ values are write-only: they are sealed and never returned or rendered. Admins
 see header values.
 
 **Catalog.** A catalog entry is a backend whose users bring their own
-credential. Define it in the config as a `[[backends]]` entry with
-`credential_mode = "per_user"` and one `[[backends.credential_fields]]` per
-value (`name`, `label`, `header`, `prefix`): the gateway sends the header with
-`prefix` plus what the user entered. Config entries are read-only in the UI
-and API (409). Or create entries with `catalog.manage` through the API or the
+credential. Define it as a backend with `credential_mode = "per_user"` and one
+`credential_fields` entry per value (`name`, `label`, `header`, `prefix`), on
+the Backends admin pages or through the config API (in a file imported with
+`admin import-config`: `[[backends]]` and `[[backends.credential_fields]]`):
+the gateway sends the header with `prefix` plus what the user entered. Such
+entries are read-only in the catalog UI and API (409); edit them as backends.
+A standalone file may not define one. Or create entries with `catalog.manage` through the API or the
 UI. A user sees an entry only if their RBAC grants cover that backend (admins
 see all). Entering a credential gives them their own connection; its tools
 `<entry>_<tool>` need a normal grant. Catalog entries get no egress check.
@@ -1335,13 +1526,15 @@ write routes they need the session's `X-CSRF-Token`; without the personal hub
 random data key (AES-256-GCM); the data key is wrapped by a key-encryption key
 (KEK), derived with HKDF-SHA256 from `AXON_KEK_FILE` (a path) or `AXON_KEK` (the
 text). It has one line per KEK, `[id:]secret`, a secret of at least 32
-characters, and the first line is the active key. With `[database]` and
-`[personal_backends] enabled = true` the gateway refuses to start without one.
+characters, and the first line is the active key. In database mode
+the gateway refuses to start without one.
 Generate a secret with `pwgen -s 48 1`.
 
 To rotate, put the new key first and keep the old line, restart, run
-`axon-gateway admin rewrap-secrets --config <path>` (it rewraps the data keys
-only and prints how many it moved), then drop the old line.
+`axon-gateway admin rewrap-secrets` with the same environment (it rewraps the
+data keys only, of personal backends, catalog credentials and the sealed
+secrets of backends and OIDC providers, and prints how many it moved), then
+drop the old line.
 
 **Egress guard.** A personal server URL is typed in by a user, so the gateway
 checks it: `http` or `https` only, no userinfo, every resolved address is
@@ -1401,7 +1594,7 @@ Prometheus metrics are exposed at `/metrics`:
 - `axon_backend_up` - Gauge per backend, 1 when the last connect or health probe succeeded
 - `axon_audit_dropped_total` - Tool-call audit events dropped on a full queue
 - `axon_audit_write_errors_total` - Tool-call audit batches the database refused
-- `axon_mcp_requests_total{method,principal_type}` - MCP requests by `Mcp-Method`; `principal_type` is `open`, `legacy_token`, `service` (config `[[tokens]]` accounts and service-account tokens) or `pat`
+- `axon_mcp_requests_total{method,principal_type}` - MCP requests by `Mcp-Method`; `principal_type` is `open`, `legacy_token`, `service` (service-account tokens) or `pat`
 - `axon_user_tool_calls_total{user,backend,outcome}` - Tool calls per user; `outcome` is `ok`, `error` or `denied`, `backend` is `personal` for personal backends; only callers with an owner user are counted
 - `axon_authn_total{method,result}` - Authentication attempts; `method` is `pat`, `service_token`, `legacy_token`, `session`, `break_glass` or `open`; `result` is `ok`, `invalid`, `expired`, `disabled` or `rate_limited`
 - `axon_authz_denied_total{reason}` - Denied calls; `reason` is `tool`, `backend`, `quota` or `rate_limit`
@@ -1424,6 +1617,12 @@ The `idle` value of the backend state gauge counts backends closed by the idle
 timeout. Personal and catalog connections are not labelled in metrics.
 
 ## Gateway Settings
+
+In [database mode](#database-mode), `bind`, `base_url` and `allow_stdio` are the
+environment variables `AXON_BIND`, `AXON_BASE_URL` and `AXON_ALLOW_STDIO`;
+`rate_limit_per_minute`, `allowed_hosts` and `idle_timeout_secs` are edited on
+`/ui/admin/config/settings` and apply to every replica within seconds. The
+rest of this section describes the file of a standalone gateway.
 
 These `[gateway]` settings control what the gateway runs and answers to:
 
@@ -1475,7 +1674,9 @@ transport = "http"
 
 ## Environment Variable References in Config
 
-You can reference environment variables in `config.toml` using `${VAR_NAME}` placeholders.
+A standalone gateway, and `admin import-config`, can reference environment
+variables in `config.toml` using `${VAR_NAME}` placeholders. Database mode reads
+no file.
 
 Example:
 
@@ -1524,7 +1725,8 @@ Completed:
 
 - [x] **Reconnection logic**: Automatic reconnect with exponential backoff (1s base, 5min max)
 - [x] **Health checks**: Periodic pings to detect dead backends
-- [x] **Hot reload**: Watch config file and update backends without restart
+- [x] **Hot reload**: Watch config file and update backends without restart (standalone); database notification plus a 30 s poll in database mode
+- [x] **Configuration in the database**: backends, toolsets, OIDC providers and settings managed in the dashboard and the API, with `admin import-config` for an existing file
 - [x] **Metrics**: Prometheus metrics for tool calls, latency, errors
 - [x] **Tool filtering**: Support `allowed_tools` config per token/group
 - [x] **Resource/Prompt proxying**: Forward MCP resources and prompts

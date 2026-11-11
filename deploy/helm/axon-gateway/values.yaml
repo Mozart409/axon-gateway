@@ -1,8 +1,9 @@
 # Default values for the axon-gateway chart.
 
 # Replicas share sessions, rate limits and policy through the database, so no
-# session affinity is needed. Several replicas need a [database] section in
-# `config`; without one, sessions live in each process and you must run 1.
+# session affinity is needed. Several replicas need database mode
+# (`database.enabled`); standalone, sessions live in each process and you must
+# run 1.
 replicaCount: 2
 
 image:
@@ -15,7 +16,59 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# The whole config.toml, rendered into a ConfigMap and mounted read-only at
+# Database mode: the gateway reads no config file. Backends, toolsets, OIDC
+# providers and settings are stored in Postgres and managed in the dashboard
+# and the API; only the settings below are environment. `config` is ignored
+# and no config ConfigMap is created or mounted. Needs kek.existingSecret.
+database:
+  enabled: false
+  # Secret holding the Postgres URL (becomes AXON_DATABASE_URL). Required when
+  # enabled.
+  existingSecret: ""
+  key: url
+
+# Public URL of the gateway (AXON_BASE_URL), used for OIDC redirects and
+# links. Required in database mode.
+baseUrl: ""
+# Listen address (AXON_BIND). Keep the port in step with service.port's target:
+# the container port is 8080.
+bind: "0.0.0.0:8080"
+# AXON_ALLOW_STDIO. A process spawned inside the pod is not a boundary you want
+# on Kubernetes; run the server in its own Deployment behind a bridge instead.
+allowStdio: false
+
+# Optional bootstrap OIDC provider for database mode (AXON_OIDC_*). Without any
+# provider, log in with `axon-gateway admin login-link` and add one in the
+# dashboard. It is shown there as read-only (source env).
+oidc:
+  issuer: ""            # setting it turns the bootstrap provider on
+  clientId: ""          # required with the issuer
+  id: ""                # default "sso"
+  displayName: ""
+  adminGroups: []       # members of these groups are admins
+  # The client secret is mounted from a Secret as a file
+  # (AXON_OIDC_CLIENT_SECRET_FILE). Leave empty for a public PKCE client.
+  clientSecret:
+    existingSecret: ""
+    key: client-secret
+
+# One-shot import of a config.toml into the database (database mode only): a
+# pre-install,pre-upgrade hook Job runs
+#   axon-gateway admin import-config /config/config.toml
+# on the text below. Off by default.
+#   - The file wins: every install and upgrade with this on overwrites what was
+#     changed in the dashboard. Turn it off after the first run.
+#   - New service-account tokens (from `[[tokens]]`) are printed once, on the
+#     Job's log (`kubectl logs job/<release>-axon-gateway-import`, tab
+#     separated name and token). The Job is deleted a day after it finishes.
+#   - `${VAR}` references resolve from existingSecret / env / envFrom.
+import:
+  enabled: false
+  dryRun: false         # report only, write nothing
+  config: ""
+
+# Standalone mode (database.enabled false): the whole config.toml, rendered
+# into a ConfigMap and mounted read-only at
 # /etc/axon/config.toml (AXON_GATEWAY_CONFIG points there). `${VAR}` references
 # are resolved from the container environment when the file is loaded, so put
 # secrets in `existingSecret` / `env`, never here.
@@ -31,9 +84,6 @@ config: |
   base_url = "https://axon.example.com"
   allow_stdio = false
 
-  # [database]
-  # url_env = "AXON_DATABASE_URL"
-
   # [[backends]]
   # name = "docs"
   # url = "https://mcp.example.com/mcp"
@@ -41,7 +91,8 @@ config: |
   # enabled = true
 
 # Name of an existing Secret whose keys all become environment variables
-# (AXON_DATABASE_URL, OIDC client secrets, backend tokens, ...). The Secret is
+# (OIDC client secrets, backend tokens for `${VAR}` references, ...; in
+# standalone mode also AXON_DATABASE_URL). The Secret is
 # read at start; after changing it run `kubectl rollout restart`.
 existingSecret: ""
 
@@ -56,8 +107,9 @@ envFrom: []
 logLevel: info
 logJson: true
 
-# Key-encryption key for personal backends and catalog credentials. The Secret
-# key is mounted as a file and AXON_KEK_FILE points at it. Format: one line per
+# Key-encryption key; required in database mode, where it seals the secrets of
+# backends, OIDC providers, personal servers and catalog credentials. A
+# standalone gateway does not use it. The Secret key is mounted as a file and AXON_KEK_FILE points at it. Format: one line per
 # KEK, `[id:]secret`, a secret of at least 32 characters.
 kek:
   existingSecret: ""

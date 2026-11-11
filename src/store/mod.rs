@@ -13,6 +13,8 @@ use thiserror::Error;
 mod audit;
 mod auth;
 mod break_glass;
+mod gateway_config;
+mod import;
 mod jwt_bindings;
 mod oauth;
 mod personal;
@@ -28,6 +30,15 @@ mod views;
 
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
 pub use break_glass::{BREAK_GLASS_CODE_TTL, BREAK_GLASS_SESSION_MAX_AGE};
+pub use gateway_config::{
+    GatewayBackendRow, GatewayConfigError, GatewaySettingsRow, GatewayToolsetRow, OidcProviderRow,
+};
+pub use import::{
+    Change, audit_import, import_backend, import_grant, import_group, import_idp_mapping,
+    import_membership, import_oidc_provider, import_role, import_role_binding,
+    import_service_account, import_service_token, import_settings, import_toolset,
+    stored_backend_secret, stored_provider_secret,
+};
 pub use jwt_bindings::{JwtBinding, JwtBindingError, JwtSubject};
 pub use oauth::{
     ACCESS_TOKEN_TTL, AccessLookup, AuthRequest, CodeRedemption, IssuedOauthTokens, NewAuthRequest,

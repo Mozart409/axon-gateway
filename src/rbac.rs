@@ -1,6 +1,6 @@
 //! Runtime RBAC management: the live policy handle and the admin service
 //!
-//! [`PolicyHandle`] holds the merged config and database [`Policy`] and swaps it
+//! [`PolicyHandle`] holds the database [`Policy`] and swaps it
 //! atomically on [`PolicyHandle::refresh`]; a background task refreshes it so that
 //! replicas pick up each other's changes. [`Admin`] is the service layer behind the
 //! `/api/v1` admin API (and the admin pages to come): it checks the caller's
@@ -17,9 +17,9 @@ use uuid::Uuid;
 use crate::changes::{ChangeBus, ChangeScope};
 use crate::gateway::GetDetailedStatus;
 use crate::policy::{
-    GrantConfig, GrantView, GroupView, Permission, Permissions, Policy, RbacConfig, RbacSnapshot,
-    Role, RoleBinding, RoleSource, RoleSubject, RoleView, Source, parse_permissions,
-    validate_grant, validate_group_name, validate_role_name,
+    GrantConfig, GrantView, GroupView, Permission, Permissions, Policy, RbacSnapshot, Role,
+    RoleBinding, RoleSource, RoleSubject, RoleView, parse_permissions, validate_grant,
+    validate_group_name, validate_role_name,
 };
 use crate::principal::TokenScope;
 use crate::server::AppState;
@@ -48,10 +48,9 @@ const MAX_SCOPE_ENTRIES: usize = 50;
 /// Longest backend name or tool glob in a token scope, in characters.
 const MAX_SCOPE_ENTRY_CHARS: usize = 200;
 
-/// The live policy: `[rbac]` from config merged with the database rows.
+/// The live policy, compiled from the database rows.
 #[derive(Debug)]
 pub struct PolicyHandle {
-    config: RbacConfig,
     current: RwLock<Arc<Policy>>,
     /// The snapshot of the last refresh; `None` until the first one
     last_snapshot: Mutex<Option<RbacSnapshot>>,
@@ -59,17 +58,33 @@ pub struct PolicyHandle {
     changes: Option<ChangeBus>,
 }
 
+impl Default for PolicyHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PolicyHandle {
-    /// A handle on the config-only policy; [`PolicyHandle::refresh`] adds the
+    /// A handle on the empty policy; [`PolicyHandle::refresh`] loads the
     /// database rows.
-    pub fn new(config: RbacConfig) -> Self {
-        let policy = Arc::new(Policy::from_config(&config));
+    pub fn new() -> Self {
+        let policy = Arc::new(Policy::from_snapshot(&RbacSnapshot::default()));
         Self {
-            config,
             current: RwLock::new(policy),
             last_snapshot: Mutex::new(None),
             changes: None,
         }
+    }
+
+    /// A handle on the policy of `snapshot`, for tests that render with one.
+    #[cfg(test)]
+    pub fn from_snapshot(snapshot: &RbacSnapshot) -> Self {
+        let handle = Self::new();
+        *handle
+            .current
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(Policy::from_snapshot(snapshot));
+        handle
     }
 
     /// Publishes [`ChangeScope::All`] on `changes` whenever a refresh finds the
@@ -85,13 +100,13 @@ impl PolicyHandle {
         Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Reloads the database rows and swaps the merged policy in.
+    /// Reloads the database rows and swaps the policy in.
     ///
     /// # Errors
     /// Fails when the snapshot cannot be read; the previous policy stays.
     pub async fn refresh(&self, store: &Store) -> Result<(), StoreError> {
         let snapshot = store.rbac_snapshot().await?;
-        let policy = Arc::new(Policy::from_parts(&self.config, &snapshot));
+        let policy = Arc::new(Policy::from_snapshot(&snapshot));
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = policy;
         if self.remember(snapshot)
             && let Some(changes) = &self.changes
@@ -102,7 +117,7 @@ impl PolicyHandle {
     }
 
     /// Keeps `snapshot` as the latest one; whether it differs from the one before.
-    /// The first snapshot is no change: nobody has listened to the config-only policy.
+    /// The first snapshot is no change: nobody has listened to the empty policy.
     fn remember(&self, snapshot: RbacSnapshot) -> bool {
         let mut last = self
             .last_snapshot
@@ -193,10 +208,6 @@ impl From<JwtBindingError> for AdminError {
     }
 }
 
-fn read_only() -> AdminError {
-    AdminError::Conflict("defined in config.toml, read-only".to_owned())
-}
-
 fn already_exists() -> AdminError {
     AdminError::Conflict("already exists".to_owned())
 }
@@ -224,7 +235,7 @@ fn clean_description(description: Option<&str>) -> Result<Option<String>, AdminE
     Ok(Some(description.to_owned()))
 }
 
-/// A role with the number of role bindings that name it, config bindings included
+/// A role with the number of role bindings that name it
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleEntry {
     pub role: RoleView,
@@ -261,8 +272,6 @@ pub struct Admin<'a> {
     backends: Vec<String>,
     /// `[[auth.oidc]]` ids an `IdP` mapping may name
     providers: Vec<String>,
-    /// `[[tokens]]` names, which config groups list in `service_accounts`
-    config_accounts: Vec<String>,
 }
 
 impl<'a> Admin<'a> {
@@ -284,7 +293,6 @@ impl<'a> Admin<'a> {
             permissions,
             backends,
             providers,
-            config_accounts: Vec::new(),
         }
     }
 
@@ -308,12 +316,17 @@ impl<'a> Admin<'a> {
             backends.extend(hub.catalog().into_iter().map(|item| item.name));
         }
         let providers = oidc
+            .list()
             .iter()
             .map(|provider| provider.id().to_owned())
             .collect();
-        let mut admin = Self::new(store, &state.policy, session, backends, providers);
-        admin.config_accounts = state.auth_manager.load().token_names();
-        Some(admin)
+        Some(Self::new(
+            store,
+            &state.policy,
+            session,
+            backends,
+            providers,
+        ))
     }
 
     fn require(&self, permission: Permission) -> Result<(), AdminError> {
@@ -331,17 +344,12 @@ impl<'a> Admin<'a> {
         }
     }
 
-    /// A database group: missing is not found, from config is read-only.
+    /// A group: missing is not found.
     fn local_group(&self, name: &str) -> Result<GroupView, AdminError> {
-        let group = self
-            .policy
+        self.policy
             .current()
             .group(name)
-            .ok_or(AdminError::NotFound)?;
-        if group.source == Source::Config {
-            return Err(read_only());
-        }
-        Ok(group)
+            .ok_or(AdminError::NotFound)
     }
 
     /// Re-reads the policy after a write. The write stands when this fails;
@@ -362,7 +370,7 @@ impl<'a> Admin<'a> {
         }
     }
 
-    /// A database role: missing is not found, built in or from config is read-only.
+    /// A custom role: missing is not found, built in cannot be changed.
     fn local_role(&self, name: &str) -> Result<RoleView, AdminError> {
         let role = self
             .policy
@@ -374,7 +382,6 @@ impl<'a> Admin<'a> {
             RoleSource::Builtin => Err(AdminError::Conflict(
                 "built-in role, cannot be changed".to_owned(),
             )),
-            RoleSource::Config => Err(read_only()),
         }
     }
 
@@ -387,7 +394,7 @@ impl<'a> Admin<'a> {
         ])
     }
 
-    /// All groups, config first.
+    /// All groups, by name.
     ///
     /// # Errors
     /// [`AdminError::Forbidden`] without `groups.manage` or `audit.read`.
@@ -396,7 +403,7 @@ impl<'a> Admin<'a> {
         Ok(self.policy.current().groups())
     }
 
-    /// One group with the ids of its members (database groups only).
+    /// One group with the ids of its members.
     ///
     /// # Errors
     /// Forbidden like [`Admin::groups`], [`AdminError::NotFound`] for an
@@ -409,7 +416,7 @@ impl<'a> Admin<'a> {
         Ok((group, members))
     }
 
-    /// All grants, config first.
+    /// All grants, by id.
     ///
     /// # Errors
     /// Forbidden like [`Admin::groups`].
@@ -418,7 +425,7 @@ impl<'a> Admin<'a> {
         Ok(self.policy.current().grants())
     }
 
-    /// All role bindings, config first.
+    /// All role bindings, by id.
     ///
     /// # Errors
     /// Forbidden like [`Admin::groups`].
@@ -427,7 +434,7 @@ impl<'a> Admin<'a> {
         Ok(self.policy.current().role_bindings())
     }
 
-    /// All roles (built-in, config, database) with their binding counts.
+    /// All roles (built-in, custom) with their binding counts.
     ///
     /// # Errors
     /// Forbidden like [`Admin::groups`].
@@ -531,11 +538,11 @@ impl<'a> Admin<'a> {
         Ok(self.store.audit_log(limit, before).await?)
     }
 
-    /// Creates a database group.
+    /// Creates a group.
     ///
     /// # Errors
     /// Forbidden without `groups.manage`, invalid for a bad name or
-    /// description, conflict when the name is taken by config or the database.
+    /// description, conflict when the name is taken.
     pub async fn create_group(
         &self,
         name: &str,
@@ -558,11 +565,10 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Sets (or with `None` clears) a database group's description.
+    /// Sets (or with `None` clears) a group's description.
     ///
     /// # Errors
-    /// Forbidden without `groups.manage`, not found for an unknown group,
-    /// conflict for a config group.
+    /// Forbidden without `groups.manage`, not found for an unknown group.
     pub async fn update_group(
         &self,
         name: &str,
@@ -582,12 +588,10 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Deletes a database group with its mappings, memberships, grants and
-    /// bindings.
+    /// Deletes a group with its mappings, memberships, grants and bindings.
     ///
     /// # Errors
-    /// Forbidden without `groups.manage`, not found for an unknown group,
-    /// conflict for a config group.
+    /// Forbidden without `groups.manage`, not found for an unknown group.
     pub async fn delete_group(&self, name: &str) -> Result<(), AdminError> {
         self.require(Permission::GroupsManage)?;
         self.local_group(name)?;
@@ -598,12 +602,12 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Maps an `IdP` claim value of a configured provider to a database group.
+    /// Maps an `IdP` claim value of a configured provider to a group.
     ///
     /// # Errors
     /// Forbidden without `groups.manage` or without every permission of the
     /// roles bound to the group, invalid for an unknown provider or an empty
-    /// value, conflict for a config group or an existing mapping.
+    /// value, conflict for an existing mapping.
     pub async fn add_idp_mapping(
         &self,
         group: &str,
@@ -632,11 +636,11 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Removes an `IdP` mapping from a database group.
+    /// Removes an `IdP` mapping from a group.
     ///
     /// # Errors
     /// Forbidden without `groups.manage`, not found for an unknown group or
-    /// mapping, conflict for a config group.
+    /// mapping.
     pub async fn remove_idp_mapping(
         &self,
         group: &str,
@@ -656,12 +660,12 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Adds a user to a database group.
+    /// Adds a user to a group.
     ///
     /// # Errors
     /// Forbidden without `groups.manage` or without every permission of the
     /// roles bound to the group, not found for an unknown group or user,
-    /// conflict for a config group or an existing member.
+    /// conflict for an existing member.
     pub async fn add_member(&self, group: &str, user_id: Uuid) -> Result<(), AdminError> {
         self.require(Permission::GroupsManage)?;
         self.local_group(group)?;
@@ -677,11 +681,11 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Removes a user from a database group.
+    /// Removes a user from a group.
     ///
     /// # Errors
     /// Forbidden without `groups.manage`, not found for an unknown group or
-    /// non-member, conflict for a config group.
+    /// non-member.
     pub async fn remove_member(&self, group: &str, user_id: Uuid) -> Result<(), AdminError> {
         self.require(Permission::GroupsManage)?;
         self.local_group(group)?;
@@ -710,8 +714,7 @@ impl<'a> Admin<'a> {
         Ok(id)
     }
 
-    /// Deletes a database grant. Config grants have no id and cannot be
-    /// addressed.
+    /// Deletes a grant.
     ///
     /// # Errors
     /// Forbidden without `groups.manage`, not found for an unknown id.
@@ -724,13 +727,12 @@ impl<'a> Admin<'a> {
         Ok(())
     }
 
-    /// Creates a custom role in the database and returns it.
+    /// Creates a custom role and returns it.
     ///
     /// # Errors
     /// Forbidden without `roles.manage` or when the role would carry a
     /// permission the caller does not hold, invalid for a bad name, description
-    /// or permission list, conflict when the name is a built-in, config or
-    /// database role.
+    /// or permission list, conflict when the name is a built-in or custom role.
     pub async fn create_role(
         &self,
         name: &str,
@@ -771,13 +773,12 @@ impl<'a> Admin<'a> {
         })
     }
 
-    /// Replaces a database role's description and permissions and returns it.
+    /// Replaces a custom role's description and permissions and returns it.
     ///
     /// # Errors
     /// Forbidden without `roles.manage` or when the new permissions include one
     /// the caller does not hold, not found for an unknown role, conflict for a
-    /// built-in or config role, invalid for a bad description or permission
-    /// list.
+    /// built-in role, invalid for a bad description or permission list.
     pub async fn update_role(
         &self,
         name: &str,
@@ -815,11 +816,11 @@ impl<'a> Admin<'a> {
         })
     }
 
-    /// Deletes a database role. With `force` the bindings that name it go too.
+    /// Deletes a custom role. With `force` the bindings that name it go too.
     ///
     /// # Errors
     /// Forbidden without `roles.manage`, not found for an unknown role,
-    /// conflict for a built-in or config role, or when bindings name the role
+    /// conflict for a built-in role, or when bindings name the role
     /// and `force` is not set.
     pub async fn delete_role(&self, name: &str, force: bool) -> Result<(), AdminError> {
         self.require(Permission::RolesManage)?;
@@ -881,8 +882,7 @@ impl<'a> Admin<'a> {
         Ok(id)
     }
 
-    /// Deletes a database role binding. Config bindings have no id and cannot
-    /// be addressed.
+    /// Deletes a role binding.
     ///
     /// # Errors
     /// Forbidden without `roles.manage`, not found for an unknown id.
@@ -1243,13 +1243,6 @@ impl Admin<'_> {
     ) -> Result<ServiceAccount, AdminError> {
         self.require(Permission::ServiceAccountsManage)?;
         validate_group_name(name).map_err(AdminError::Invalid)?;
-        // A config group lists service accounts by name: a database account must not
-        // take over the groups of a `[[tokens]]` entry
-        if self.config_accounts.iter().any(|account| account == name) {
-            return Err(AdminError::Conflict(
-                "a [[tokens]] entry in config.toml has this name".to_owned(),
-            ));
-        }
         let description = clean_description(description)?;
         self.store
             .create_service_account(&self.actor, name, description.as_deref())
@@ -1405,7 +1398,7 @@ impl Admin<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{IdpMapping, RbacGroupConfig};
+    use crate::policy::{AUTHENTICATED_GROUP, IdpMapping};
     use crate::store::LoginUser;
     use crate::store::test_support::{database_url, isolated_url};
 
@@ -1417,21 +1410,6 @@ mod tests {
         };
         let url = isolated_url(&base, schema).await;
         Some(Store::connect_url(&url).await.unwrap())
-    }
-
-    /// `ops` is declared in config; nothing else.
-    fn test_config() -> RbacConfig {
-        RbacConfig {
-            groups: vec![RbacGroupConfig {
-                name: "ops".to_owned(),
-                description: None,
-                idp: Vec::new(),
-                service_accounts: Vec::new(),
-            }],
-            grants: Vec::new(),
-            role_bindings: Vec::new(),
-            roles: Vec::new(),
-        }
     }
 
     /// A user created through the login path, with a session on provider `mock`.
@@ -1512,7 +1490,7 @@ mod tests {
         let Some(store) = test_store("axon_rbac_member").await else {
             return;
         };
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let session = test_session(&store, "mia", false).await;
         let admin = admin(&store, &handle, &session);
 
@@ -1541,28 +1519,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_service_account_cannot_take_a_config_token_name() {
-        let Some(store) = test_store("axon_rbac_token_name").await else {
-            return;
-        };
-        let handle = PolicyHandle::new(test_config());
-        let session = test_session(&store, "root", true).await;
-        let mut admin = admin(&store, &handle, &session);
-        admin.config_accounts = vec!["legacy-ops".to_owned()];
-
-        assert!(matches!(
-            admin.create_service_account("legacy-ops", None).await,
-            Err(AdminError::Conflict(_))
-        ));
-        admin.create_service_account("db-bot", None).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn an_admin_manages_a_group_and_it_is_audited() {
         let Some(store) = test_store("axon_rbac_group").await else {
             return;
         };
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let session = test_session(&store, "root", true).await;
         let admin = admin(&store, &handle, &session);
 
@@ -1571,18 +1532,17 @@ mod tests {
             .await
             .unwrap();
         let (group, members) = admin.group("dev").unwrap();
-        assert_eq!(group.source, Source::Local);
         assert_eq!(group.description.as_deref(), Some("Developers"));
         assert_eq!(members, Vec::<Uuid>::new());
 
-        // Taken by the database, by config, or not a valid name.
+        // Taken, or not a valid name.
         assert!(matches!(
             admin.create_group("dev", None).await,
             Err(AdminError::Conflict(_))
         ));
         assert!(matches!(
-            admin.create_group("ops", None).await,
-            Err(AdminError::Conflict(_))
+            admin.create_group(AUTHENTICATED_GROUP, None).await,
+            Err(AdminError::Invalid(_))
         ));
         assert!(matches!(
             admin.create_group("Not Valid", None).await,
@@ -1637,32 +1597,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_groups_are_read_only() {
-        let Some(store) = test_store("axon_rbac_config").await else {
+    async fn an_unknown_group_is_not_found() {
+        let Some(store) = test_store("axon_rbac_unknown_group").await else {
             return;
         };
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let session = test_session(&store, "root", true).await;
         let admin = admin(&store, &handle, &session);
 
         assert!(matches!(
-            admin.update_group("ops", Some("x")).await,
-            Err(AdminError::Conflict(_))
-        ));
-        assert!(matches!(
-            admin.delete_group("ops").await,
-            Err(AdminError::Conflict(_))
-        ));
-        assert!(matches!(
-            admin.add_idp_mapping("ops", "mock", "ops").await,
-            Err(AdminError::Conflict(_))
-        ));
-        assert!(matches!(
-            admin.add_member("ops", session.user.id).await,
-            Err(AdminError::Conflict(_))
-        ));
-        assert!(matches!(
             admin.update_group("missing", None).await,
+            Err(AdminError::NotFound)
+        ));
+        assert!(matches!(
+            admin.delete_group("missing").await,
             Err(AdminError::NotFound)
         ));
         assert_eq!(
@@ -1676,7 +1624,7 @@ mod tests {
         let Some(store) = test_store("axon_rbac_members").await else {
             return;
         };
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let session = test_session(&store, "root", true).await;
         let bob = test_session(&store, "bob", false).await;
         let admin = admin(&store, &handle, &session);
@@ -1705,9 +1653,10 @@ mod tests {
         let Some(store) = test_store("axon_rbac_grants").await else {
             return;
         };
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let session = test_session(&store, "root", true).await;
         let admin = admin(&store, &handle, &session);
+        admin.create_group("ops", None).await.unwrap();
 
         assert!(matches!(
             admin.create_grant(grant("nobody", "files")).await,
@@ -1721,7 +1670,6 @@ mod tests {
         let id = admin.create_grant(grant("ops", "files")).await.unwrap();
         let grants = admin.grants().unwrap();
         let created = grants.iter().find(|view| view.id == Some(id)).unwrap();
-        assert_eq!(created.source, Source::Local);
         assert_eq!(created.grant.group, "ops");
 
         admin.delete_grant(id).await.unwrap();
@@ -1737,7 +1685,7 @@ mod tests {
         let Some(store) = test_store("axon_rbac_bindings").await else {
             return;
         };
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let root = test_session(&store, "root", true).await;
         let bob = test_session(&store, "bob", false).await;
         let root_admin = admin(&store, &handle, &root);
@@ -1798,7 +1746,7 @@ mod tests {
         let Some(store) = test_store("axon_rbac_refresh").await else {
             return;
         };
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let session = test_session(&store, "root", true).await;
         let actor = Actor {
             user_id: Some(session.user.id),
@@ -1813,7 +1761,7 @@ mod tests {
 
     #[test]
     fn remember_reports_a_change_only_after_the_first_snapshot() {
-        let handle = PolicyHandle::new(test_config());
+        let handle = PolicyHandle::new();
         let mut snapshot = RbacSnapshot::default();
 
         assert!(!handle.remember(snapshot.clone()), "first load");
@@ -1831,7 +1779,7 @@ mod tests {
         };
         let bus = ChangeBus::new();
         let mut subscription = bus.subscribe();
-        let handle = PolicyHandle::new(test_config()).with_change_bus(bus);
+        let handle = PolicyHandle::new().with_change_bus(bus);
         let session = test_session(&store, "root", true).await;
         let actor = Actor {
             user_id: Some(session.user.id),

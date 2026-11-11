@@ -1,7 +1,9 @@
-//! Legacy `[[tokens]]` in multi-user mode: they are config service accounts under
-//! strict RBAC (the groups that list them in `service_accounts`), and the shared
-//! `gateway.auth_token` is refused. Database service accounts can be listed by name
-//! in a config group too, and a token's use records the client address.
+//! Legacy `[[tokens]]` in database mode: the import turns each into a service
+//! account with a fresh token (printed once), whose tools come from the groups
+//! that list it in `service_accounts`; the old token strings and the shared
+//! `gateway.auth_token` are refused. A service account the import created takes
+//! a token from the API like any other, and a token's use records the client
+//! address.
 //!
 //! The tests skip themselves unless `AXON_TEST_DATABASE_URL` is set (see
 //! `oidc_login.rs`).
@@ -31,8 +33,9 @@ const LOGIN_COOKIE: &str = "__Host-axon_login";
 const DATABASE_ENV: &str = "AXON_TEST_GATEWAY_DATABASE_URL";
 const SHARED_TOKEN: &str = "shared-secret-token";
 
-/// `ops` lists one legacy token and one database service account; `[[tokens]]`
-/// entries come after the rbac tables.
+/// `ops` lists two imported tokens and one service account without a token;
+/// `[[tokens]]` entries come after the rbac tables. Their `allowed_tools` is not
+/// imported: tools come from the groups.
 const CONFIG_TAIL: &str = r#"
 [[rbac.groups]]
 name = "ops"
@@ -279,7 +282,7 @@ fn csrf_token(page: &str) -> String {
 }
 
 #[tokio::test]
-async fn the_shared_token_is_refused_in_multi_user_mode() {
+async fn the_shared_token_is_refused_in_database_mode() {
     let Some(h) = Harness::start("axon_legacy_shared").await else {
         return;
     };
@@ -290,45 +293,77 @@ async fn the_shared_token_is_refused_in_multi_user_mode() {
 }
 
 #[tokio::test]
-async fn legacy_tokens_see_what_their_config_groups_grant() {
+async fn an_imported_token_entry_is_a_service_account_with_its_groups_tools() {
     let Some(h) = Harness::start("axon_legacy_tokens").await else {
         return;
     };
 
+    // One printed token per `[[tokens]]` entry, and only those.
+    let mut printed: Vec<&str> = h
+        .gateway
+        .imported_tokens
+        .keys()
+        .map(String::as_str)
+        .collect();
+    printed.sort_unstable();
+    assert_eq!(printed, ["legacy-narrow", "legacy-ops", "legacy-orphan"]);
+    for token in h.gateway.imported_tokens.values() {
+        assert!(token.starts_with("axon_pat_"), "{token}");
+    }
+
     // In a group with a grant: the group's tools
     assert_eq!(
-        h.connected_tool_names("legacy-ops-secret").await,
+        h.connected_tool_names(h.gateway.token("legacy-ops")).await,
         ["files_list_files", "files_read_file"]
     );
-    // Narrowed by its own allowed_tools
+    // `allowed_tools` is not imported: the same group, the same tools
     assert_eq!(
-        h.tool_names("legacy-narrow-secret").await,
-        ["files_read_file"]
+        h.tool_names(h.gateway.token("legacy-narrow")).await,
+        ["files_list_files", "files_read_file"]
     );
     // In no group: strict RBAC, nothing (the backend is connected by now)
     assert_eq!(
-        h.tool_names("legacy-orphan-secret").await,
+        h.tool_names(h.gateway.token("legacy-orphan")).await,
         Vec::<String>::new()
     );
 }
 
 #[tokio::test]
-async fn a_database_service_account_is_a_member_of_config_groups_by_name() {
+async fn the_old_token_strings_are_refused() {
+    let Some(h) = Harness::start("axon_legacy_old_strings").await else {
+        return;
+    };
+    for old in [
+        "legacy-ops-secret",
+        "legacy-narrow-secret",
+        "legacy-orphan-secret",
+    ] {
+        let (status, _) = h.list(old, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{old}");
+    }
+}
+
+#[tokio::test]
+async fn a_service_account_made_by_the_import_is_a_member_by_name() {
     let Some(h) = Harness::start("axon_legacy_db_account").await else {
         return;
     };
     let admin = h.login_admin().await;
 
-    let (status, account) = h
-        .send(
-            Method::POST,
-            "/api/v1/service-accounts",
-            &admin,
-            Some(json!({ "name": "db-bot" })),
-        )
+    // `db-bot` exists since the import (it is listed in the group), without a
+    // token; an admin issues one.
+    let (_, accounts) = h
+        .send(Method::GET, "/api/v1/service-accounts", &admin, None)
         .await;
-    assert_eq!(status, StatusCode::CREATED, "{account}");
-    let account_id = account["id"].as_str().unwrap().to_string();
+    let account_id = accounts["service_accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|account| account["name"] == "db-bot")
+        .unwrap_or_else(|| panic!("no db-bot in {accounts}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (status, token) = h
         .send(
             Method::POST,
@@ -341,7 +376,6 @@ async fn a_database_service_account_is_a_member_of_config_groups_by_name() {
     let plaintext = token["plaintext"].as_str().unwrap().to_string();
     let token_id = token["id"].as_str().unwrap().to_string();
 
-    // No database membership: the group comes from the `service_accounts` list alone.
     // The first use carries a forwarded address, which a loopback peer (the test
     // client) is believed to have been set by our own proxy.
     let (status, body) = h

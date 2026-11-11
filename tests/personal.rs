@@ -729,7 +729,7 @@ async fn an_idle_personal_connection_is_reopened_on_demand() {
 }
 
 #[tokio::test]
-async fn personal_backends_need_a_key_unless_they_are_switched_off() {
+async fn database_mode_needs_a_key() {
     let Ok(base) = std::env::var("AXON_TEST_DATABASE_URL") else {
         eprintln!("skipping: AXON_TEST_DATABASE_URL is not set");
         return;
@@ -737,7 +737,8 @@ async fn personal_backends_need_a_key_unless_they_are_switched_off() {
     let idp = MockOidc::start("axon-test").await;
     let no_key = ["AXON_KEK", "AXON_KEK_FILE"];
 
-    // A database and no key: the gateway refuses to start.
+    // Database mode and no key: the gateway refuses to start (the import ran
+    // with one).
     let url = isolated_url(&base, "axon_personal_kek_missing").await;
     let bind = format!("127.0.0.1:{}", free_port());
     let config = ConfigBuilder::new(&bind)
@@ -753,22 +754,6 @@ async fn personal_backends_need_a_key_unless_they_are_switched_off() {
     .expect("the gateway should refuse to start");
     assert!(!status.success(), "{stderr}");
     assert!(stderr.contains("AXON_KEK"), "{stderr}");
-
-    // Switched off, it needs none.
-    let url = isolated_url(&base, "axon_personal_kek_off").await;
-    let bind = format!("127.0.0.1:{}", free_port());
-    let config = ConfigBuilder::new(&bind)
-        .database(DATABASE_ENV)
-        .personal_backends("enabled = false")
-        .oidc_provider("mock", idp.issuer(), "axon-test", "")
-        .render();
-    let _gateway = Gateway::start_without_env(
-        &config,
-        &format!("http://{bind}"),
-        &[(DATABASE_ENV, &url)],
-        &no_key,
-    )
-    .await;
 }
 
 #[tokio::test]

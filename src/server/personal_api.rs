@@ -337,7 +337,9 @@ impl<'a> Ctx<'a> {
             .find(|item| item.name == name)
             .ok_or_else(not_found)?;
         if item.source == CatalogSource::Config {
-            return Err(conflict("defined in the config file"));
+            return Err(conflict(
+                "defined as a backend: edit it in the backend configuration",
+            ));
         }
         Ok(item)
     }
@@ -1033,6 +1035,7 @@ pub(super) async fn create_catalog_entry(
 }
 
 /// Changes a catalog entry of the database. Needs `catalog.manage`.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn update_catalog_entry(
     state: &AppState,
     session: &SessionUser,
@@ -1081,6 +1084,21 @@ pub(super) async fn update_catalog_entry(
             SecretUpdate::Set(ctx.seal_oauth_secret(name, secret)?)
         }
     };
+    // The stored client secret must not follow the entry to a new URL unseen.
+    if let Some(url) = patch.url.as_deref() {
+        let moved = clean_url(url).map_err(invalid)? != item.url;
+        let secret_stored = matches!(
+            &item.auth,
+            CatalogAuth::OAuth { client, client_unusable, .. }
+                if *client_unusable
+                    || client.as_ref().is_some_and(|client| client.client_secret.is_some())
+        );
+        if moved && secret_stored && matches!(oauth_secret, SecretUpdate::Keep) {
+            return Err(invalid(
+                "changing where the backend connects needs its secrets entered again (or cleared)",
+            ));
+        }
+    }
     // The credential fields follow the mode: none for OAuth, at least one for
     // fields (so switching back needs them in the same request)
     let credential_fields = match (auth, patch.credential_fields) {

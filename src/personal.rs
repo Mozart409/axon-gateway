@@ -1497,7 +1497,7 @@ impl PersonalHub {
             })
         });
         let subject = match self
-            .subject_token(user, provider, assertion_scope.as_deref())
+            .subject_token(user, &provider, assertion_scope.as_deref())
             .await
         {
             Subject::Token(token) => token,

@@ -596,11 +596,15 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 11. Phased plan
 
-Status (2026-11-11): Phases 0 to 5 are done and committed. Resume at
-Phase 6 (Phase 8, config in the database, is planned). Open caveats: OIDC
-login is untested against a real IdP, and a plain-text 403 from the CSRF
-check can replace an admin page section (the htmx config swaps 4xx
-responses).
+Status (2026-11-12): Phases 0 to 5 are done and committed. Phase 8 (config in
+the database) is implemented, except the NixOS module, which is the user's.
+Resume at Phase 6. Open caveats: OIDC login is untested against a real IdP, a
+plain-text 403 from the CSRF check can replace an admin page section (the htmx
+config swaps 4xx responses), the `personal_backends` settings stored in the
+database apply after a restart (live per-user connections read them at
+startup), and the tokens that `import-config` issues for `[[tokens]]` entries
+expire after the service-token lifetime (365 days) and are shown once, so they
+need a rotation plan.
 
 ### Phase 0 - Groundwork (no behaviour change)
 
@@ -859,32 +863,39 @@ by a few environment variables plus the database; everything else is edited
 in the admin UI and API, audited, and shared by all replicas. Standalone mode
 (no database) keeps reading the file until it is retired in a major release.
 
-- [ ] Bootstrap from environment only: `AXON_DATABASE_URL`, `AXON_BIND`,
+- [x] Bootstrap from environment only: `AXON_DATABASE_URL`, `AXON_BIND`,
       `AXON_BASE_URL`, `AXON_KEK_FILE`, and one bootstrap OIDC provider
       (`AXON_OIDC_ISSUER`, `_CLIENT_ID`, `_CLIENT_SECRET_FILE`,
       `_ADMIN_GROUPS`). Without the provider variables the break-glass link
       is the way in.
-- [ ] Database-managed objects, each with a table, admin page, `/api/v1`
+- [x] Database-managed objects, each with a table, admin page, `/api/v1`
       endpoints, audit actions and the 30 s replica refresh (or LISTEN/NOTIFY
       from Phase 4): backends (transport, URL or command, headers, timeouts,
       circuit breaker; secrets envelope-encrypted, Phase 5 `crypto/`), config
       toolsets, OIDC providers (with their admin groups and claim names),
       gateway settings (rate limits, CORS-free defaults, idle timeout).
       RBAC groups, grants and role bindings are already in the database.
-- [ ] Hot reload becomes "apply on save": a backend change restarts only that
-      backend actor; the file watcher is removed in database mode.
-- [ ] Migration command `axon-gateway admin import-config <config.toml>`:
+- [x] Hot reload becomes "apply on save": a backend change restarts only the
+      backends whose config changed; the file watcher is removed in database
+      mode. Replicas reload on the `config` notification, with a 30 s poll as
+      the backstop.
+- [x] Migration command `axon-gateway admin import-config <config.toml>`:
       imports backends, toolsets, `[rbac]`, `[[auth.oidc]]` and `[[tokens]]`
       (as service accounts with fresh PATs printed once) into the database,
       idempotent, with a dry-run. After import, config objects lose their
       read-only `source = config` status.
-- [ ] Remove the config layer of RBAC (`Source::Config`, 409 on write) once
+- [x] Remove the config layer of RBAC (`Source::Config`, 409 on write) once
       import exists; `[[rbac.groups]] service_accounts` becomes ordinary
       database membership.
-- [ ] stdio backends stay admin-only; their command and arguments are
+- [x] stdio backends stay admin-only; their command and arguments are
       editable only with `backends.manage` and an explicit allow setting.
 - [ ] NixOS module and Helm chart move from a rendered TOML file to
-      environment variables plus a one-shot import.
+      environment variables plus a one-shot import. The Helm chart is done
+      (`database.enabled`, and an `import` hook Job, off by default, that
+      prints the new tokens to its log once); the NixOS module is the user's.
+- Notes: the explicit allow setting for stdio is the environment variable
+  `AXON_ALLOW_STDIO=true`, which the UI and API cannot change. Standalone mode
+  refuses `[database]`, `[[auth.oidc]]`, `[rbac]` and per-user backends.
 - Exit: a fresh instance starts with only environment variables, an admin
   adds a backend in the UI, and a second replica serves it within 30 s.
 

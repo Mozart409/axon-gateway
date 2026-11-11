@@ -79,12 +79,15 @@ bacon pedantic
 - **backend.rs**: BackendActor - per-MCP-server connection management
 - **registry.rs**: RegistryActor - tool aggregation and routing
 - **server.rs**: HTTP server (axum) - router, middleware, shared state; handlers in `server/{ui,mcp,api,auth}.rs` (`api.rs` has `/health`, `/livez`, `/readyz`, `/build`, `/status*`, `/metrics`)
-- **config.rs**: Config types and TOML parsing
+- **config.rs**: Config types and TOML parsing (standalone mode and the import)
+- **bootstrap.rs**: the environment of database mode (`AXON_DATABASE_URL`, `AXON_BIND`, `AXON_BASE_URL`, `AXON_ALLOW_STDIO`, `AXON_OIDC_*`)
+- **dbconfig.rs**: assembles the runtime `Config` from the database tables (backends, toolsets, OIDC providers, settings); secrets are sealed with the KEK
+- **import.rs**: `admin import-config <file> [--dry-run]`, which writes a config file into the database
 - **types.rs**: Core domain types (ToolDefinition, JsonRpc, etc.)
 - **error.rs**: Error types using thiserror
 - **auth.rs**: Authentication middleware and token validation
 - **metrics.rs**: Prometheus metrics recording functions
-- **watcher.rs**: Config file watcher for hot reload
+- **watcher.rs**: Config file watcher for hot reload (standalone mode only; database mode reloads on the `config` notification, with a 30 s poll, from `fanout.rs`)
 
 ### UI Stack (Dashboard)
 - **Rendering**: Server-side HTML rendering with **maud** in `server.rs`
@@ -145,7 +148,7 @@ crates under `tests/` allow them at crate level.
 - Edition 2024 is used
 - No lib.rs - this is a binary-only crate
 - Backend actors use real rmcp client connections (not mocks)
-- Config file is TOML format with sections `[gateway]` and `[[backends]]`
+- Standalone mode reads a TOML file with sections `[gateway]` and `[[backends]]`; it refuses `[database]`, `[[auth.oidc]]`, `[rbac]` and per-user backends. Database mode (`AXON_DATABASE_URL` set) reads no file: the config lives in the database and the environment, and a file argument is an error
 - SSE and HTTP transports both use rmcp's `StreamableHttpClientTransport`
 - Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
 - `auth_token` in `[gateway]` config only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard routes. The unauthenticated UI is intended (it sits on the homelab network), so the guard against other web pages is: no CORS layer at all (don't add `CorsLayer::permissive()` back), and the state-changing `POST /ui/actions/*` routes go through `reject_cross_site_middleware`, which returns 403 when `Sec-Fetch-Site` is not `same-origin`/`none` or the `Origin` matches neither `Host` nor `base_url`. Requests without either header (curl) pass

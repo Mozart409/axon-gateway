@@ -26,7 +26,7 @@ use crate::policy::ToolRef;
 use crate::principal::PrincipalPolicy;
 use crate::registry::{
     GetBackendStatus, ListTools, ListToolset, ListToolsets, RegisterBackend, RegistryActor,
-    RemoveBackend, ResolveToolBackend, ToolRoute,
+    RemoveBackend, ResolveToolBackend, SetToolsets, ToolRoute,
 };
 use crate::types::{
     BackendInfo, JsonRpcRequest, JsonRpcResponse, NamespacedPrompt, NamespacedResource,
@@ -1301,6 +1301,7 @@ pub struct ReloadConfig {
 impl Message<ReloadConfig> for GatewayActor {
     type Reply = Result<ReloadResult, String>;
 
+    #[allow(clippy::too_many_lines)]
     async fn handle(
         &mut self,
         msg: ReloadConfig,
@@ -1309,6 +1310,7 @@ impl Message<ReloadConfig> for GatewayActor {
         let new_config = msg.config;
         let mut added = Vec::new();
         let mut removed = Vec::new();
+        let mut changed = Vec::new();
         let mut errors = Vec::new();
 
         // Find backends to add (in new config but not current)
@@ -1339,7 +1341,29 @@ impl Message<ReloadConfig> for GatewayActor {
             if !backend_config.enabled || backend_config.is_per_user() {
                 continue;
             }
-            if !current_names.contains(&backend_config.name) {
+            let is_new = !current_names.contains(&backend_config.name);
+            let was_changed = !is_new
+                && self
+                    .config
+                    .backends
+                    .iter()
+                    .find(|b| b.name == backend_config.name)
+                    .is_some_and(|old| old != backend_config);
+            if was_changed {
+                // Restart it on the new config: stop the old actor and drop its routes
+                if let Some(actor_ref) = self.backends_mut().remove(&backend_config.name) {
+                    if let Err(e) = actor_ref.stop_gracefully().await {
+                        errors.push(format!("Failed to stop '{}': {e:?}", backend_config.name));
+                    }
+                    let _ = self
+                        .registry
+                        .tell(RemoveBackend {
+                            name: backend_config.name.clone(),
+                        })
+                        .await;
+                }
+            }
+            if is_new || was_changed {
                 // Register in registry
                 if let Err(e) = self
                     .registry
@@ -1367,11 +1391,27 @@ impl Message<ReloadConfig> for GatewayActor {
                     BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
                 self.backends_mut()
                     .insert(backend_config.name.clone(), actor_ref);
-                added.push(backend_config.name.clone());
+                if was_changed {
+                    changed.push(backend_config.name.clone());
+                } else {
+                    added.push(backend_config.name.clone());
+                }
             }
         }
 
-        // Update internal config
+        // Toolsets only filter the registry's tool list
+        if let Err(e) = self
+            .registry
+            .tell(SetToolsets {
+                toolsets: new_config.toolsets.clone(),
+            })
+            .await
+        {
+            errors.push(format!("Failed to update the toolsets: {e:?}"));
+        }
+
+        // Update internal config. New and restarted backends above already used the
+        // new idle timeout; the running ones keep theirs until they restart.
         self.config = new_config;
 
         // The catalog comes from the config's `per_user` entries: reload it,
@@ -1388,15 +1428,17 @@ impl Message<ReloadConfig> for GatewayActor {
         }
 
         tracing::info!(
-            "Config reloaded: {} added, {} removed, {} errors",
+            "Config reloaded: {} added, {} removed, {} restarted, {} errors",
             added.len(),
             removed.len(),
+            changed.len(),
             errors.len()
         );
 
         Ok(ReloadResult {
             added,
             removed,
+            changed,
             errors,
         })
     }
@@ -1406,6 +1448,8 @@ impl Message<ReloadConfig> for GatewayActor {
 pub struct ReloadResult {
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    /// Backends restarted because their configuration changed
+    pub changed: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -1592,6 +1636,7 @@ mod tests {
             let result = ReloadResult {
                 added: vec!["new1".to_string(), "new2".to_string()],
                 removed: vec!["old1".to_string()],
+                changed: vec![],
                 errors: vec![],
             };
 
@@ -1606,6 +1651,7 @@ mod tests {
             let result = ReloadResult {
                 added: vec![],
                 removed: vec![],
+                changed: vec![],
                 errors: vec!["Failed to connect".to_string()],
             };
 
@@ -1821,7 +1867,7 @@ mod tests {
             opt_outs: &[(&str, Option<&str>)],
             scope: TokenScope,
         ) -> Arc<Caller> {
-            use crate::policy::{GrantConfig, OptOuts, Policy, RbacConfig, RbacGroupConfig};
+            use crate::policy::{GrantConfig, OptOuts, Policy, RbacGroupConfig, RbacSnapshot};
 
             let grant = |backend: &str, include: &[&str]| GrantConfig {
                 group: String::from("dev"),
@@ -1831,19 +1877,23 @@ mod tests {
                 read_only: false,
                 mandatory: false,
             };
-            let config = RbacConfig {
+            let snapshot = RbacSnapshot {
                 groups: vec![RbacGroupConfig {
                     name: String::from("dev"),
                     description: None,
                     idp: Vec::new(),
                     service_accounts: Vec::new(),
                 }],
-                grants: vec![grant("public", &["*"]), grant("secret", &["nothing"])],
+                memberships: Vec::new(),
+                grants: vec![
+                    (1, grant("public", &["*"])),
+                    (2, grant("secret", &["nothing"])),
+                ],
                 role_bindings: Vec::new(),
                 roles: Vec::new(),
             };
             let groups: Vec<String> = groups.iter().map(ToString::to_string).collect();
-            let effective = Policy::from_config(&config).effective(&groups);
+            let effective = Policy::from_snapshot(&snapshot).effective(&groups);
             let opt_outs = OptOuts::new(
                 opt_outs
                     .iter()
