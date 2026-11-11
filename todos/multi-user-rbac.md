@@ -846,8 +846,8 @@ next two, 7c: the rest):
 
 - [x] Resource-server JWT mode.
 - [x] MCP OAuth authorization server (RFC 9728, RFC 7591, PKCE, refresh).
-- [ ] Upstream OAuth for backends ("Connect" button).
-- [ ] Token-exchange passthrough (RFC 8693).
+- [x] Upstream OAuth for backends ("Connect" button).
+- [x] Token-exchange passthrough (RFC 8693, plus Entra on-behalf-of).
 - [ ] SCIM 2.0.
 - [ ] Custom roles.
 - [ ] Entra groups-overage Graph lookup (fallback only; app roles are the default, section 5).

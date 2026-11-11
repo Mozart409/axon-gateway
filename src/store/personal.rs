@@ -21,8 +21,9 @@ const MAX_ERROR_CHARS: usize = 500;
 
 const PERSONAL_COLUMNS: &str = "id, owner_id, prefix, url, header_names, secret_kek_id, secret_dek, secret_data, \
      enabled, created_at, updated_at, last_ok_at, last_error_at, last_error";
-const CATALOG_COLUMNS: &str =
-    "name, description, url, credential_fields, enabled, created_by, created_at, updated_at";
+const CATALOG_COLUMNS: &str = "name, description, url, credential_fields, enabled, created_by, \
+     created_at, updated_at, auth, oauth_client_id, oauth_scopes, oauth_secret_kek_id, \
+     oauth_secret_dek, oauth_secret_data";
 const CREDENTIAL_COLUMNS: &str = "user_id, backend, secret_kek_id, secret_dek, secret_data, \
      created_at, updated_at, last_ok_at, last_error_at, last_error";
 
@@ -40,6 +41,18 @@ fn map_unique(error: sqlx::Error) -> PersonalError {
     match &error {
         sqlx::Error::Database(db) if db.is_unique_violation() => PersonalError::Exists,
         _ => PersonalError::Store(StoreError::Query(error)),
+    }
+}
+
+/// One part of the secret an update sets; `None` for [`SecretUpdate::Clear`]
+/// (and unused for [`SecretUpdate::Keep`])
+fn secret_part<'a, T: ?Sized>(
+    update: &'a SecretUpdate,
+    part: impl FnOnce(&'a SealedColumns) -> &'a T,
+) -> Option<&'a T> {
+    match update {
+        SecretUpdate::Set(secret) => Some(part(secret)),
+        SecretUpdate::Keep | SecretUpdate::Clear => None,
     }
 }
 
@@ -151,6 +164,27 @@ pub struct PersonalBackendUpdate {
     pub headers: Option<(Vec<String>, Option<SealedColumns>)>,
 }
 
+/// How the users of a catalog entry authenticate to its backend
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CatalogAuthMode {
+    /// The values of `credential_fields`, sent as headers
+    #[default]
+    Fields,
+    /// OAuth: each user connects their own account
+    OAuth,
+}
+
+impl CatalogAuthMode {
+    /// The value of the `auth` column
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fields => "fields",
+            Self::OAuth => "oauth",
+        }
+    }
+}
+
 /// A catalog entry as stored
 #[derive(Debug, Clone)]
 pub struct CatalogEntry {
@@ -162,6 +196,13 @@ pub struct CatalogEntry {
     pub created_by: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub auth: CatalogAuthMode,
+    /// The static OAuth client; without it the gateway uses a client ID metadata
+    /// document or registers itself
+    pub oauth_client_id: Option<String>,
+    pub oauth_scopes: Vec<String>,
+    /// The sealed client secret of the static OAuth client
+    pub oauth_secret: Option<SealedColumns>,
 }
 
 #[derive(FromRow)]
@@ -174,10 +215,24 @@ struct CatalogRow {
     created_by: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    auth: String,
+    oauth_client_id: Option<String>,
+    oauth_scopes: Vec<String>,
+    oauth_secret_kek_id: Option<String>,
+    oauth_secret_dek: Option<Vec<u8>>,
+    oauth_secret_data: Option<Vec<u8>>,
 }
 
 impl From<CatalogRow> for CatalogEntry {
     fn from(row: CatalogRow) -> Self {
+        let oauth_secret = match (
+            row.oauth_secret_kek_id,
+            row.oauth_secret_dek,
+            row.oauth_secret_data,
+        ) {
+            (Some(kek_id), Some(dek), Some(data)) => Some(SealedColumns { kek_id, dek, data }),
+            _ => None,
+        };
         Self {
             name: row.name,
             description: row.description,
@@ -187,18 +242,45 @@ impl From<CatalogRow> for CatalogEntry {
             created_by: row.created_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            // The column's check constraint leaves no other value
+            auth: if row.auth == "oauth" {
+                CatalogAuthMode::OAuth
+            } else {
+                CatalogAuthMode::Fields
+            },
+            oauth_client_id: row.oauth_client_id,
+            oauth_scopes: row.oauth_scopes,
+            oauth_secret,
         }
     }
 }
 
 /// The fields of a catalog entry to create
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NewCatalogEntry {
     pub name: String,
     pub description: Option<String>,
     pub url: String,
     pub credential_fields: Vec<CredentialField>,
     pub created_by: Option<String>,
+    pub auth: CatalogAuthMode,
+    pub oauth_client_id: Option<String>,
+    pub oauth_scopes: Vec<String>,
+    pub oauth_secret: Option<SealedColumns>,
+}
+
+/// What to do with a stored sealed secret
+// `Clear` and `Set` are built by the admin form of a later slice.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SecretUpdate {
+    /// Leave it as it is
+    #[default]
+    Keep,
+    /// Remove it
+    Clear,
+    /// Replace it
+    Set(SealedColumns),
 }
 
 /// The fields of a catalog entry to change; `None` keeps the stored value
@@ -209,6 +291,11 @@ pub struct CatalogEntryUpdate {
     pub url: Option<String>,
     pub credential_fields: Option<Vec<CredentialField>>,
     pub enabled: Option<bool>,
+    pub auth: Option<CatalogAuthMode>,
+    /// `Some("")` clears the static client id
+    pub oauth_client_id: Option<String>,
+    pub oauth_scopes: Option<Vec<String>>,
+    pub oauth_secret: SecretUpdate,
 }
 
 /// One user's sealed credentials for a backend
@@ -483,14 +570,22 @@ impl Store {
         new: &NewCatalogEntry,
     ) -> Result<CatalogEntry, PersonalError> {
         let row: CatalogRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "insert into catalog_entries (name, description, url, credential_fields, created_by) \
-             values ($1, $2, $3, $4, $5) returning {CATALOG_COLUMNS}"
+            "insert into catalog_entries \
+             (name, description, url, credential_fields, created_by, auth, oauth_client_id, \
+              oauth_scopes, oauth_secret_kek_id, oauth_secret_dek, oauth_secret_data) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning {CATALOG_COLUMNS}"
         )))
         .bind(&new.name)
         .bind(new.description.as_deref())
         .bind(&new.url)
         .bind(Json(&new.credential_fields))
         .bind(new.created_by.as_deref())
+        .bind(new.auth.as_str())
+        .bind(new.oauth_client_id.as_deref())
+        .bind(&new.oauth_scopes)
+        .bind(new.oauth_secret.as_ref().map(|s| s.kek_id.as_str()))
+        .bind(new.oauth_secret.as_ref().map(|s| s.dek.as_slice()))
+        .bind(new.oauth_secret.as_ref().map(|s| s.data.as_slice()))
         .fetch_one(&self.pool)
         .await
         .map_err(map_unique)?;
@@ -513,6 +608,12 @@ impl Store {
              url = coalesce($4, url), \
              credential_fields = coalesce($5::jsonb, credential_fields), \
              enabled = coalesce($6, enabled), \
+             auth = coalesce($7::text, auth), \
+             oauth_client_id = case when $8 then nullif($9::text, '') else oauth_client_id end, \
+             oauth_scopes = coalesce($10::text[], oauth_scopes), \
+             oauth_secret_kek_id = case when $11 then $12::text else oauth_secret_kek_id end, \
+             oauth_secret_dek = case when $11 then $13::bytea else oauth_secret_dek end, \
+             oauth_secret_data = case when $11 then $14::bytea else oauth_secret_data end, \
              updated_at = now() \
              where name = $1 returning {CATALOG_COLUMNS}"
         )))
@@ -522,6 +623,14 @@ impl Store {
         .bind(update.url.as_deref())
         .bind(update.credential_fields.as_ref().map(Json))
         .bind(update.enabled)
+        .bind(update.auth.map(CatalogAuthMode::as_str))
+        .bind(update.oauth_client_id.is_some())
+        .bind(update.oauth_client_id.as_deref())
+        .bind(update.oauth_scopes.as_deref())
+        .bind(update.oauth_secret != SecretUpdate::Keep)
+        .bind(secret_part(&update.oauth_secret, |s| s.kek_id.as_str()))
+        .bind(secret_part(&update.oauth_secret, |s| s.dek.as_slice()))
+        .bind(secret_part(&update.oauth_secret, |s| s.data.as_slice()))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(Into::into))
@@ -818,6 +927,7 @@ mod tests {
             url: format!("https://{name}.example/mcp"),
             credential_fields: vec![field("token")],
             created_by: Some("admin".to_string()),
+            ..Default::default()
         }
     }
 

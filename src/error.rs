@@ -52,11 +52,11 @@ pub enum ConfigError {
         part: &'static str,
     },
 
-    #[error("backend '{name}' uses credential_mode = \"per_user\" but {reason}")]
+    #[error("backend '{name}' has an invalid per-user setup: {reason}")]
     InvalidPerUserBackend { name: String, reason: String },
 
     #[error(
-        "backend '{name}' uses credential_mode = \"per_user\" and needs a [database] section: user credentials are stored in Postgres"
+        "backend '{name}' has a per-user credential_mode and needs a [database] section: user credentials are stored in Postgres"
     )]
     PerUserRequiresDatabase { name: String },
 

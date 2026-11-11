@@ -21,6 +21,7 @@ mod replica;
 mod stats;
 mod tokens;
 mod toolsets;
+mod upstream_oauth;
 mod usage;
 mod views;
 
@@ -32,8 +33,9 @@ pub use oauth::{
     NewCode, NewOauthClient, OAUTH_ACCESS_PREFIX, OauthClient, OauthGrant,
 };
 pub use personal::{
-    AdminPersonalBackend, CatalogEntry, CatalogEntryUpdate, NewCatalogEntry, NewPersonalBackend,
-    PersonalBackend, PersonalBackendUpdate, PersonalError, SealedColumns, UserCredential,
+    AdminPersonalBackend, CatalogAuthMode, CatalogEntry, CatalogEntryUpdate, NewCatalogEntry,
+    NewPersonalBackend, PersonalBackend, PersonalBackendUpdate, PersonalError, SealedColumns,
+    SecretUpdate, UserCredential,
 };
 pub use rbac::{Actor, AuditRecord};
 pub use replica::MCP_SESSION_IDLE;
@@ -42,6 +44,7 @@ pub use tokens::{
     MAX_USER_TOKEN_LIFETIME, NewToken, PAT_PREFIX, ServiceAccount, TokenError,
 };
 pub use toolsets::{NewToolset, Toolset, ToolsetError};
+pub use upstream_oauth::{NewUpstreamRequest, NewUpstreamToken, UpstreamToken};
 #[cfg(test)]
 pub use usage::{BackendUsage, ToolUsage, UsageTotals};
 pub use usage::{

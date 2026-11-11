@@ -340,7 +340,9 @@ pub struct BackendConfig {
 
     /// `shared` (default): one connection with the backend's own credentials.
     /// `per_user`: no shared connection, each user stores their own credential
-    /// (`credential_fields`) and gets their own connection.
+    /// (`credential_fields`) and gets their own connection. `oauth`: each user
+    /// connects their own account through the backend's authorization server.
+    /// `passthrough`: the user's identity is exchanged for a backend token.
     #[serde(default)]
     pub credential_mode: CredentialMode,
 
@@ -348,6 +350,15 @@ pub struct BackendConfig {
     /// they are sent in
     #[serde(default)]
     pub credential_fields: Vec<CredentialField>,
+
+    /// For `oauth` backends: a static client; without it the gateway uses a
+    /// client ID metadata document or registers itself
+    #[serde(default)]
+    pub oauth: Option<UpstreamOAuthConfig>,
+
+    /// For `passthrough` backends: how the user's token is exchanged
+    #[serde(default)]
+    pub passthrough: Option<PassthroughConfig>,
 }
 
 /// Whose credentials a backend connection uses
@@ -359,6 +370,72 @@ pub enum CredentialMode {
     Shared,
     /// A connection per user, with the credential that user stored
     PerUser,
+    /// A connection per user, with the tokens the backend's authorization
+    /// server gave that user
+    #[serde(rename = "oauth")]
+    OAuth,
+    /// A connection per user, with a token exchanged from the user's identity
+    Passthrough,
+}
+
+/// `[backends.oauth]`: the static OAuth client of an `oauth` backend
+#[derive(Clone, Deserialize)]
+pub struct UpstreamOAuthConfig {
+    pub client_id: String,
+    /// Env var holding the client secret; unset for a public client
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
+    /// The secret read from `client_secret_env` when the config loads
+    #[serde(skip)]
+    pub client_secret: Option<String>,
+    /// Scopes to ask for; empty uses the ones the backend advertises
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl std::fmt::Debug for UpstreamOAuthConfig {
+    // By hand, so the client secret can never end up in a log line.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret_env", &self.client_secret_env)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+/// How a `passthrough` backend gets its token
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassthroughGrant {
+    /// RFC 8693 token exchange
+    TokenExchange,
+    /// Entra on-behalf-of
+    EntraObo,
+}
+
+/// `[backends.passthrough]`: trade the user's identity provider token for one
+/// the backend accepts
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PassthroughConfig {
+    pub grant: PassthroughGrant,
+    /// Id of the `[[auth.oidc]]` provider that issued the user's token; its
+    /// token endpoint and client credentials are used
+    pub provider: String,
+    /// Token exchange `audience`
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Token exchange `scope`; the scope of an Entra on-behalf-of request
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Token exchange `resource`
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 /// One credential a user enters for a `per_user` backend. The gateway sends
@@ -392,10 +469,11 @@ impl BackendConfig {
         (secs > 0).then(|| Duration::from_secs(secs))
     }
 
-    /// Whether each user brings their own credential (no shared connection)
+    /// Whether each user has their own connection (no shared one): a stored
+    /// credential, an OAuth sign-in or a passthrough token
     #[must_use]
     pub fn is_per_user(&self) -> bool {
-        self.credential_mode == CredentialMode::PerUser
+        self.credential_mode != CredentialMode::Shared
     }
 }
 
@@ -444,6 +522,8 @@ impl Default for BackendConfig {
             idle_timeout_secs: None,
             credential_mode: CredentialMode::Shared,
             credential_fields: Vec::new(),
+            oauth: None,
+            passthrough: None,
         }
     }
 }
@@ -556,6 +636,19 @@ impl Config {
                 &format!("backends[{index}].env"),
                 env_vars,
             )?;
+            if let Some(oauth) = backend.oauth.as_mut()
+                && let Some(var) = &oauth.client_secret_env
+            {
+                let Some(secret) = env_vars.get(var).filter(|secret| !secret.is_empty()) else {
+                    return Err(ConfigError::InvalidPerUserBackend {
+                        name: backend.name.clone(),
+                        reason: format!(
+                            "oauth.client_secret_env names {var}, which is unset or empty"
+                        ),
+                    });
+                };
+                oauth.client_secret = Some(secret.clone());
+            }
         }
 
         for (index, toolset) in self.toolsets.iter_mut().enumerate() {
@@ -647,46 +740,154 @@ impl Config {
         self.validate_rbac()
     }
 
-    /// `per_user` backends: HTTP/SSE with a url, at least one well-formed
-    /// credential field, and a database to store the credentials in.
+    /// Per-user backends (`per_user`, `oauth`, `passthrough`): a url, a
+    /// database to store the connections in, and the settings of their mode.
+    /// `per_user` is HTTP/SSE with well-formed credential fields; the others
+    /// are HTTP only.
     fn validate_per_user_backends(&self) -> Result<(), ConfigError> {
-        for backend in self.backends.iter().filter(|b| b.is_per_user()) {
+        for backend in &self.backends {
             let name = &backend.name;
             let invalid = |reason: String| ConfigError::InvalidPerUserBackend {
                 name: name.clone(),
                 reason,
             };
+            if !backend.is_per_user() {
+                if backend.oauth.is_some() {
+                    return Err(invalid(
+                        "the oauth table needs credential_mode = \"oauth\"".into(),
+                    ));
+                }
+                if backend.passthrough.is_some() {
+                    return Err(invalid(
+                        "the passthrough table needs credential_mode = \"passthrough\"".into(),
+                    ));
+                }
+                continue;
+            }
+            let per_user = backend.credential_mode == CredentialMode::PerUser;
             if backend.transport == TransportType::Stdio {
-                return Err(invalid("stdio is not supported, use http or sse".into()));
+                return Err(invalid(if per_user {
+                    "stdio is not supported, use http or sse".into()
+                } else {
+                    "stdio is not supported, use http".into()
+                }));
+            }
+            if !per_user && backend.transport != TransportType::Http {
+                return Err(invalid("it needs transport = \"http\"".into()));
             }
             if backend.url.is_none() {
                 return Err(invalid("it needs a url".into()));
             }
-            if backend.credential_fields.is_empty() {
-                return Err(invalid(
-                    "it needs at least one credential_fields entry".into(),
-                ));
-            }
-            let mut seen = std::collections::HashSet::new();
-            for field in &backend.credential_fields {
-                if field.name.is_empty() {
-                    return Err(invalid("a credential field has an empty name".into()));
+            match backend.credential_mode {
+                CredentialMode::PerUser => {
+                    if backend.oauth.is_some() {
+                        return Err(invalid(
+                            "the oauth table needs credential_mode = \"oauth\"".into(),
+                        ));
+                    }
+                    if backend.passthrough.is_some() {
+                        return Err(invalid(
+                            "the passthrough table needs credential_mode = \"passthrough\"".into(),
+                        ));
+                    }
+                    Self::validate_credential_fields(backend).map_err(invalid)?;
                 }
-                if !seen.insert(field.name.as_str()) {
-                    return Err(invalid(format!(
-                        "credential field '{}' is listed twice",
-                        field.name
-                    )));
+                CredentialMode::OAuth => {
+                    if !backend.credential_fields.is_empty() {
+                        return Err(invalid("credential_fields must be empty".into()));
+                    }
+                    if backend.passthrough.is_some() {
+                        return Err(invalid(
+                            "the passthrough table needs credential_mode = \"passthrough\"".into(),
+                        ));
+                    }
+                    if let Some(oauth) = &backend.oauth {
+                        if oauth.client_id.is_empty() {
+                            return Err(invalid("oauth.client_id must not be empty".into()));
+                        }
+                        if oauth.scopes.iter().any(String::is_empty) {
+                            return Err(invalid(
+                                "oauth.scopes must not hold an empty scope".into(),
+                            ));
+                        }
+                    }
                 }
-                if http::HeaderName::from_bytes(field.header.as_bytes()).is_err() {
-                    return Err(invalid(format!(
-                        "credential field '{}' has an invalid header name '{}'",
-                        field.name, field.header
-                    )));
+                CredentialMode::Passthrough => {
+                    if !backend.credential_fields.is_empty() {
+                        return Err(invalid("credential_fields must be empty".into()));
+                    }
+                    if backend.oauth.is_some() {
+                        return Err(invalid(
+                            "the oauth table needs credential_mode = \"oauth\"".into(),
+                        ));
+                    }
+                    self.validate_passthrough(backend).map_err(invalid)?;
                 }
+                CredentialMode::Shared => {}
             }
             if self.database.is_none() {
                 return Err(ConfigError::PerUserRequiresDatabase { name: name.clone() });
+            }
+        }
+        Ok(())
+    }
+
+    /// At least one well-formed credential field, each name used once
+    fn validate_credential_fields(backend: &BackendConfig) -> Result<(), String> {
+        if backend.credential_fields.is_empty() {
+            return Err("it needs at least one credential_fields entry".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for field in &backend.credential_fields {
+            if field.name.is_empty() {
+                return Err("a credential field has an empty name".into());
+            }
+            if !seen.insert(field.name.as_str()) {
+                return Err(format!("credential field '{}' is listed twice", field.name));
+            }
+            if http::HeaderName::from_bytes(field.header.as_bytes()).is_err() {
+                return Err(format!(
+                    "credential field '{}' has an invalid header name '{}'",
+                    field.name, field.header
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The passthrough table: present, naming a configured provider, and
+    /// complete for its grant
+    fn validate_passthrough(&self, backend: &BackendConfig) -> Result<(), String> {
+        let Some(passthrough) = &backend.passthrough else {
+            return Err("it needs a passthrough table".into());
+        };
+        let Some(provider) = self
+            .auth
+            .oidc
+            .iter()
+            .find(|provider| provider.id == passthrough.provider)
+        else {
+            return Err(format!(
+                "passthrough.provider '{}' is not an [[auth.oidc]] id",
+                passthrough.provider
+            ));
+        };
+        let blank = |value: Option<&str>| value.is_some_and(str::is_empty);
+        if blank(passthrough.audience.as_deref())
+            || blank(passthrough.scope.as_deref())
+            || blank(passthrough.resource.as_deref())
+        {
+            return Err("passthrough.audience, scope and resource must not be empty".into());
+        }
+        if passthrough.grant == PassthroughGrant::EntraObo {
+            if passthrough.scope.is_none() {
+                return Err("the entra_obo grant needs passthrough.scope".into());
+            }
+            if provider.client_secret_env.is_none() {
+                return Err(format!(
+                    "the entra_obo grant needs a client secret: set client_secret_env on provider '{}'",
+                    provider.id
+                ));
             }
         }
         Ok(())
@@ -1954,6 +2155,225 @@ name = "same"
         fn shared_backends_need_none_of_it() {
             let config = parse("transport = \"http\"\nurl = \"http://x\"", "");
             config.validate().expect("should be valid");
+        }
+
+        const HTTP: &str = "transport = \"http\"\nurl = \"http://localhost:9000\"";
+
+        const OIDC: &str = r#"
+            [[auth.oidc]]
+            id = "entra"
+            issuer = "https://login.example.com/v2.0"
+            client_id = "app"
+            client_secret_env = "ENTRA_SECRET"
+        "#;
+
+        const OIDC_PUBLIC: &str = r#"
+            [[auth.oidc]]
+            id = "entra"
+            issuer = "https://login.example.com/v2.0"
+            client_id = "app"
+        "#;
+
+        fn with_mode(mode: &str, extra: &str) -> Config {
+            parse(&format!("{HTTP}\ncredential_mode = \"{mode}\""), extra)
+        }
+
+        fn passthrough(table: &str, oidc: &str) -> Config {
+            with_mode(
+                "passthrough",
+                &format!("[backends.passthrough]\n{table}\n[database]\n{oidc}"),
+            )
+        }
+
+        #[test]
+        fn parses_an_oauth_backend() {
+            let config = with_mode(
+                "oauth",
+                "[backends.oauth]\nclient_id = \"c\"\nclient_secret_env = \"WIKI_SECRET\"\nscopes = [\"read\", \"write\"]\n[database]",
+            );
+            let backend = &config.backends[0];
+            assert_eq!(backend.credential_mode, CredentialMode::OAuth);
+            assert!(backend.is_per_user());
+            let oauth = backend.oauth.as_ref().expect("oauth table");
+            assert_eq!(oauth.client_id, "c");
+            assert_eq!(oauth.client_secret_env.as_deref(), Some("WIKI_SECRET"));
+            assert_eq!(oauth.client_secret, None, "read when the config loads");
+            assert_eq!(oauth.scopes, ["read", "write"]);
+            config.validate().expect("should be valid");
+        }
+
+        #[test]
+        fn an_oauth_backend_needs_no_static_client() {
+            let config = with_mode("oauth", "[database]");
+            assert!(config.backends[0].oauth.is_none());
+            config.validate().expect("should be valid");
+        }
+
+        #[test]
+        fn the_oauth_client_secret_is_read_from_the_environment() {
+            let mut config = with_mode(
+                "oauth",
+                "[backends.oauth]\nclient_id = \"c\"\nclient_secret_env = \"WIKI_SECRET\"\n[database]",
+            );
+            let mut env = HashMap::new();
+            env.insert("WIKI_SECRET".to_string(), "hunter2".to_string());
+            config.resolve_env_vars(&env).expect("should resolve");
+            let oauth = config.backends[0].oauth.as_ref().expect("oauth table");
+            assert_eq!(oauth.client_secret.as_deref(), Some("hunter2"));
+            assert!(!format!("{oauth:?}").contains("hunter2"));
+
+            env.insert("WIKI_SECRET".to_string(), String::new());
+            let error = config.resolve_env_vars(&env).expect_err("empty secret");
+            assert!(error.to_string().contains("WIKI_SECRET"), "{error}");
+            let error = config
+                .resolve_env_vars(&HashMap::new())
+                .expect_err("unset secret");
+            assert!(error.to_string().contains("WIKI_SECRET"), "{error}");
+        }
+
+        #[test]
+        fn an_oauth_backend_needs_http_a_url_and_a_database() {
+            let config = parse(
+                "transport = \"sse\"\nurl = \"http://x\"\ncredential_mode = \"oauth\"",
+                "[database]",
+            );
+            assert!(reason(&config).contains("http"));
+            let config = parse(
+                "transport = \"stdio\"\ncommand = \"x\"\ncredential_mode = \"oauth\"",
+                "[database]",
+            );
+            assert!(reason(&config).contains("stdio"));
+            let config = with_mode("oauth", "");
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::PerUserRequiresDatabase { .. })
+            ));
+        }
+
+        #[test]
+        fn an_oauth_backend_takes_no_credential_fields() {
+            let config = with_mode("oauth", &format!("{FIELD}\n[database]"));
+            assert!(reason(&config).contains("credential_fields must be empty"));
+        }
+
+        #[test]
+        fn an_oauth_client_needs_an_id() {
+            let config = with_mode("oauth", "[backends.oauth]\nclient_id = \"\"\n[database]");
+            assert!(reason(&config).contains("client_id"));
+        }
+
+        #[test]
+        fn the_oauth_table_is_only_for_the_oauth_mode() {
+            let table = "[backends.oauth]\nclient_id = \"c\"\n[database]";
+            let config = per_user(&format!("{FIELD}\n{table}"));
+            assert!(reason(&config).contains("credential_mode = \"oauth\""));
+            let config = parse(HTTP, table);
+            assert!(reason(&config).contains("credential_mode = \"oauth\""));
+            let config = passthrough(
+                "grant = \"token_exchange\"\nprovider = \"entra\"\n[backends.oauth]\nclient_id = \"c\"",
+                OIDC,
+            );
+            assert!(reason(&config).contains("credential_mode = \"oauth\""));
+        }
+
+        #[test]
+        fn the_passthrough_table_is_only_for_the_passthrough_mode() {
+            let table = "[backends.passthrough]\ngrant = \"token_exchange\"\nprovider = \"entra\"\n[database]";
+            let config = parse(HTTP, table);
+            assert!(reason(&config).contains("credential_mode = \"passthrough\""));
+            let config = with_mode(
+                "oauth",
+                "[backends.passthrough]\ngrant = \"token_exchange\"\nprovider = \"entra\"\n[database]",
+            );
+            assert!(reason(&config).contains("credential_mode = \"passthrough\""));
+        }
+
+        #[test]
+        fn parses_a_token_exchange_backend() {
+            let config = passthrough(
+                "grant = \"token_exchange\"\nprovider = \"entra\"\naudience = \"api://wiki\"\nscope = \"read\"\nresource = \"https://wiki.example.com\"",
+                OIDC_PUBLIC,
+            );
+            let backend = &config.backends[0];
+            assert_eq!(backend.credential_mode, CredentialMode::Passthrough);
+            assert!(backend.is_per_user());
+            assert_eq!(
+                backend.passthrough,
+                Some(PassthroughConfig {
+                    grant: PassthroughGrant::TokenExchange,
+                    provider: "entra".into(),
+                    audience: Some("api://wiki".into()),
+                    scope: Some("read".into()),
+                    resource: Some("https://wiki.example.com".into()),
+                })
+            );
+            config.validate().expect("should be valid");
+        }
+
+        #[test]
+        fn parses_an_entra_obo_backend() {
+            let config = passthrough(
+                "grant = \"entra_obo\"\nprovider = \"entra\"\nscope = \"api://wiki/.default\"",
+                OIDC,
+            );
+            let passthrough = config.backends[0].passthrough.as_ref().expect("table");
+            assert_eq!(passthrough.grant, PassthroughGrant::EntraObo);
+            config.validate().expect("should be valid");
+        }
+
+        #[test]
+        fn a_passthrough_backend_needs_its_table() {
+            let config = with_mode("passthrough", &format!("[database]\n{OIDC}"));
+            assert!(reason(&config).contains("passthrough table"));
+        }
+
+        #[test]
+        fn the_passthrough_provider_must_be_configured() {
+            let config = passthrough("grant = \"token_exchange\"\nprovider = \"other\"", OIDC);
+            assert!(reason(&config).contains("'other'"));
+            let config = passthrough("grant = \"token_exchange\"\nprovider = \"entra\"", "");
+            assert!(reason(&config).contains("'entra'"));
+        }
+
+        #[test]
+        fn entra_obo_needs_a_scope_and_a_client_secret() {
+            let config = passthrough("grant = \"entra_obo\"\nprovider = \"entra\"", OIDC);
+            assert!(reason(&config).contains("passthrough.scope"));
+            let config = passthrough(
+                "grant = \"entra_obo\"\nprovider = \"entra\"\nscope = \"api://x/.default\"",
+                OIDC_PUBLIC,
+            );
+            assert!(reason(&config).contains("client secret"));
+        }
+
+        #[test]
+        fn passthrough_takes_no_fields_and_needs_a_database() {
+            let config = with_mode(
+                "passthrough",
+                &format!(
+                    "{FIELD}\n[backends.passthrough]\ngrant = \"token_exchange\"\nprovider = \"entra\"\n[database]\n{OIDC}"
+                ),
+            );
+            assert!(reason(&config).contains("credential_fields must be empty"));
+
+            let config = with_mode(
+                "passthrough",
+                &format!(
+                    "[backends.passthrough]\ngrant = \"token_exchange\"\nprovider = \"entra\"\n{OIDC}"
+                ),
+            );
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::PerUserRequiresDatabase { .. })
+            ));
+        }
+
+        #[test]
+        fn an_unknown_grant_does_not_parse() {
+            let toml = format!(
+                "{BASE}\n[[backends]]\nname = \"cat\"\n{HTTP}\ncredential_mode = \"passthrough\"\n[backends.passthrough]\ngrant = \"magic\"\nprovider = \"entra\""
+            );
+            assert!(toml::from_str::<Config>(&toml).is_err());
         }
     }
 }

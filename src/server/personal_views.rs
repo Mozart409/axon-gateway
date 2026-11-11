@@ -19,7 +19,7 @@ use super::admin_views::{
 };
 use super::personal_api::{CatalogView, PersonalSaved};
 use crate::config::CredentialField;
-use crate::personal::CatalogSource;
+use crate::personal::{CatalogAuth, CatalogItem, CatalogSource};
 use crate::store::{AdminPersonalBackend, PersonalBackend, SessionUser};
 
 const BACKENDS: &str = "#my-backends";
@@ -339,10 +339,85 @@ fn credential_state(view: &CatalogView) -> Markup {
     }
 }
 
+/// What the admin form shows of an entry's OAuth settings: the client id, the
+/// scopes and whether a client secret is stored (its value never is)
+struct OauthSettings {
+    client_id: String,
+    scopes: String,
+    secret_set: bool,
+}
+
+fn oauth_settings(item: &CatalogItem) -> OauthSettings {
+    match &item.auth {
+        CatalogAuth::OAuth {
+            client,
+            scopes,
+            client_unusable,
+        } => OauthSettings {
+            client_id: client
+                .as_ref()
+                .map(|client| client.client_id.clone())
+                .unwrap_or_default(),
+            scopes: scopes.join(" "),
+            secret_set: *client_unusable
+                || client
+                    .as_ref()
+                    .is_some_and(|client| client.client_secret.is_some()),
+        },
+        CatalogAuth::Fields | CatalogAuth::Passthrough(_) => OauthSettings {
+            client_id: String::new(),
+            scopes: String::new(),
+            secret_set: false,
+        },
+    }
+}
+
+/// The `auth` choice and the OAuth inputs of the admin forms. `current` is
+/// `None` on the create form, which has no stored secret to keep or clear.
+fn oauth_inputs(oauth: bool, current: Option<&OauthSettings>) -> Markup {
+    let client_id = current.map_or("", |settings| settings.client_id.as_str());
+    let scopes = current.map_or("", |settings| settings.scopes.as_str());
+    let secret_set = current.is_some_and(|settings| settings.secret_set);
+    html! {
+        label class=(LABEL) {
+            "Sign-in"
+            select class=(INPUT) name="auth" {
+                option value="fields" selected[!oauth] { "credential fields" }
+                option value="oauth" selected[oauth] { "OAuth (users connect their account)" }
+            }
+        }
+        label class=(LABEL) {
+            "OAuth client ID (optional)"
+            input class=(format!("{INPUT} w-72")) type="text" name="oauth_client_id" value=(client_id) autocomplete="off";
+        }
+        label class=(LABEL) {
+            "OAuth scopes (space or comma separated)"
+            input class=(format!("{INPUT} w-72")) type="text" name="oauth_scopes" value=(scopes) autocomplete="off";
+        }
+        label class=(LABEL) {
+            "OAuth client secret"
+            input
+                class=(format!("{INPUT} w-72"))
+                type="password"
+                name="oauth_client_secret"
+                placeholder=(if secret_set { "stored; leave empty to keep it" } else { "" })
+                autocomplete="new-password";
+        }
+        @if secret_set {
+            label class=(LABEL) {
+                input type="checkbox" name="clear_oauth_secret" value="true";
+                " Clear the stored client secret"
+            }
+        }
+    }
+}
+
 /// The admin's forms for one entry of the database: edit and delete
 fn render_entry_admin(view: &CatalogView) -> Markup {
     let item = &view.item;
     let base = format!("/ui/actions/catalog/{}", item.name);
+    let settings = oauth_settings(item);
+    let oauth = matches!(item.auth, CatalogAuth::OAuth { .. });
     html! {
         details class="mt-3" {
             summary class="cursor-pointer text-xs text-slate-600 dark:text-slate-300" { "Edit entry" }
@@ -372,6 +447,7 @@ fn render_entry_admin(view: &CatalogView) -> Markup {
                         option value="false" selected[!item.enabled] { "disabled" }
                     }
                 }
+                (oauth_inputs(oauth, Some(&settings)))
                 button class=(BUTTON_SMALL) type="submit" { "Save entry" }
             }
             button
@@ -383,6 +459,121 @@ fn render_entry_admin(view: &CatalogView) -> Markup {
                 hx-confirm=(format!("Delete the catalog entry {}? Every user's credential for it goes with it.", item.name))
             {
                 "Delete entry"
+            }
+        }
+    }
+}
+
+/// The credential an entry takes: its fields, the user's stored credential
+/// and the forms for it
+fn render_credential(view: &CatalogView, base: &str) -> Markup {
+    let item = &view.item;
+    html! {
+        p class=(format!("mt-2 {MUTED}")) {
+            "Fields: "
+            @for (index, field) in item.credential_fields.iter().enumerate() {
+                @if index > 0 {
+                    ", "
+                }
+                (field_label(field))
+                @if view.manage {
+                    " ("
+                    code class=(CODE) {
+                        (field.header) ": " (field.prefix.as_deref().unwrap_or_default()) "<value>"
+                    }
+                    ")"
+                }
+            }
+        }
+        div class="mt-2 text-sm" {
+            "Your credential: "
+            (credential_state(view))
+        }
+        @if item.enabled {
+            form class=(FORM_COL) hx-post=(format!("{base}/credential")) hx-target=(CATALOG) hx-swap="outerHTML" {
+                div class=(FORM_ROW) {
+                    @for field in &item.credential_fields {
+                        label class=(LABEL) {
+                            (field_label(field))
+                            input
+                                class=(format!("{INPUT} w-72"))
+                                type="password"
+                                name=(format!("field:{}", field.name))
+                                autocomplete="new-password";
+                        }
+                    }
+                }
+                p class=(MUTED) {
+                    "Saving replaces your stored credential. Fields left empty are not stored."
+                }
+                button class=(BUTTON_SMALL) type="submit" { "Save credential" }
+            }
+        }
+        @if view.credential.is_some() {
+            button
+                class=(format!("mt-3 {BUTTON_DANGER}"))
+                type="button"
+                hx-post=(format!("{base}/credential/delete"))
+                hx-target=(CATALOG)
+                hx-swap="outerHTML"
+                hx-confirm=(format!("Remove your credential for {}?", item.name))
+            {
+                "Remove credential"
+            }
+        }
+    }
+}
+
+/// The OAuth connection of an entry: its state and the buttons to connect,
+/// connect again and disconnect. Connecting is a form post whose answer sends
+/// the browser to the service's sign-in (`HX-Redirect`).
+fn render_connection(view: &CatalogView, base: &str, client_unusable: bool) -> Markup {
+    let item = &view.item;
+    let connect = if view.connection.is_some() {
+        "Reconnect"
+    } else {
+        "Connect"
+    };
+    html! {
+        div class="mt-2 text-sm" {
+            "Your connection: "
+            @if let Some(connection) = &view.connection {
+                @if let Some(message) = &connection.last_error {
+                    span class=(BADGE_WARN) { "Reconnect needed" }
+                    @if let Some(failed_at) = connection.last_error_at {
+                        " "
+                        span class=(FAINT) { (when(failed_at)) }
+                    }
+                    div class=(format!("mt-1 break-words {MUTED}")) { (message) }
+                } @else {
+                    span class=(BADGE_OK) { "Connected" }
+                    " "
+                    span class=(FAINT) { "token expires " (when(connection.expires_at)) }
+                }
+            } @else {
+                span class=(BADGE_OFF) { "Not connected" }
+            }
+        }
+        @if client_unusable {
+            p class=(format!("mt-2 {MUTED}")) {
+                "The administrator's OAuth client secret for this service cannot be read, "
+                "so it cannot be connected until it is set again."
+            }
+        } @else if item.enabled {
+            form class="mt-3" hx-post=(format!("{base}/connect")) hx-swap="none" {
+                button class=(BUTTON_SMALL) type="submit" { (connect) }
+            }
+        }
+        @if view.connection.is_some() {
+            button
+                class=(format!("mt-3 {BUTTON_DANGER}"))
+                type="button"
+                hx-post=(format!("{base}/disconnect"))
+                hx-target=(CATALOG)
+                hx-swap="outerHTML"
+                hx-confirm=(format!("Disconnect {}?", item.name))
+            {
+                "Disconnect"
             }
         }
     }
@@ -415,56 +606,19 @@ fn render_entry(view: &CatalogView) -> Markup {
             @if view.manage {
                 p class=(format!("mt-1 break-all {MUTED}")) { code class=(CODE) { (item.url) } }
             }
-            p class=(format!("mt-2 {MUTED}")) {
-                "Fields: "
-                @for (index, field) in item.credential_fields.iter().enumerate() {
-                    @if index > 0 {
-                        ", "
-                    }
-                    (field_label(field))
-                    @if view.manage {
-                        " ("
-                        code class=(CODE) {
-                            (field.header) ": " (field.prefix.as_deref().unwrap_or_default()) "<value>"
-                        }
-                        ")"
-                    }
+            @match &item.auth {
+                CatalogAuth::Fields => { (render_credential(view, &base)) }
+                CatalogAuth::OAuth { client_unusable, .. } => {
+                    (render_connection(view, &base, *client_unusable))
                 }
-            }
-            div class="mt-2 text-sm" {
-                "Your credential: "
-                (credential_state(view))
-            }
-            @if item.enabled {
-                form class=(FORM_COL) hx-post=(format!("{base}/credential")) hx-target=(CATALOG) hx-swap="outerHTML" {
-                    div class=(FORM_ROW) {
-                        @for field in &item.credential_fields {
-                            label class=(LABEL) {
-                                (field_label(field))
-                                input
-                                    class=(format!("{INPUT} w-72"))
-                                    type="password"
-                                    name=(format!("field:{}", field.name))
-                                    autocomplete="new-password";
-                            }
+                CatalogAuth::Passthrough(_) => {
+                    div class="mt-2 text-sm" {
+                        span class=(BADGE_OK) { "Uses your sign-in" }
+                        " "
+                        span class=(MUTED) {
+                            "The gateway trades your sign-in for a token this service accepts."
                         }
                     }
-                    p class=(MUTED) {
-                        "Saving replaces your stored credential. Fields left empty are not stored."
-                    }
-                    button class=(BUTTON_SMALL) type="submit" { "Save credential" }
-                }
-            }
-            @if view.credential.is_some() {
-                button
-                    class=(format!("mt-3 {BUTTON_DANGER}"))
-                    type="button"
-                    hx-post=(format!("{base}/credential/delete"))
-                    hx-target=(CATALOG)
-                    hx-swap="outerHTML"
-                    hx-confirm=(format!("Remove your credential for {}?", item.name))
-                {
-                    "Remove credential"
                 }
             }
             @if view.manage && item.source == CatalogSource::Database {
@@ -497,7 +651,9 @@ fn render_catalog_create() -> Markup {
             h3 class=(SUBHEADING) { "New catalog entry" }
             p class=(format!("mt-1 {MUTED}")) {
                 "Each credential field is one input for the user and one header the gateway sends: "
-                "its value, with the prefix put in front. Empty rows are ignored."
+                "its value, with the prefix put in front. Empty rows are ignored. "
+                "For an OAuth entry leave the rows empty: each user connects their own account, "
+                "with the static client below or, without one, a client the gateway registers itself."
             }
             form class=(FORM_COL) hx-post="/ui/actions/catalog" hx-target=(CATALOG) hx-swap="outerHTML" {
                 div class=(FORM_ROW) {
@@ -515,6 +671,9 @@ fn render_catalog_create() -> Markup {
                     }
                 }
                 (field_rows())
+                div class=(FORM_ROW) {
+                    (oauth_inputs(false, None))
+                }
                 button class=(BUTTON) type="submit" { "Create entry" }
             }
         }
@@ -528,8 +687,8 @@ pub(super) fn render_catalog_section(entries: &[CatalogView], manage: bool) -> M
         section id="catalog" class=(CARD) {
             h2 class=(HEADING) { "Catalog" }
             p class=(format!("mt-1 {MUTED}")) {
-                "Servers the admin has set up for you to use with your own credential. "
-                "Store yours here and the tools appear in your session, named "
+                "Servers the admin has set up for you to use with your own credential or account. "
+                "Store a credential or connect here and the tools appear in your session, named "
                 code class=(CODE) { "<name>_<tool>" }
                 ". Credentials are stored encrypted and are never shown again."
             }
@@ -657,8 +816,10 @@ mod tests {
 
     use super::*;
     use crate::personal::CatalogItem;
+    use crate::personal::ConnectionStatus;
     use crate::server::tests::test_state;
     use crate::store::{SealedColumns, User, UserCredential};
+    use crate::upstream_oauth::ClientCredentials;
 
     fn session() -> SessionUser {
         SessionUser {
@@ -713,6 +874,7 @@ mod tests {
             description: Some(String::from("for <everyone>")),
             url: String::from("https://catalog.example.com/mcp"),
             credential_fields: vec![field("token", Some("API token")), field("org", None)],
+            auth: crate::personal::CatalogAuth::Fields,
             enabled,
             source,
             idle_timeout: Some(Duration::from_secs(300)),
@@ -741,7 +903,34 @@ mod tests {
         CatalogView {
             item,
             credential,
+            connection: None,
             manage,
+        }
+    }
+
+    fn oauth_item(name: &str) -> CatalogItem {
+        CatalogItem {
+            credential_fields: Vec::new(),
+            auth: CatalogAuth::OAuth {
+                client: Some(ClientCredentials {
+                    client_id: String::from("axon-client"),
+                    client_secret: Some(String::from("hunter2-client-secret")),
+                }),
+                scopes: vec![String::from("read"), String::from("write")],
+                client_unusable: false,
+            },
+            ..item(name, CatalogSource::Database, true)
+        }
+    }
+
+    fn connection(last_error: Option<&str>) -> ConnectionStatus {
+        ConnectionStatus {
+            backend: String::from("linear"),
+            issuer: String::from("https://auth.example.com"),
+            expires_at: Utc::now() + Span::hours(1),
+            last_error: last_error.map(str::to_owned),
+            last_error_at: last_error.map(|_| Utc::now()),
+            created_at: Utc::now(),
         }
     }
 
@@ -941,5 +1130,82 @@ mod tests {
 
         let empty = render_admin_section(&[]).into_string();
         assert!(empty.contains("No personal servers yet."));
+    }
+
+    #[test]
+    fn an_oauth_entry_offers_connect_and_no_credential_form() {
+        let entries = [view(oauth_item("linear"), None, false)];
+        let html = render_catalog_section(&entries, false).into_string();
+
+        assert!(html.contains(">Not connected<"));
+        assert!(html.contains("hx-post=\"/ui/actions/catalog/linear/connect\""));
+        assert!(html.contains(">Connect<"));
+        assert!(!html.contains("disconnect"));
+        assert!(!html.contains("type=\"password\""));
+        assert!(!html.contains("/credential"));
+        assert!(!html.contains("Uses your sign-in"));
+    }
+
+    #[test]
+    fn a_connected_entry_shows_its_expiry_and_can_be_disconnected() {
+        let mut entry = view(oauth_item("linear"), None, false);
+        entry.connection = Some(connection(None));
+        let html = render_catalog_section(&[entry], false).into_string();
+
+        assert!(html.contains(">Connected<"));
+        assert!(html.contains("token expires "));
+        assert!(html.contains(">Reconnect<"));
+        assert!(html.contains("/ui/actions/catalog/linear/disconnect"));
+        assert!(!html.contains("Reconnect needed"));
+    }
+
+    #[test]
+    fn a_failed_refresh_asks_to_reconnect_and_escapes_the_error() {
+        let mut entry = view(oauth_item("linear"), None, false);
+        entry.connection = Some(connection(Some("invalid_grant <revoked>")));
+        let html = render_catalog_section(&[entry], false).into_string();
+
+        assert!(html.contains(">Reconnect needed<"));
+        assert!(html.contains("invalid_grant &lt;revoked&gt;"));
+        assert!(html.contains(">Reconnect<"));
+        assert!(html.contains("/ui/actions/catalog/linear/disconnect"));
+        assert!(!html.contains(">Connected<"));
+    }
+
+    #[test]
+    fn a_passthrough_entry_has_no_buttons_and_no_forms() {
+        let passthrough = CatalogItem {
+            credential_fields: Vec::new(),
+            auth: CatalogAuth::Passthrough(crate::config::PassthroughConfig {
+                grant: crate::config::PassthroughGrant::TokenExchange,
+                provider: String::from("pocket"),
+                audience: None,
+                scope: None,
+                resource: None,
+            }),
+            ..item("internal", CatalogSource::Config, true)
+        };
+        let html = render_catalog_section(&[view(passthrough, None, false)], false).into_string();
+
+        assert!(html.contains("Uses your sign-in"));
+        assert!(!html.contains("<form"));
+        assert!(!html.contains("<button"));
+        assert!(!html.contains("type=\"password\""));
+    }
+
+    #[test]
+    fn the_admin_form_never_echoes_the_client_secret() {
+        let entries = [view(oauth_item("linear"), None, true)];
+        let html = render_catalog_section(&entries, true).into_string();
+
+        assert!(html.contains("value=\"axon-client\""));
+        assert!(html.contains("value=\"read write\""));
+        assert!(html.contains("<option value=\"oauth\" selected>"));
+        assert!(html.contains("name=\"clear_oauth_secret\""));
+        assert!(html.contains("stored; leave empty to keep it"));
+        assert!(!html.contains("hunter2"));
+        // the create form has a secret input but nothing stored to clear
+        assert_eq!(html.matches("name=\"oauth_client_secret\"").count(), 2);
+        assert_eq!(html.matches("name=\"clear_oauth_secret\"").count(), 1);
     }
 }

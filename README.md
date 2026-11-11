@@ -792,6 +792,127 @@ since it is the issuer and the resource.
   `GET`/`DELETE /api/v1/me/oauth-grants[/{id}]`; admins use
   `/api/v1/admin/oauth-grants[/{id}]`.
 
+### Upstream OAuth and identity passthrough
+
+Besides the header values of `credential_mode = "per_user"`, a backend can
+authenticate each user in two more ways. Both need multi-user mode and a
+database, make the backend a catalog entry (a user needs a grant on it, like
+any other), give every user their own connection, and keep every token sealed
+with the gateway KEK (see [Encryption](#personal-mcp-servers-and-the-catalog)).
+
+**OAuth (`credential_mode = "oauth"`).** Each user connects their own account
+at the backend's authorization server, for a backend that speaks MCP's
+authorization spec (OAuth 2.1 with PKCE and protected resource metadata). The
+gateway finds the authorization server from the backend's URL and picks a
+client in this order:
+
+1. the static client of `[backends.oauth]`;
+2. the gateway's client ID metadata document, `<base_url>/oauth/upstream/client.json`,
+   when the authorization server supports those;
+3. dynamic client registration, once per backend, shared by all users (a
+   registered secret is sealed too).
+
+```toml
+[[backends]]
+name = "tracker"
+url = "https://mcp.tracker.example.com/mcp"
+transport = "http"
+credential_mode = "oauth"
+
+# optional: a client registered by hand; leave the table out to use the
+# metadata document or registration
+[backends.oauth]
+client_id = "axon-gateway"
+client_secret_env = "TRACKER_CLIENT_SECRET"   # leave out for a public client
+scopes = ["read", "write"]                    # empty: what the backend advertises
+```
+
+A user presses **Connect** on `/ui/catalog` (or calls `POST
+/api/v1/me/connections/{backend}`, below), signs in at the backend and is sent
+back to `<base_url>/oauth/upstream/callback`, which needs their dashboard
+session. Register that URL as a redirect URI of a static client. The request
+lasts 10 minutes and is single use; an authorization server that returns `iss`
+is checked against the one the gateway started with. The tokens are refreshed
+shortly before they expire; if a refresh fails the catalog shows "Reconnect
+needed" with the reason, and **Disconnect** removes them. Connecting again
+replaces the old connection on every replica. `base_url` must be the gateway's
+public URL, since the redirect URI and the metadata document are built from it.
+
+**Identity passthrough (`credential_mode = "passthrough"`).** The user signs in
+once, and the gateway trades the identity provider's token for one the backend
+accepts, with no extra step for the user. The catalog shows "Uses your sign-in".
+
+```toml
+[[auth.oidc]]
+id = "entra"
+issuer = "https://login.microsoftonline.com/<tenant>/v2.0"
+client_id = "axon"
+client_secret_env = "AXON_OIDC_SECRET"
+accept_access_tokens = true
+# offline_access keeps a refresh token from the dashboard login, and the
+# gateway's own API scope makes the token's audience the gateway (Entra OBO)
+scopes = ["openid", "profile", "email", "offline_access", "api://axon/access"]
+
+[[backends]]
+name = "reports"
+url = "https://reports.example.com/mcp"
+transport = "http"
+credential_mode = "passthrough"
+
+[backends.passthrough]
+grant = "entra_obo"                  # or "token_exchange" (RFC 8693)
+provider = "entra"                   # id of the [[auth.oidc]] provider
+scope = "api://reports/.default"     # required for entra_obo
+# audience = "reports"               # token exchange `audience`
+# resource = "https://reports.example.com"   # token exchange `resource`
+```
+
+`entra_obo` runs Entra's on-behalf-of flow and needs `scope` and a
+`client_secret_env` on the provider; `token_exchange` posts an RFC 8693 request
+to the provider's token endpoint with `audience`, `scope` and `resource` when
+set. The subject token it starts from is the user's identity provider token:
+
+- the access token of a request that came in as a resource-server JWT (see
+  above; the provider needs `accept_access_tokens = true`), or else
+- the refresh token the provider gave at the dashboard login, which the
+  gateway keeps sealed. The provider's `scopes` must include `offline_access`
+  for it to give one, and for Entra OBO a scope of the gateway's own API, so
+  that the token's audience is the gateway. Users who signed in before the
+  change sign in again once.
+
+A user with neither (no recent request with a JWT, no stored refresh token)
+gets no tools of that backend until they sign in again.
+
+**In the catalog.** An admin can also create OAuth entries in the dashboard or
+with `POST /api/v1/catalog`: `auth` is `"fields"` (the default) or `"oauth"`,
+and an OAuth entry takes no `credential_fields`. Its optional settings are
+`oauth_client_id`, `oauth_scopes` (an array in the API, space or comma
+separated in the form) and `oauth_client_secret`. The secret is write-only and
+never returned (`oauth_client_secret_set` says whether one is stored): on
+`PATCH`, leaving it out or `null` keeps the stored one and `""` clears it; the
+edit form keeps it when the field is empty and has a "clear" box. Passthrough
+entries are config-only.
+
+```sh
+curl -X POST https://axon.example.com/api/v1/catalog \
+  -H "Cookie: $SESSION" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
+  -d '{"name": "tracker", "url": "https://mcp.tracker.example.com/mcp",
+       "auth": "oauth", "oauth_scopes": ["read", "write"]}'
+```
+
+**For users.** `/api/v1/catalog` lists each entry with `"auth": "fields" |
+"oauth" | "passthrough"`. The connection endpoints are session-only like the
+other `/api/v1/me/*` routes, and writes need `X-CSRF-Token`:
+
+| Endpoint | Method | Does |
+| --- | --- | --- |
+| `/api/v1/me/connections` | GET | `{"connections": [{backend, issuer, expires_at, last_error, last_error_at, created_at}]}`, never a token |
+| `/api/v1/me/connections/{backend}` | POST | optional body `{"return_to": "/ui/catalog"}` (a local path); answers `{"authorize_url": "..."}` to send the browser to |
+| `/api/v1/me/connections/{backend}` | DELETE | 204, or 404 when there was no connection |
+
+A backend that cannot be connected this way answers 404, a client secret the
+gateway cannot read or an authorization server that cannot be used 502.
+
 ## Tool-call audit
 
 In multi-user mode every `tools/call` made by a user or service account
@@ -971,6 +1092,10 @@ and API (409). Or create entries with `catalog.manage` through the API or the
 UI. A user sees an entry only if their RBAC grants cover that backend (admins
 see all). Entering a credential gives them their own connection; its tools
 `<entry>_<tool>` need a normal grant. Catalog entries get no egress check.
+`credential_mode` says whose credentials a backend uses: `shared` (the default,
+one connection with the backend's own `auth_token` and `headers`), `per_user`
+(the values above), `oauth` or `passthrough` (see
+[Upstream OAuth and identity passthrough](#upstream-oauth-and-identity-passthrough)).
 
 | Endpoint                                         | Method        | Needs                    |
 | ------------------------------------------------ | ------------- | ------------------------ |
@@ -978,6 +1103,8 @@ see all). Entering a credential gives them their own connection; its tools
 | `/api/v1/me/backends/{prefix}`                   | PATCH, DELETE | own server               |
 | `/api/v1/me/credentials`                         | GET           | your credentials and the entries you may use |
 | `/api/v1/me/credentials/{entry}`                 | PUT, DELETE   | a grant on the entry     |
+| `/api/v1/me/connections`                         | GET           | your OAuth connections   |
+| `/api/v1/me/connections/{backend}`               | POST, DELETE  | a grant on the entry     |
 | `/api/v1/catalog`                                | GET, POST     | `catalog.manage` to create |
 | `/api/v1/catalog/{name}`                         | PATCH, DELETE | `catalog.manage`         |
 | `/api/v1/admin/personal-backends`                | GET           | `users.manage`           |

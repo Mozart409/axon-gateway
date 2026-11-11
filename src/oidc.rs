@@ -39,7 +39,7 @@ use oauth2::basic::{
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet,
     ExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
-    StandardRevocableToken, StandardTokenResponse, TokenUrl,
+    StandardRevocableToken, StandardTokenResponse, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -47,6 +47,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 
 use crate::config::OidcProviderConfig;
+use crate::upstream_oauth::ClientCredentials;
 
 /// How long discovered provider metadata is trusted before it is fetched again.
 pub const METADATA_TTL: Duration = Duration::from_secs(3_600);
@@ -113,8 +114,9 @@ pub struct AccessTokenClaims {
     /// The `email` claim, if any.
     pub email: Option<String>,
     /// The token as presented, for forwarding in a token exchange.
-    #[allow(dead_code)] // read by the token-exchange passthrough (Phase 7b)
     pub token: String,
+    /// The `exp` claim, in seconds since the epoch.
+    pub expires_at: u64,
 }
 
 impl fmt::Debug for AccessTokenClaims {
@@ -126,8 +128,9 @@ impl fmt::Debug for AccessTokenClaims {
             .field("subject", &self.subject)
             .field("groups", &self.groups)
             .field("email", &self.email)
+            .field("expires_at", &self.expires_at)
             .field("token", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -174,6 +177,9 @@ pub struct VerifiedLogin {
     pub is_admin: bool,
     /// The raw ID token, for `id_token_hint` at logout.
     pub id_token: String,
+    /// The refresh token of the code exchange, when the provider gave one
+    /// (`offline_access`); kept for the passthrough grants.
+    pub refresh_token: Option<String>,
 }
 
 impl fmt::Debug for VerifiedLogin {
@@ -188,6 +194,10 @@ impl fmt::Debug for VerifiedLogin {
             .field("groups", &self.groups)
             .field("is_admin", &self.is_admin)
             .field("id_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -227,6 +237,8 @@ struct ProviderMetadata {
     id_token_signing_alg_values_supported: Vec<String>,
     #[serde(default)]
     end_session_endpoint: Option<String>,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
 }
 
 /// The provider's signing keys, and when they were fetched.
@@ -244,6 +256,9 @@ struct Discovery {
     algorithms: Vec<Algorithm>,
     jwks_uri: String,
     end_session_endpoint: Option<String>,
+    /// The token endpoint and the client authentication methods it lists
+    token_endpoint: String,
+    token_auth_methods: Option<Vec<String>>,
     keys: RwLock<Keys>,
 }
 
@@ -473,6 +488,7 @@ impl Provider {
                 .then(|| groups_from(&verified.extra, &self.groups_claim)),
             email: verified.email,
             token: token.to_owned(),
+            expires_at: verified.exp,
         })
     }
 
@@ -533,6 +549,7 @@ impl Provider {
             ));
         }
         let set = observed(&self.id, "jwks", get_json(&self.http, &metadata.jwks_uri)).await?;
+        let token_endpoint = metadata.token_endpoint.clone();
         let mut client: OidcClient = oauth2::Client::new(self.client_id.clone())
             .set_auth_uri(
                 AuthUrl::new(metadata.authorization_endpoint)
@@ -552,6 +569,8 @@ impl Provider {
             algorithms,
             jwks_uri: metadata.jwks_uri,
             end_session_endpoint: metadata.end_session_endpoint,
+            token_endpoint,
+            token_auth_methods: metadata.token_endpoint_auth_methods_supported,
             keys: RwLock::new(Keys {
                 set,
                 fetched: Instant::now(),
@@ -622,7 +641,46 @@ impl Provider {
             .as_deref()
             .ok_or_else(|| self.error("the provider returned no ID token".to_owned()))?;
         let claims = self.verify(&discovery, id_token, nonce).await?;
-        self.login(claims, id_token)
+        let mut login = self.login(claims, id_token)?;
+        login.refresh_token = response
+            .refresh_token()
+            .map(|token| token.secret().clone())
+            .filter(|token| !token.is_empty());
+        Ok(login)
+    }
+
+    /// The provider's token endpoint and the client authentication methods it
+    /// lists, from the cached discovery (fetched when there is none).
+    ///
+    /// # Errors
+    /// Fails when the provider cannot be discovered.
+    pub async fn token_endpoint(&self) -> Result<(String, Option<Vec<String>>), OidcError> {
+        let discovery = self.discovery().await?;
+        Ok((
+            discovery.token_endpoint.clone(),
+            discovery.token_auth_methods.clone(),
+        ))
+    }
+
+    /// The gateway's own client at this provider, for the passthrough grants.
+    #[must_use]
+    pub fn app_credentials(&self) -> ClientCredentials {
+        ClientCredentials {
+            client_id: self.client_id.as_str().to_owned(),
+            client_secret: self
+                .client_secret
+                .as_ref()
+                .map(|secret| secret.secret().clone()),
+        }
+    }
+
+    /// The configured scopes, without `openid`.
+    #[must_use]
+    pub fn scopes(&self) -> Vec<String> {
+        self.scopes
+            .iter()
+            .map(|scope| scope.as_str().to_owned())
+            .collect()
     }
 
     /// [`verify_id_token`] against the cached keys. A token signed with a key
@@ -683,6 +741,7 @@ impl Provider {
             groups,
             is_admin,
             id_token: id_token.to_owned(),
+            refresh_token: None,
         })
     }
 
@@ -1548,8 +1607,11 @@ mod tests {
             groups: Vec::new(),
             is_admin: false,
             id_token: "id-token-secret".to_owned(),
+            refresh_token: Some("refresh-token-secret".to_owned()),
         };
-        assert!(!format!("{login:?}").contains("id-token-secret"));
+        let shown = format!("{login:?}");
+        assert!(!shown.contains("id-token-secret"));
+        assert!(!shown.contains("refresh-token-secret"));
     }
 
     /// What the fake provider serves, and what it was sent.

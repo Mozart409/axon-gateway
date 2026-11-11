@@ -447,6 +447,15 @@ async fn finish_login(
             "Your account has been disabled by an administrator.",
         )));
     }
+    if let Some(hub) = state.personal.as_deref()
+        && hub.wants_idp_refresh_token(&flow.provider_id)
+        && let Some(refresh_token) = login.refresh_token.as_deref()
+        && let Err(error) = hub
+            .store_idp_refresh_token(user.id, &flow.provider_id, refresh_token)
+            .await
+    {
+        tracing::warn!(%error, provider = %flow.provider_id, "could not keep the identity provider's refresh token");
+    }
     let session = store
         .create_session(user.id, &flow.provider_id, Some(&login.id_token))
         .await

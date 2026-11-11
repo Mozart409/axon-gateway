@@ -8,6 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
+use chrono::DateTime;
 use uuid::Uuid;
 
 use super::AppState;
@@ -358,6 +359,16 @@ async fn authenticate_jwt(
     .await?;
 
     crate::metrics::record_authn("jwt", "ok");
+
+    // The verified token is what a passthrough backend of the owner may trade
+    if let Some(hub) = state.personal.as_deref()
+        && let Some(expires_at) = i64::try_from(claims.expires_at)
+            .ok()
+            .and_then(|exp| DateTime::from_timestamp(exp, 0))
+    {
+        hub.note_subject_token(owner.id, provider.id(), &claims.token, expires_at)
+            .await;
+    }
 
     let policy = state.policy.current();
     let groups = if is_service_account {

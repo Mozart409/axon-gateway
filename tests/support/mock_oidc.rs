@@ -6,7 +6,7 @@
 //! signed with a P-256 key generated per provider (ES256), and the code flow
 //! enforces PKCE (S256), so the gateway runs a real login against it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +27,8 @@ use tokio::task::JoinHandle;
 
 const KID: &str = "mock-oidc-key";
 const TOKEN_LIFETIME: u64 = 300;
+const GRANT_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const GRANT_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
 fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -67,6 +69,16 @@ struct ProviderState {
     codes: HashMap<String, Grant>,
     last_logout: Option<HashMap<String, String>>,
     last_id_token: Option<String>,
+    /// Opt-in: the code exchange also returns a refresh token, and the
+    /// `refresh_token` grant works.
+    refresh_tokens: bool,
+    /// Opt-in: the token exchange and `jwt-bearer` (on-behalf-of) grants work.
+    token_exchange: bool,
+    /// Counter behind the `refresh_<n>`, `idp_at_<n>` and `exchanged_<n>` tokens.
+    issued: u64,
+    refresh_valid: HashSet<String>,
+    /// The form of every request the token endpoint got, oldest first.
+    forms: Vec<HashMap<String, String>>,
 }
 
 type Shared = Arc<Mutex<ProviderState>>;
@@ -107,6 +119,11 @@ impl MockOidc {
             codes: HashMap::new(),
             last_logout: None,
             last_id_token: None,
+            refresh_tokens: false,
+            token_exchange: false,
+            issued: 0,
+            refresh_valid: HashSet::new(),
+            forms: Vec::new(),
         }));
 
         let app = Router::new()
@@ -150,6 +167,34 @@ impl MockOidc {
     /// The ID token the token endpoint answered last.
     pub fn last_id_token(&self) -> Option<String> {
         self.state.lock().unwrap().last_id_token.clone()
+    }
+
+    /// Whether the code exchange returns a refresh token (`refresh_<n>`) and
+    /// the `refresh_token` grant is accepted (it answers `idp_at_<n>`).
+    pub fn set_refresh_tokens(&self, enabled: bool) {
+        self.state.lock().unwrap().refresh_tokens = enabled;
+    }
+
+    /// Whether the RFC 8693 token exchange and the `jwt-bearer` (Entra
+    /// on-behalf-of) grants are accepted; both answer `exchanged_<n>`.
+    pub fn set_token_exchange(&self, enabled: bool) {
+        self.state.lock().unwrap().token_exchange = enabled;
+    }
+
+    /// The form of every token endpoint request so far, oldest first.
+    pub fn token_forms(&self) -> Vec<HashMap<String, String>> {
+        self.state.lock().unwrap().forms.clone()
+    }
+
+    /// The forms of the token endpoint requests with `grant_type`.
+    pub fn token_forms_for(&self, grant_type: &str) -> Vec<HashMap<String, String>> {
+        self.token_forms()
+            .into_iter()
+            .filter(|form| {
+                form.get("grant_type")
+                    .is_some_and(|grant| grant == grant_type)
+            })
+            .collect()
     }
 
     /// A JWT access token signed by this provider, for resource-server mode:
@@ -257,11 +302,20 @@ fn sign(state: &ProviderState, claims: &Value) -> String {
 }
 
 async fn token(State(state): State<Shared>, Form(form): Form<HashMap<String, String>>) -> Response {
-    let get = |name: &str| form.get(name).map_or("", String::as_str);
     let mut state = state.lock().unwrap();
-    if get("grant_type") != "authorization_code" {
-        return bad_request("unsupported_grant_type");
+    state.forms.push(form.clone());
+    match form.get("grant_type").map_or("", String::as_str) {
+        "authorization_code" => code_grant(&mut state, &form),
+        "refresh_token" if state.refresh_tokens => refresh_grant(&mut state, &form),
+        GRANT_TOKEN_EXCHANGE | GRANT_JWT_BEARER if state.token_exchange => {
+            exchange_grant(&mut state, &form)
+        }
+        _ => bad_request("unsupported_grant_type"),
     }
+}
+
+fn code_grant(state: &mut ProviderState, form: &HashMap<String, String>) -> Response {
+    let get = |name: &str| form.get(name).map_or("", String::as_str);
     // One-time: the code is gone whether or not the rest checks out.
     let Some(grant) = state.codes.remove(get("code")) else {
         return bad_request("invalid_grant");
@@ -279,14 +333,56 @@ async fn token(State(state): State<Shared>, Form(form): Form<HashMap<String, Str
     claims["iat"] = json!(now);
     claims["exp"] = json!(now + TOKEN_LIFETIME);
 
-    let id_token = sign(&state, &claims);
+    let id_token = sign(state, &claims);
     state.last_id_token = Some(id_token.clone());
 
-    Json(json!({
+    let mut response = json!({
         "access_token": b64(&Sha256::digest(id_token.as_bytes())),
         "token_type": "Bearer",
         "expires_in": TOKEN_LIFETIME,
         "id_token": id_token,
+    });
+    if state.refresh_tokens {
+        state.issued += 1;
+        let refresh_token = format!("refresh_{}", state.issued);
+        state.refresh_valid.insert(refresh_token.clone());
+        response["refresh_token"] = json!(refresh_token);
+    }
+    Json(response).into_response()
+}
+
+/// A refresh token that was issued (it is not rotated) gets a fresh access token.
+fn refresh_grant(state: &mut ProviderState, form: &HashMap<String, String>) -> Response {
+    let token = form.get("refresh_token").map_or("", String::as_str);
+    if !state.refresh_valid.contains(token) {
+        return bad_request("invalid_grant");
+    }
+    state.issued += 1;
+    Json(json!({
+        "access_token": format!("idp_at_{}", state.issued),
+        "token_type": "Bearer",
+        "expires_in": TOKEN_LIFETIME,
+    }))
+    .into_response()
+}
+
+/// RFC 8693 token exchange (`subject_token`) or on-behalf-of (`assertion`).
+fn exchange_grant(state: &mut ProviderState, form: &HashMap<String, String>) -> Response {
+    let get = |name: &str| form.get(name).map_or("", String::as_str);
+    let valid = if get("grant_type") == GRANT_JWT_BEARER {
+        !get("assertion").is_empty() && get("requested_token_use") == "on_behalf_of"
+    } else {
+        !get("subject_token").is_empty()
+    };
+    if !valid {
+        return bad_request("invalid_request");
+    }
+    state.issued += 1;
+    Json(json!({
+        "access_token": format!("exchanged_{}", state.issued),
+        "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "token_type": "Bearer",
+        "expires_in": TOKEN_LIFETIME,
     }))
     .into_response()
 }

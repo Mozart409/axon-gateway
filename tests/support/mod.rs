@@ -6,6 +6,7 @@
 
 pub mod mock_backend;
 pub mod mock_oidc;
+pub mod mock_upstream;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};

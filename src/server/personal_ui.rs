@@ -26,9 +26,10 @@ use super::AppState;
 use super::admin_ui::{AdminForm, error_response, flash_response, fragment, not_found, page_error};
 use super::personal_api::{
     CatalogPatch, NewCatalogItem, NewPersonal, PersonalApiError, PersonalPatch, PersonalSaved,
-    create_catalog_entry, create_personal, delete_catalog_entry, delete_credential,
-    delete_personal, delete_personal_of, list_all_personal, list_catalog, list_personal,
-    set_credential, set_personal_enabled, update_catalog_entry, update_personal,
+    connect_failure, create_catalog_entry, create_personal, delete_catalog_entry,
+    delete_credential, delete_personal, delete_personal_of, list_all_personal, list_catalog,
+    list_personal, set_credential, set_personal_enabled, split_scopes, update_catalog_entry,
+    update_personal,
 };
 use super::personal_views::{
     render_admin_page, render_admin_section, render_backends_page, render_backends_section,
@@ -110,14 +111,6 @@ struct EnabledForm {
     enabled: bool,
 }
 
-/// `POST /ui/actions/catalog/{name}/update` form
-#[derive(Debug, Deserialize)]
-struct EntryForm {
-    description: String,
-    url: String,
-    enabled: bool,
-}
-
 /// The values of every row of a repeated key, in order
 fn all<'a>(pairs: &'a [(String, String)], key: &'a str) -> impl Iterator<Item = &'a str> {
     pairs
@@ -173,6 +166,18 @@ fn values_of(pairs: &[(String, String)]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The OAuth client secret of the catalog forms: what was typed, else an
+/// empty string when "clear" is ticked (which clears the stored one), else
+/// nothing (which keeps it)
+fn secret_of(pairs: &[(String, String)]) -> Option<String> {
+    if first(pairs, "clear_oauth_secret").is_some() {
+        return Some(String::new());
+    }
+    first(pairs, "oauth_client_secret")
+        .filter(|secret| !secret.is_empty())
+        .map(str::to_owned)
+}
+
 /// The first value of a key
 fn first<'a>(pairs: &'a [(String, String)], key: &'a str) -> Option<&'a str> {
     all(pairs, key).next()
@@ -191,10 +196,14 @@ fn session_for(
 }
 
 /// An action error: the flash fragment
-fn action_error(error: &PersonalApiError) -> Response {
+pub(super) fn action_error(error: &PersonalApiError) -> Response {
     match error {
         PersonalApiError::Admin(error) => error_response(error),
         PersonalApiError::Disabled => flash_response(StatusCode::NOT_FOUND, error.to_string()),
+        PersonalApiError::Connect(error) => {
+            let (status, message) = connect_failure(error);
+            flash_response(status, message)
+        }
         PersonalApiError::Internal(message) => {
             tracing::warn!(message, "A personal backend page request failed");
             flash_response(
@@ -210,6 +219,10 @@ fn page_failure(state: &AppState, session: &SessionUser, error: &PersonalApiErro
     match error {
         PersonalApiError::Admin(error) => page_error(state, session, error),
         PersonalApiError::Disabled => not_found(state),
+        PersonalApiError::Connect(error) => {
+            let (status, message) = connect_failure(error);
+            (status, format!("{message}\n")).into_response()
+        }
         PersonalApiError::Internal(message) => {
             tracing::warn!(message, "A personal backend page request failed");
             (
@@ -241,7 +254,7 @@ async fn backends_fragment(
 }
 
 /// The answer to an action on `/ui/catalog`: the section, or the error.
-async fn catalog_fragment(state: &AppState, session: &SessionUser) -> Response {
+pub(super) async fn catalog_fragment(state: &AppState, session: &SessionUser) -> Response {
     match list_catalog(state, session).await {
         Ok(list) => fragment(&render_catalog_section(
             &list,
@@ -454,6 +467,10 @@ async fn handle_entry_create(
         description: first(&pairs, "description").map(str::to_owned),
         url: first(&pairs, "url").unwrap_or_default().to_owned(),
         credential_fields: fields_of(&pairs),
+        auth: first(&pairs, "auth").map(str::to_owned),
+        oauth_client_id: first(&pairs, "oauth_client_id").map(str::to_owned),
+        oauth_scopes: split_scopes(first(&pairs, "oauth_scopes").unwrap_or_default()),
+        oauth_client_secret: secret_of(&pairs),
     };
     if let Err(error) = create_catalog_entry(&state, &session, input).await {
         return action_error(&error);
@@ -466,16 +483,22 @@ async fn handle_entry_update(
     State(state): State<AppState>,
     user: Option<Extension<SessionUser>>,
     Path(name): Path<String>,
-    AdminForm(form): AdminForm<EntryForm>,
+    AdminForm(pairs): AdminForm<FormPairs>,
 ) -> Response {
     let session = match session_for(&state, user) {
         Ok(session) => session,
         Err(response) => return *response,
     };
     let patch = CatalogPatch {
-        description: Some(form.description),
-        url: Some(form.url),
-        enabled: Some(form.enabled),
+        description: first(&pairs, "description").map(str::to_owned),
+        url: first(&pairs, "url").map(str::to_owned),
+        enabled: first(&pairs, "enabled").and_then(|enabled| enabled.parse().ok()),
+        auth: first(&pairs, "auth").map(str::to_owned),
+        // The edit form always sends them: empty clears the client id and the
+        // scopes, the secret is kept unless one is typed or cleared
+        oauth_client_id: first(&pairs, "oauth_client_id").map(str::to_owned),
+        oauth_scopes: first(&pairs, "oauth_scopes").map(split_scopes),
+        oauth_client_secret: secret_of(&pairs),
         ..CatalogPatch::default()
     };
     if let Err(error) = update_catalog_entry(&state, &session, &name, patch).await {
@@ -615,6 +638,49 @@ mod tests {
             Some("Bearer ")
         );
         assert_eq!(fields.first().map(|f| f.name.as_str()), Some("token"));
+    }
+
+    #[test]
+    fn the_client_secret_is_kept_unless_typed_or_cleared() {
+        // empty: keep the stored one
+        assert_eq!(secret_of(&pairs(&[("oauth_client_secret", "")])), None);
+        assert_eq!(secret_of(&pairs(&[])), None);
+        // typed: replace it
+        assert_eq!(
+            secret_of(&pairs(&[("oauth_client_secret", "s3cret")])).as_deref(),
+            Some("s3cret")
+        );
+        // the box: clear it, even when something was typed
+        assert_eq!(
+            secret_of(&pairs(&[("clear_oauth_secret", "true")])).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            secret_of(&pairs(&[
+                ("oauth_client_secret", "s3cret"),
+                ("clear_oauth_secret", "true"),
+            ]))
+            .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn scopes_of_a_form_split_on_spaces_and_commas() {
+        let form = pairs(&[("oauth_scopes", "read write,admin")]);
+        assert_eq!(
+            first(&form, "oauth_scopes").map(split_scopes),
+            Some(vec![
+                String::from("read"),
+                String::from("write"),
+                String::from("admin")
+            ])
+        );
+        let blank = pairs(&[("oauth_scopes", "")]);
+        assert_eq!(
+            first(&blank, "oauth_scopes").map(split_scopes),
+            Some(Vec::new())
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod server;
 mod store;
 mod telemetry;
 mod types;
+mod upstream_oauth;
 mod watcher;
 
 use std::env;
@@ -205,7 +206,7 @@ async fn main() -> Result<()> {
         Arc::new(rbac::PolicyHandle::new(config.rbac.clone()).with_change_bus(changes.clone()));
 
     let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy).await;
-    let personal = setup_personal(&config, store.as_ref(), &changes).await?;
+    let personal = setup_personal(&config, store.as_ref(), &changes, oidc.clone()).await?;
 
     // Initialize Prometheus metrics exporter
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -300,6 +301,7 @@ async fn setup_personal(
     config: &Config,
     store: Option<&store::Store>,
     changes: &ChangeBus,
+    oidc: Option<Arc<OidcProviders>>,
 ) -> Result<Option<Arc<PersonalHub>>> {
     let Some(store) = store.filter(|_| config.personal_backends.enabled) else {
         return Ok(None);
@@ -322,6 +324,7 @@ async fn setup_personal(
         Arc::new(egress),
         config,
         changes.clone(),
+        oidc,
     );
     if let Err(error) = hub.reload_catalog(config).await {
         tracing::warn!(%error, "Could not load the per-user catalog from the database");
@@ -391,6 +394,19 @@ fn spawn_purges(store: &store::Store) {
             Err(error) => tracing::warn!(%error, "Failed to purge expired OAuth state"),
         }
     });
+    jobs::spawn_singleton(
+        store.clone(),
+        "upstream_oauth",
+        PURGE_INTERVAL,
+        |store| async move {
+            match store.purge_upstream_oauth().await {
+                Ok(purged) => tracing::debug!(purged, "Purged expired upstream OAuth requests"),
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to purge expired upstream OAuth requests");
+                }
+            }
+        },
+    );
 }
 
 /// Spawns the task that refreshes this replica's sampled gauges: sessions,

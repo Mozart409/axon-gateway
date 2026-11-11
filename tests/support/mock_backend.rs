@@ -15,7 +15,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -52,6 +56,76 @@ struct MockState {
     calls: Mutex<Vec<CallRecord>>,
     /// The headers (lowercase names) of every HTTP request the backend got.
     requests: Mutex<Vec<HashMap<String, String>>>,
+    /// The origin of the backend, for the protected resource metadata.
+    base_url: String,
+    /// Opt-in: every request but the well-known documents needs a bearer token.
+    bearer: Option<BearerGate>,
+    /// The bearer token of every request that had one, oldest first.
+    bearers: Mutex<Vec<String>>,
+}
+
+/// Makes a backend answer 401 unless the bearer token is acceptable.
+struct BearerGate {
+    /// The authorization server the protected resource metadata names.
+    issuer: String,
+    accept: Box<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+/// The URL of the protected resource metadata a 401 points at.
+fn resource_metadata_url(base_url: &str) -> String {
+    format!("{base_url}/.well-known/oauth-protected-resource/mcp")
+}
+
+/// RFC 9728 protected resource metadata naming the authorization server.
+async fn protected_resource(State(state): State<Arc<MockState>>) -> Response {
+    let issuer = state
+        .bearer
+        .as_ref()
+        .map(|gate| gate.issuer.clone())
+        .unwrap_or_default();
+    Json(json!({
+        "resource": format!("{}/mcp", state.base_url),
+        "authorization_servers": [issuer],
+        "bearer_methods_supported": ["header"],
+    }))
+    .into_response()
+}
+
+/// Answers 401 with a `resource_metadata` challenge unless the request carries
+/// an acceptable bearer token; records every bearer token it sees.
+async fn check_bearer(
+    State(state): State<Arc<MockState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request.uri().path().starts_with("/.well-known/") {
+        return next.run(request).await;
+    }
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string);
+    if let Some(token) = &token {
+        state.bearers.lock().unwrap().push(token.clone());
+    }
+    let accepted = match (&state.bearer, &token) {
+        (Some(gate), Some(token)) => (gate.accept)(token),
+        _ => false,
+    };
+    if accepted {
+        return next.run(request).await;
+    }
+    let challenge = format!(
+        "Bearer resource_metadata=\"{}\"",
+        resource_metadata_url(&state.base_url)
+    );
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge)],
+    )
+        .into_response()
 }
 
 /// Records the headers of every request before it reaches the MCP service.
@@ -211,6 +285,12 @@ impl MockBackend {
             .collect()
     }
 
+    /// The bearer token of every request that carried one (a backend built
+    /// with [`MockBackendBuilder::require_bearer`]), accepted or not, oldest first.
+    pub fn bearer_tokens(&self) -> Vec<String> {
+        self.state.bearers.lock().unwrap().clone()
+    }
+
     /// A snapshot of every recorded call.
     pub fn calls(&self) -> Vec<CallRecord> {
         self.state.calls.lock().unwrap().clone()
@@ -224,6 +304,7 @@ pub struct MockBackendBuilder {
     slow: HashMap<String, Duration>,
     progress: HashMap<String, u32>,
     cancellable: HashSet<String>,
+    bearer: Option<BearerGate>,
 }
 
 impl MockBackendBuilder {
@@ -234,7 +315,25 @@ impl MockBackendBuilder {
             slow: HashMap::new(),
             progress: HashMap::new(),
             cancellable: HashSet::new(),
+            bearer: None,
         }
+    }
+
+    /// Make the backend an OAuth-protected resource: it answers 401 (with a
+    /// `WWW-Authenticate: Bearer resource_metadata="..."` challenge) unless the
+    /// request has `Authorization: Bearer <token>` with a token `accept` allows,
+    /// and serves `/.well-known/oauth-protected-resource[/mcp]` naming `issuer`
+    /// as its authorization server. See [`MockBackend::bearer_tokens`].
+    pub fn require_bearer(
+        mut self,
+        issuer: &str,
+        accept: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.bearer = Some(BearerGate {
+            issuer: issuer.to_string(),
+            accept: Box::new(accept),
+        });
+        self
     }
 
     /// Add a tool that sends `steps` progress notifications (to the request's
@@ -288,6 +387,13 @@ impl MockBackendBuilder {
     /// Bind `addr` (e.g. a port reserved with `free_port`) and start serving.
     /// Panics on bind failure.
     pub async fn build_on(self, addr: &str) -> MockBackend {
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("bind mock backend port");
+        let addr = listener.local_addr().expect("mock backend local addr");
+        let base_url = format!("http://{addr}");
+
+        let gated = self.bearer.is_some();
         let state = Arc::new(MockState {
             tools: self.tools,
             failing: self.failing,
@@ -297,6 +403,9 @@ impl MockBackendBuilder {
             cancelled: Mutex::new(HashSet::new()),
             calls: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
+            base_url: base_url.clone(),
+            bearer: self.bearer,
+            bearers: Mutex::new(Vec::new()),
         });
 
         let handler = MockHandler {
@@ -308,15 +417,29 @@ impl MockBackendBuilder {
             StreamableHttpServerConfig::default(),
         );
 
-        let router = axum::Router::new().nest_service("/mcp", service).layer(
-            axum::middleware::from_fn_with_state(state.clone(), record_headers),
-        );
-
-        let listener = TcpListener::bind(addr)
-            .await
-            .expect("bind mock backend port");
-        let addr = listener.local_addr().expect("mock backend local addr");
-        let base_url = format!("http://{addr}");
+        let mut router = axum::Router::new().nest_service("/mcp", service);
+        if gated {
+            let metadata = axum::Router::new()
+                .route(
+                    "/.well-known/oauth-protected-resource",
+                    get(protected_resource),
+                )
+                .route(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    get(protected_resource),
+                )
+                .with_state(state.clone());
+            router = router
+                .merge(metadata)
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    check_bearer,
+                ));
+        }
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            record_headers,
+        ));
 
         let shutdown = CancellationToken::new();
         let shutdown_child = shutdown.clone();

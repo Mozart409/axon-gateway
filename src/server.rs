@@ -86,6 +86,7 @@ mod toolsets_api;
 mod toolsets_ui;
 mod toolsets_views;
 mod ui;
+mod upstream_oauth_ui;
 mod usage_api;
 mod usage_ui;
 mod usage_views;
@@ -261,6 +262,8 @@ pub fn create_router(state: AppState) -> Router {
         // MCP OAuth authorization server (multi-user mode only)
         .merge(oauth::routes(&state))
         .merge(oauth_ui::consent_routes(&state))
+        // Connecting a catalog entry to the user's own account (multi-user mode only)
+        .merge(upstream_oauth_ui::routes(&state))
         .merge(break_glass::routes())
         // JSON admin API
         .merge(admin_api::router(state.clone()))
