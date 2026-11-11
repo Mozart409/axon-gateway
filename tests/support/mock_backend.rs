@@ -282,6 +282,12 @@ impl MockBackendBuilder {
 
     /// Bind an ephemeral port and start serving. Panics on bind failure.
     pub async fn build(self) -> MockBackend {
+        self.build_on("127.0.0.1:0").await
+    }
+
+    /// Bind `addr` (e.g. a port reserved with `free_port`) and start serving.
+    /// Panics on bind failure.
+    pub async fn build_on(self, addr: &str) -> MockBackend {
         let state = Arc::new(MockState {
             tools: self.tools,
             failing: self.failing,
@@ -306,7 +312,7 @@ impl MockBackendBuilder {
             axum::middleware::from_fn_with_state(state.clone(), record_headers),
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind(addr)
             .await
             .expect("bind mock backend port");
         let addr = listener.local_addr().expect("mock backend local addr");

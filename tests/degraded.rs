@@ -1,9 +1,10 @@
 //! Degraded and error-path integration tests.
 //!
-//! Covers behaviour the happy-path tests don't: an unreachable backend, the
-//! Prometheus `/metrics` scrape, malformed JSON-RPC input, and calls to tools
-//! that don't exist. The theme is that none of these should take the gateway
-//! down — it degrades, it reports, it returns errors.
+//! Covers behaviour the happy-path tests don't: an unreachable backend, a
+//! backend that comes up after the gateway, the Prometheus `/metrics` scrape,
+//! malformed JSON-RPC input, and calls to tools that don't exist. The theme is
+//! that none of these should take the gateway down — it degrades, it reports,
+//! it returns errors.
 
 // Integration tests are test code: exempt them from the panic-family denies.
 #![allow(
@@ -17,7 +18,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::mock_backend::MockBackend;
+use support::mock_backend::{MockBackend, MockBackendBuilder};
 use support::{ConfigBuilder, Gateway, free_port, mcp_post, poll_until, rpc, rpc_call};
 
 #[tokio::test]
@@ -80,6 +81,87 @@ async fn unreachable_backend_is_degraded_but_gateway_stays_healthy() {
     .await
     .1;
     assert_eq!(tools["result"]["tools"].as_array().map(Vec::len), Some(0));
+}
+
+/// Regression for 2026-11-11: a backend unreachable at startup (connect/DNS
+/// error) must be picked up by the retry loop without a restart.
+#[tokio::test]
+async fn backend_that_comes_up_later_is_connected_by_reconnect() {
+    // Reserve a port and leave it empty, so the first connect is refused.
+    let backend_port = free_port();
+    let backend_url = format!("http://127.0.0.1:{backend_port}/mcp");
+
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let base = format!("http://{bind}");
+    let config = ConfigBuilder::new(&bind)
+        .http_backend("late", &backend_url)
+        .render();
+    let server = Gateway::start(&config, &base).await;
+    let client = reqwest::Client::new();
+
+    // The first attempt fails, so the backend sits in a retry state.
+    let failed = poll_until(50, Duration::from_millis(100), || async {
+        let detailed: serde_json::Value = client
+            .get(format!("{}/status/detailed", server.base))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let state = detailed["backends"][0]["state"].as_str()?.to_string();
+        matches!(state.as_str(), "Failed" | "Reconnecting").then_some(state)
+    })
+    .await;
+    assert!(
+        failed.is_some(),
+        "first connect attempt should fail and enter a retry state"
+    );
+
+    // Nothing is listening yet, so no tools are exposed.
+    let tools: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc("tools/list"),
+    )
+    .await
+    .1;
+    assert_eq!(tools["result"]["tools"].as_array().map(Vec::len), Some(0));
+
+    // The backend comes up on the reserved port.
+    let _backend = MockBackendBuilder::new()
+        .tool("echo")
+        .build_on(&format!("127.0.0.1:{backend_port}"))
+        .await;
+
+    // A later reconnect attempt connects it.
+    let connected = poll_until(60, Duration::from_millis(500), || async {
+        let detailed: serde_json::Value = client
+            .get(format!("{}/status/detailed", server.base))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        (detailed["backends"][0]["state"] == "Connected").then_some(())
+    })
+    .await;
+    connected.expect("reconnect should connect the late backend once it is listening");
+
+    // Its tools are now exposed, prefixed with the backend name.
+    let tools: serde_json::Value = mcp_post(
+        &client,
+        &format!("{}/mcp", server.base),
+        None,
+        &rpc("tools/list"),
+    )
+    .await
+    .1;
+    assert_eq!(tools["result"]["tools"].as_array().map(Vec::len), Some(1));
+    assert_eq!(tools["result"]["tools"][0]["name"], "late_echo");
 }
 
 #[tokio::test]
