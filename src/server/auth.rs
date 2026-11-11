@@ -118,17 +118,45 @@ pub(super) async fn authenticate(
         return Err(Box::new(unauthorized()));
     }
 
-    let multi_user = state.multi_user().is_some();
+    if let Some((store, _)) = state.multi_user() {
+        // Multi-user mode counts in Postgres, so the replicas share one limit
+        return match auth_manager.identify(provided_token) {
+            Ok(Some(identity)) => {
+                let limit = auth_manager.effective_limit(identity.rate_limit_per_minute);
+                within_rate_limit(store, &format!("config:{}", identity.name), limit).await?;
+                Ok(config_account(&identity, state))
+            }
+            // The shared token has no identity to put under RBAC
+            Ok(None) | Err(_) => Err(Box::new(unauthorized())),
+        };
+    }
+
     match auth_manager.validate_token(provided_token) {
-        Ok(Some(identity)) if multi_user => Ok(config_account(&identity, state)),
         Ok(Some(identity)) => Ok(Caller::Token(identity)),
-        // The shared token has no identity to put under RBAC
-        Ok(None) if multi_user => Err(Box::new(unauthorized())),
         Ok(None) => Ok(Caller::Open),
-        Err(AuthError::RateLimited { .. }) => {
-            Err(Box::new(StatusCode::TOO_MANY_REQUESTS.into_response()))
-        }
+        Err(AuthError::RateLimited { .. }) => Err(Box::new(too_many_requests())),
         Err(_) => Err(Box::new(unauthorized())),
+    }
+}
+
+fn too_many_requests() -> Response {
+    StatusCode::TOO_MANY_REQUESTS.into_response()
+}
+
+/// Count a request in the shared Postgres window under `key`: 429 when the limit
+/// (requests per minute, 0 = unlimited) is used up. A store error lets the request
+/// through: the limit protects the backends, it is not an access check.
+async fn within_rate_limit(store: &Store, key: &str, limit: u32) -> Result<(), Box<Response>> {
+    if limit == 0 {
+        return Ok(());
+    }
+    match store.hit_rate_limit(key, limit).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Box::new(too_many_requests())),
+        Err(error) => {
+            tracing::warn!(%error, key, "Rate limit check failed, letting the request through");
+            Ok(())
+        }
     }
 }
 
@@ -163,6 +191,12 @@ async fn authenticate_pat(
         Ok(None) => return Err(Box::new(unauthorized())),
         Err(error) => return Err(Box::new(unavailable(&error))),
     };
+    within_rate_limit(
+        store,
+        &format!("pat:{}", principal.token.id),
+        state.auth_manager.load().effective_limit(0),
+    )
+    .await?;
 
     let owner = &principal.owner;
     let policy = state.policy.current();

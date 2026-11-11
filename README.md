@@ -10,7 +10,7 @@ A lightweight, self-hosted MCP (Model Context Protocol) gateway that aggregates 
 - **Streamable HTTP**: Clients connect per the MCP spec and hear `notifications/tools/list_changed` when their tools change
 - **Multi-token auth**: Named API tokens with fine-grained permissions (allowed tools/backends)
 - **Toolsets**: Expose subsets of tools via different path prefixes
-- **Hot reload**: Config file watching with automatic backend updates
+- **Hot reload**: Config file watching with automatic backend updates; Kubernetes ConfigMap updates (the `..data` symlink swap) are picked up too
 - **Prometheus metrics**: Built-in metrics endpoint for monitoring
 - **Resource/Prompt proxying**: Forward MCP resources and prompts from backends
 - **Auto-reconnect**: Exponential backoff reconnection with circuit breaker
@@ -146,6 +146,11 @@ from the gateway. Three protocol versions are served:
   `Mcp-Session-Id` header that the client sends on every later request.
 - `2026-07-28` is stateless: there is no session, and a client that wants to
   hear changes opens a `subscriptions/listen` stream.
+
+With a database, sessions for the two older versions are stored there, so any
+replica can serve them, and each is bound to the principal that opened it:
+another principal sending its `Mcp-Session-Id` gets HTTP 404. See
+[Multiple replicas](#multiple-replicas).
 
 `/mcp/sse`, the old SSE endpoint, is removed; point clients at `/mcp` with the
 Streamable HTTP transport.
@@ -299,8 +304,17 @@ Semantics:
   means **unlimited**. Rate limiting is **off** until you set a non-zero value.
 - **Resolution**: a per-token `rate_limit_per_minute > 0` overrides the global
   value; a per-token `0` (or omitted) falls back to the global default.
-- **Window**: fixed 1-minute window per token; the counter resets once a full
-  minute has elapsed (not a sliding window or token bucket).
+- **Window**: fixed 1-minute window per token (not a sliding window or token
+  bucket). In standalone mode the counter lives in memory, per replica, and
+  resets once a full minute has elapsed.
+- **Multi-user mode**: the counter lives in Postgres (table `rate_limit_windows`,
+  one row per token and minute, aligned to the wall-clock minute), so the limit
+  holds across all replicas.
+- **Personal access tokens and service-account tokens** are limited by the
+  global `[gateway] rate_limit_per_minute` too.
+- **Fail-open**: if the counter cannot be updated, the request is let through
+  and a warning is logged. The limit protects the backends; it is not an access
+  check.
 - **Simple shared-token auth** (`auth_token`, no named `[[tokens]]`) is not
   rate-limited. Use named tokens to enforce limits.
 - Exceeding the limit returns an auth error (HTTP 429).
@@ -340,6 +354,45 @@ url_env = "AXON_DATABASE_URL" # default
 
 When configured, `/readyz` also pings the database and returns 503
 (`database unreachable`) when it does not answer within 2 s.
+
+## Multiple replicas
+
+Several gateways can share one database and serve the same clients. Sessions
+need no sticky routing.
+
+Changes fan out through Postgres. Triggers run `NOTIFY axon_changes` when
+groups, IdP mappings, memberships, grants or role bindings change (payload kind
+`policy`), and when a user's opt-outs or toolsets change (kind `user`). Every
+replica LISTENs on the channel: a policy notice reloads its policy, and a user
+notice sends `notifications/tools/list_changed` to that user's MCP clients.
+Changes made with `axon-gateway admin` or straight in SQL propagate the same way.
+Payloads name the schema and replicas ignore other schemas, so gateways in
+different schemas can share one database.
+
+If the listen connection drops, the replica reloads its policy and tells all
+clients their tool list may have changed. The 30-second policy poll stays as a
+backstop.
+
+With a database, MCP session state for `2025-06-18` and `2025-11-25` is stored
+in the `mcp_sessions` table, keyed by the SHA-256 of the session id. Any replica
+can serve such a session, and one that does not know it restores it from the
+database. Each session is bound to the principal that opened it (user, config
+service account, legacy token or open), and another principal gets HTTP 404.
+Sessions unused for 24 hours are purged. Without a database, sessions and their
+binding live in the process only. `2026-07-28` requests are stateless and need
+nothing shared.
+
+Rate limits are shared in multi-user mode; see [Rate Limiting](#rate-limiting).
+
+Background jobs (expired login sessions, audit retention, rate-limit windows
+and idle MCP sessions) run hourly. Every replica ticks, but a lease row in
+`job_runs` makes each job run about once an hour across all replicas. Token
+expiry and inactive-user suspension need no job: they are checked when a token
+is used.
+
+Some state stays per replica. Each replica connects to the backends itself, so
+backend tool changes are not shared. Progress and cancellation for an in-flight
+call travel on the connection that made the call.
 
 ## Dashboard login (OIDC)
 

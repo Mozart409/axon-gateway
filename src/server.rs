@@ -66,6 +66,7 @@ mod audit_views;
 mod auth;
 mod break_glass;
 mod mcp;
+mod mcp_sessions;
 mod session;
 mod tokens_api;
 mod tokens_ui;
@@ -177,13 +178,14 @@ fn ui_action_routes(state: &AppState) -> Router<AppState> {
 /// an HTTP 401) and hands the caller to the MCP handler in a request extension.
 fn mcp_routes(state: &AppState) -> Router<AppState> {
     let service = mcp::mcp_service(state);
+    let owners = mcp_sessions::SessionOwners::new(state.store.as_ref());
     Router::new()
         .route_service("/mcp", service.clone())
         .route_service("/mcp/toolset/{toolset_name}", service.clone())
         // Deprecated alias for the toolset endpoint, removed after one minor release
         .route_service("/mcp/group/{toolset_name}", service)
         .route_layer(middleware::from_fn_with_state(
-            state.clone(),
+            (state.clone(), owners),
             mcp::authenticate_mcp,
         ))
 }

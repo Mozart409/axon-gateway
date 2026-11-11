@@ -178,7 +178,7 @@ fn is_lower_hex(text: &str) -> bool {
 }
 
 /// The SHA-256 of a token secret: the only form that is stored
-fn hash_secret(secret: &str) -> Vec<u8> {
+pub(super) fn hash_secret(secret: &str) -> Vec<u8> {
     Sha256::digest(secret.as_bytes()).to_vec()
 }
 

@@ -3,6 +3,7 @@
 //! Watches the config file for changes and triggers a reload
 //! when modifications are detected.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,7 +25,8 @@ use crate::gateway::{GatewayActor, ReloadConfig};
 /// symlink swap into an immutable store) replace the file via `rename(2)`, which
 /// leaves an inotify watch on the *file* pointing at the old, now-detached inode
 /// so no further events arrive. Watching the directory and filtering on the file
-/// name survives those atomic replaces.
+/// name survives those atomic replaces. Kubelet `ConfigMap` mounts swap a `..data`
+/// symlink instead of touching the file, so events on `..data` count as relevant.
 pub fn start_config_watcher(
     config_path: impl AsRef<Path>,
     gateway: ActorRef<GatewayActor>,
@@ -38,7 +40,7 @@ pub fn start_config_watcher(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let file_name = config_path.file_name().map(std::ffi::OsStr::to_os_string);
+    let file_name = config_path.file_name().map(OsStr::to_os_string);
 
     // Channel bridging notify's own thread (sync callback) to our async task.
     // `tokio::sync::mpsc` is used instead of `std::sync::mpsc` because the
@@ -58,15 +60,7 @@ pub fn start_config_watcher(
             }
 
             // When watching the directory, only react to our config file.
-            let relevant = match &file_name_for_cb {
-                Some(name) => event
-                    .paths
-                    .iter()
-                    .any(|p| p.file_name() == Some(name.as_os_str())),
-                None => true,
-            };
-
-            if relevant {
+            if is_relevant(&event.paths, file_name_for_cb.as_deref()) {
                 // Unbounded send never blocks; a closed receiver just means we
                 // are shutting down, so the error is safely ignored.
                 let _ = tx.send(());
@@ -139,4 +133,78 @@ pub fn start_config_watcher(
     });
 
     Ok(())
+}
+
+/// Whether an event on `paths` concerns the config file.
+///
+/// `file_name` is the config's own file name; `None` means it is unknown, so
+/// every event counts. Kubelet's `..data` symlink swap also counts, since it is
+/// how a `ConfigMap` update reaches the mounted config.
+fn is_relevant(paths: &[PathBuf], file_name: Option<&OsStr>) -> bool {
+    let Some(name) = file_name else {
+        return true;
+    };
+    paths.iter().any(|p| {
+        let file = p.file_name();
+        file == Some(name) || file == Some(OsStr::new("..data"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use super::is_relevant;
+
+    const CONFIG: &str = "config.toml";
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|name| PathBuf::from("/etc/axon").join(name))
+            .collect()
+    }
+
+    #[test]
+    fn config_name_is_relevant() {
+        assert!(is_relevant(
+            &paths(&["config.toml"]),
+            Some(OsStr::new(CONFIG))
+        ));
+    }
+
+    #[test]
+    fn kubelet_data_swap_is_relevant() {
+        assert!(is_relevant(&paths(&["..data"]), Some(OsStr::new(CONFIG))));
+    }
+
+    #[test]
+    fn unknown_file_name_is_relevant() {
+        assert!(is_relevant(&paths(&["other.toml"]), None));
+    }
+
+    #[test]
+    fn unrelated_file_is_not_relevant() {
+        assert!(!is_relevant(
+            &paths(&["other.toml"]),
+            Some(OsStr::new(CONFIG))
+        ));
+    }
+
+    #[test]
+    fn kubelet_data_tmp_alone_is_not_relevant() {
+        assert!(!is_relevant(
+            &paths(&["..data_tmp"]),
+            Some(OsStr::new(CONFIG))
+        ));
+    }
+
+    #[test]
+    fn kubelet_timestamped_dir_is_not_relevant() {
+        assert!(!is_relevant(
+            &paths(&["..2026_11_11_10_00_00.123"]),
+            Some(OsStr::new(CONFIG))
+        ));
+    }
 }

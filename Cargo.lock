@@ -118,6 +118,7 @@ dependencies = [
 name = "axon-gateway"
 version = "0.4.2"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "axum",
  "axum-extra",

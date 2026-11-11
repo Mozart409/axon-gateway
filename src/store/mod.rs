@@ -14,6 +14,7 @@ mod audit;
 mod auth;
 mod break_glass;
 mod rbac;
+mod replica;
 mod tokens;
 mod toolsets;
 mod views;
@@ -21,6 +22,7 @@ mod views;
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
 pub use break_glass::{BREAK_GLASS_CODE_TTL, BREAK_GLASS_SESSION_MAX_AGE};
 pub use rbac::{Actor, AuditRecord};
+pub use replica::MCP_SESSION_IDLE;
 pub use tokens::{
     ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, MAX_SERVICE_TOKEN_LIFETIME,
     MAX_USER_TOKEN_LIFETIME, NewToken, PAT_PREFIX, ServiceAccount, TokenError,

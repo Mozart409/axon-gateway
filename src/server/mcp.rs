@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::auth::{ClientIp, authenticate};
+use super::mcp_sessions::{PgSessionStore, SessionOwners, session_owner};
 use crate::audit::{CallOutcome, ToolCallEvent};
 use crate::auth::AuthManager;
 use crate::gateway::{Caller, DescribeTool, HandleRequest, HandleToolsetRequest};
@@ -47,6 +48,9 @@ use crate::types::{JsonRpcRequest, JsonRpcResponse};
 
 /// Longest `User-Agent` kept in the audit.
 const MAX_USER_AGENT_CHARS: usize = 200;
+
+/// The header that carries the id of a pre-2026-07-28 session.
+const SESSION_ID_HEADER: &str = "mcp-session-id";
 
 /// JSON-RPC code of a gateway that failed to answer.
 const INTERNAL_ERROR: i32 = -32603;
@@ -102,8 +106,13 @@ fn log_principal(caller: &Caller, method: &str, client_ip: Option<&str>) {
 /// A refused request gets `authenticate`'s response unchanged (a 401 stays an HTTP
 /// 401). An accepted one carries an [`McpCaller`] in its extensions, and is counted
 /// by the `Mcp-Method` header the client sent (rmcp checks it against the body).
+///
+/// A session of a client before 2026-07-28 belongs to the caller that opened it: a
+/// request naming it from anyone else gets the 404 of an unknown session. A new
+/// session (the response carries its id) is bound to the caller before the client
+/// hears of it.
 pub(super) async fn authenticate_mcp(
-    State(state): State<AppState>,
+    State((state, owners)): State<(AppState, SessionOwners)>,
     ClientIp(client_ip): ClientIp,
     path_params: RawPathParams,
     mut request: Request,
@@ -130,29 +139,85 @@ pub(super) async fn authenticate_mcp(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .map(|agent| agent.chars().take(MAX_USER_AGENT_CHARS).collect());
+    let session_id = request
+        .headers()
+        .get(SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let owner = session_owner(&caller);
+    if let Some(id) = &session_id {
+        match owners.owner(id).await {
+            Ok(Some(bound)) if bound != owner => {
+                return (StatusCode::NOT_FOUND, "Session not found").into_response();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not look up the owner of an MCP session");
+                return session_store_unavailable();
+            }
+        }
+    }
+    let is_delete = request.method() == http::Method::DELETE;
     request.extensions_mut().insert(McpCaller {
         caller: Arc::new(caller),
         client_ip,
         user_agent,
         toolset,
     });
-    next.run(request).await
+    let response = next.run(request).await;
+
+    match session_id {
+        None => {
+            let Some(id) = response
+                .headers()
+                .get(SESSION_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+            else {
+                return response;
+            };
+            if let Err(error) = owners.bind(id, &owner).await {
+                tracing::warn!(%error, "could not bind an MCP session to its caller");
+                if let Err(error) = owners.forget(id).await {
+                    tracing::warn!(%error, "could not drop an unbound MCP session");
+                }
+                return session_store_unavailable();
+            }
+        }
+        Some(id) if is_delete && response.status().is_success() => {
+            if let Err(error) = owners.forget(&id).await {
+                tracing::warn!(%error, "could not drop the owner of an ended MCP session");
+            }
+        }
+        Some(_) => {}
+    }
+    response
+}
+
+/// The answer when the session store cannot be reached.
+fn session_store_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable").into_response()
 }
 
 /// The rmcp Streamable HTTP service that serves [`AxonMcp`].
 ///
 /// Sessions are kept for clients before 2026-07-28 (`legacy_session_mode`); the
-/// newer protocol is stateless. Replies are plain JSON rather than an event
-/// stream, and `mcp_allowed_hosts` guards against DNS rebinding.
+/// newer protocol is stateless. With a database they are also stored in it, so a
+/// session survives on any replica that shares the database: a replica that does not
+/// know a session id restores it from there. Without one they live in this process
+/// only. Replies are plain JSON rather than an event stream, and `mcp_allowed_hosts`
+/// guards against DNS rebinding.
 pub(super) fn mcp_service(state: &AppState) -> StreamableHttpService<AxonMcp, LocalSessionManager> {
     crate::metrics::describe_mcp_metrics();
     let handler = AxonMcp {
         state: state.clone(),
     };
-    let config = StreamableHttpServerConfig::default()
+    let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(true)
         .with_json_response(true)
         .with_allowed_hosts(state.mcp_allowed_hosts.clone());
+    if let Some(store) = &state.store {
+        config.session_store = Some(Arc::new(PgSessionStore(store.clone())));
+    }
     StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -775,6 +840,103 @@ mod tests {
             .insert("authorization", "Bearer secret".parse().expect("header"));
         let (status, _) = send(state, request).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    fn named_token(name: &str, token: &str) -> crate::config::TokenConfig {
+        crate::config::TokenConfig {
+            name: name.to_owned(),
+            token: token.to_owned(),
+            allowed_tools: Vec::new(),
+            allowed_backends: Vec::new(),
+            rate_limit_per_minute: 0,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A request of a pre-2026-07-28 client with `token`, in the session `session`
+    /// (none for the `initialize` that opens one).
+    fn legacy_request(token: &str, session: Option<&str>, method: &str) -> Request<Body> {
+        let body = match session {
+            None => json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" },
+                },
+            }),
+            Some(_) => json!({ "jsonrpc": "2.0", "method": method, "params": {} }),
+        };
+        let mut builder = Request::builder()
+            .uri("/mcp")
+            .method(http::Method::POST)
+            .header("host", "localhost")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("mcp-method", method);
+        if let Some(session) = session {
+            builder = builder.header(SESSION_ID_HEADER, session);
+        }
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("request should build")
+    }
+
+    #[tokio::test]
+    async fn a_session_answers_only_the_token_that_opened_it() {
+        let config = GatewayConfig {
+            bind: String::from("127.0.0.1:0"),
+            base_url: String::from("http://127.0.0.1:8080"),
+            auth_token: None,
+            rate_limit_per_minute: 0,
+            allow_stdio: false,
+            allowed_hosts: vec![],
+        };
+        let tokens = [named_token("a", "token-a"), named_token("b", "token-b")];
+        let state = AppState {
+            auth_manager: SharedAuth::new(AuthManager::new(&config, &tokens)),
+            ..test_state()
+        };
+        // One router, so the sessions and their owners are shared between requests
+        let router = create_router(state);
+
+        let opened = router
+            .clone()
+            .oneshot(legacy_request("token-a", None, "initialize"))
+            .await
+            .expect("router should respond");
+        assert_eq!(opened.status(), StatusCode::OK);
+        let session = opened
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("initialize opens a session")
+            .to_owned();
+
+        let own = router
+            .clone()
+            .oneshot(legacy_request(
+                "token-a",
+                Some(&session),
+                "notifications/initialized",
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(own.status(), StatusCode::ACCEPTED);
+
+        let foreign = router
+            .oneshot(legacy_request(
+                "token-b",
+                Some(&session),
+                "notifications/initialized",
+            ))
+            .await
+            .expect("router should respond");
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

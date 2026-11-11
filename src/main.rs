@@ -15,7 +15,9 @@ mod backend;
 mod changes;
 mod config;
 mod error;
+mod fanout;
 mod gateway;
+mod jobs;
 mod metrics;
 mod oidc;
 mod policy;
@@ -89,15 +91,16 @@ fn setup_auth(config: &Config, multi_user: bool) -> SharedAuth {
     auth_manager
 }
 
-/// Spawns the background tasks that need the database: the session and audit
-/// purges, the audit writer (returned) and the RBAC policy refresh.
+/// Spawns the background tasks that need the database: the purges, the audit
+/// writer (returned), the RBAC policy refresh and the change listener.
 async fn start_store_tasks(
     store: Option<&store::Store>,
     has_oidc: bool,
     policy: &Arc<rbac::PolicyHandle>,
+    changes: &ChangeBus,
 ) -> Option<audit::AuditSink> {
     if let Some(store) = store {
-        spawn_session_purge(store.clone());
+        spawn_purges(store);
     }
     let audit = store.map(|store| {
         audit::spawn_audit_purge(store.clone());
@@ -110,6 +113,7 @@ async fn start_store_tasks(
             tracing::warn!(%error, "Could not load RBAC rows from the database, using [rbac] from the config only");
         }
         rbac::spawn_policy_refresh(Arc::clone(policy), store.clone());
+        fanout::spawn_change_listener(store.clone(), Arc::clone(policy), changes.clone());
     }
     audit
 }
@@ -160,7 +164,7 @@ async fn main() -> Result<()> {
     let policy =
         Arc::new(rbac::PolicyHandle::new(config.rbac.clone()).with_change_bus(changes.clone()));
 
-    let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy).await;
+    let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy, &changes).await;
 
     // Initialize Prometheus metrics exporter
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -272,19 +276,43 @@ fn setup_oidc(config: &Config, base_url: &str) -> Result<Option<Arc<OidcProvider
     Ok(Some(Arc::new(providers)))
 }
 
-/// Deletes expired sessions and unfinished logins every hour. They are
-/// rejected on lookup anyway; this only keeps the tables small.
-fn spawn_session_purge(store: store::Store) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(PURGE_INTERVAL);
-        loop {
-            interval.tick().await;
+/// Spawns the hourly purges that only keep tables small, each running on one
+/// replica at a time. Expired sessions, unfinished logins, rate limit windows
+/// and idle MCP sessions are rejected or ignored on lookup anyway.
+fn spawn_purges(store: &store::Store) {
+    jobs::spawn_singleton(
+        store.clone(),
+        "sessions",
+        PURGE_INTERVAL,
+        |store| async move {
             match store.purge_expired().await {
                 Ok(purged) => tracing::debug!(purged, "Purged expired sessions and logins"),
                 Err(error) => tracing::warn!(%error, "Failed to purge expired sessions"),
             }
-        }
-    });
+        },
+    );
+    jobs::spawn_singleton(
+        store.clone(),
+        "rate_limits",
+        PURGE_INTERVAL,
+        |store| async move {
+            match store.purge_rate_limits().await {
+                Ok(purged) => tracing::debug!(purged, "Purged expired rate limit windows"),
+                Err(error) => tracing::warn!(%error, "Failed to purge rate limit windows"),
+            }
+        },
+    );
+    jobs::spawn_singleton(
+        store.clone(),
+        "mcp_sessions",
+        PURGE_INTERVAL,
+        |store| async move {
+            match store.purge_mcp_sessions().await {
+                Ok(purged) => tracing::debug!(purged, "Purged idle MCP sessions"),
+                Err(error) => tracing::warn!(%error, "Failed to purge idle MCP sessions"),
+            }
+        },
+    );
 }
 
 #[expect(

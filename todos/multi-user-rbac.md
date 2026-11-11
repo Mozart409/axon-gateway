@@ -596,8 +596,8 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 11. Phased plan
 
-Status (2026-11-11): Phases 0 to 4a are done and committed. Resume at
-Phase 4b (Phase 8, config in the database, is planned). Open caveats: OIDC
+Status (2026-11-11): Phases 0 to 4b are done and committed. Resume at
+Phase 5 (Phase 8, config in the database, is planned). Open caveats: OIDC
 login is untested against a real IdP, and a plain-text 403 from the CSRF
 check can replace an admin page section (the htmx config swaps 4xx
 responses).
@@ -759,13 +759,17 @@ or protocol signals is refused (it was served before).
 
 ### Phase 4b - Multi-replica
 
-- [ ] LISTEN/NOTIFY fan-out (feeds the change bus); multi-replica notes in the
+- [x] LISTEN/NOTIFY fan-out (feeds the change bus); multi-replica notes in the
       docs.
-- [ ] Postgres session store for pre-2026-07-28 sessions (rmcp `SessionStore`).
-- [ ] Shared rate limits (Postgres counters).
-- [ ] Singleton jobs under a Postgres advisory lock (retention, token expiry,
-      inactive-user suspension).
-- [ ] Config watcher accepts the kubelet `..data` symlink swap (directory watch,
+- [x] Postgres session store for pre-2026-07-28 sessions (rmcp `SessionStore`).
+- [x] Bind pre-2026-07-28 sessions to the principal that opened them (404 for
+      others).
+- [x] Shared rate limits (Postgres counters).
+- [x] Singleton jobs (retention, session and rate-limit purges) under a
+      per-interval lease row (`job_runs`) rather than an advisory lock: the
+      lease also stops two replicas running the same job back to back. Token
+      expiry and inactive-user suspension need no job (checked on use).
+- [x] Config watcher accepts the kubelet `..data` symlink swap (directory watch,
       adjust the file-name filter).
 - Exit: two replicas stay consistent (a grant change on one reaches clients
   of the other).

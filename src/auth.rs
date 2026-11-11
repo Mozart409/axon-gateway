@@ -48,6 +48,16 @@ struct RateLimitEntry {
     window_start: Instant,
 }
 
+/// What a bearer token matched
+enum Resolved {
+    /// A `[[tokens]]` entry
+    Named(TokenIdentity),
+    /// The shared token
+    Shared,
+    /// No auth is configured
+    Open,
+}
+
 /// Authentication manager handling token validation, ACLs, and rate limiting
 pub struct AuthManager {
     /// The simple shared token (backward compat)
@@ -87,14 +97,48 @@ impl AuthManager {
     /// Validate a bearer token and return the resolved identity.
     ///
     /// Returns `Ok(Some(identity))` for named tokens, `Ok(None)` for the shared
-    /// token (which has no restrictions), or `Err(AuthError)` on failure.
+    /// token (which has no restrictions), or `Err(AuthError)` on failure. Counts
+    /// the request in the in-memory rate limit window.
     pub fn validate_token(&self, provided: &str) -> Result<Option<TokenIdentity>, AuthError> {
+        match self.resolve(provided)? {
+            Resolved::Named(identity) => {
+                self.check_rate_limit(&identity.name, identity.rate_limit_per_minute)?;
+                Ok(Some(identity))
+            }
+            Resolved::Shared => {
+                self.check_rate_limit("__shared__", 0)?;
+                Ok(None) // No restrictions
+            }
+            Resolved::Open => Ok(None),
+        }
+    }
+
+    /// Identify a bearer token like [`validate_token`](Self::validate_token), but
+    /// without counting the request against the in-memory rate limit, for callers
+    /// that count elsewhere (multi-user mode counts in Postgres).
+    pub fn identify(&self, provided: &str) -> Result<Option<TokenIdentity>, AuthError> {
+        Ok(match self.resolve(provided)? {
+            Resolved::Named(identity) => Some(identity),
+            Resolved::Shared | Resolved::Open => None,
+        })
+    }
+
+    /// The rate limit that applies to a token (requests per minute, 0 =
+    /// unlimited): its own when set, else the global one.
+    pub fn effective_limit(&self, token_limit: u32) -> u32 {
+        if token_limit > 0 {
+            token_limit
+        } else {
+            self.global_rate_limit
+        }
+    }
+
+    /// Match a bearer token against the named tokens, then the shared token.
+    fn resolve(&self, provided: &str) -> Result<Resolved, AuthError> {
         // Check named tokens first (constant-time comparison)
         for (token_value, identity) in &self.token_map {
             if constant_time_eq(provided, token_value) {
-                // Check rate limit
-                self.check_rate_limit(&identity.name, identity.rate_limit_per_minute)?;
-                return Ok(Some(identity.clone()));
+                return Ok(Resolved::Named(identity.clone()));
             }
         }
 
@@ -102,13 +146,12 @@ impl AuthManager {
         if let Some(shared) = &self.shared_token
             && constant_time_eq(provided, shared)
         {
-            self.check_rate_limit("__shared__", 0)?;
-            return Ok(None); // No restrictions
+            return Ok(Resolved::Shared);
         }
 
         // No auth configured at all — allow everything
         if self.shared_token.is_none() && self.token_map.is_empty() {
-            return Ok(None);
+            return Ok(Resolved::Open);
         }
 
         Err(AuthError::InvalidToken)
@@ -164,11 +207,7 @@ impl AuthManager {
     /// Check rate limit for a given token name
     fn check_rate_limit(&self, token_name: &str, token_rate_limit: u32) -> Result<(), AuthError> {
         // Determine effective rate limit (token-specific overrides global)
-        let limit = if token_rate_limit > 0 {
-            token_rate_limit
-        } else {
-            self.global_rate_limit
-        };
+        let limit = self.effective_limit(token_rate_limit);
 
         if limit == 0 {
             return Ok(()); // Unlimited
@@ -398,6 +437,47 @@ mod tests {
             rate_limit_per_minute: 0,
             metadata: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn effective_limit_prefers_the_token_over_the_global_value() {
+        let auth = AuthManager::new(&gateway_config(None, 10), &[]);
+        assert_eq!(auth.effective_limit(0), 10);
+        assert_eq!(auth.effective_limit(3), 3);
+        let unlimited = AuthManager::new(&gateway_config(None, 0), &[]);
+        assert_eq!(unlimited.effective_limit(0), 0);
+        assert_eq!(unlimited.effective_limit(7), 7);
+    }
+
+    #[test]
+    fn identify_does_not_count_against_the_in_memory_window() {
+        let mut limited = token("agent", "tok_agent");
+        limited.rate_limit_per_minute = 1;
+        let auth = AuthManager::new(&gateway_config(Some("s"), 1), &[limited]);
+
+        for _ in 0..5 {
+            let identity = auth.identify("tok_agent").unwrap().unwrap();
+            assert_eq!(identity.name, "agent");
+            assert_eq!(identity.rate_limit_per_minute, 1);
+            assert!(auth.identify("s").unwrap().is_none());
+        }
+        assert!(matches!(
+            auth.identify("wrong"),
+            Err(AuthError::InvalidToken)
+        ));
+
+        // The window is still untouched: one request passes, the next does not.
+        assert!(auth.validate_token("tok_agent").is_ok());
+        assert!(matches!(
+            auth.validate_token("tok_agent"),
+            Err(AuthError::RateLimited { .. })
+        ));
+    }
+
+    #[test]
+    fn identify_without_auth_configured_is_open() {
+        let auth = AuthManager::new(&gateway_config(None, 0), &[]);
+        assert!(auth.identify("anything").unwrap().is_none());
     }
 
     #[test]

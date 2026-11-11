@@ -13,7 +13,8 @@ categories = ["network-programming", "web-programming"]
 
 [dependencies]
 # keep-sorted start
-axum = { version = "0.8", features = ["macros"] }
+async-trait = "0.1"
+axum ={ version = "0.8", features = ["macros"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 color-eyre = "0.6.5"

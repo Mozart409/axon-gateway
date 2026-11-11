@@ -107,6 +107,61 @@ async fn atomic_replace_of_config_hot_reloads() {
 }
 
 #[tokio::test]
+async fn kubernetes_configmap_symlink_swap_hot_reloads() {
+    use std::os::unix::fs::symlink;
+
+    let backend = MockBackend::start(&["echo", "add"]).await;
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let base = format!("http://{bind}");
+
+    // The kubelet's ConfigMap layout: the file is a symlink through `..data`,
+    // itself a symlink to a timestamped directory holding the real file.
+    let dir = tempfile::tempdir().expect("create config dir");
+    let first = dir.path().join("..2026_a");
+    std::fs::create_dir(&first).expect("create first revision");
+    std::fs::write(
+        first.join("config.toml"),
+        ConfigBuilder::new(&bind).render(),
+    )
+    .expect("write first config");
+    symlink("..2026_a", dir.path().join("..data")).expect("link ..data");
+    let config = dir.path().join("config.toml");
+    symlink("..data/config.toml", &config).expect("link config.toml");
+
+    let server = Gateway::start_at(&config, &base, &[]).await;
+    let client = reqwest::Client::new();
+    assert_eq!(tool_count(&client, &server.base).await, 0);
+
+    // Publish the next revision the way the kubelet does: a new directory,
+    // then `..data` re-pointed by renaming a fresh symlink over it. The file
+    // itself is never touched.
+    let second = dir.path().join("..2026_b");
+    std::fs::create_dir(&second).expect("create second revision");
+    std::fs::write(
+        second.join("config.toml"),
+        ConfigBuilder::new(&bind)
+            .http_backend("mock", &backend.url())
+            .render(),
+    )
+    .expect("write second config");
+    symlink("..2026_b", dir.path().join("..data_tmp")).expect("link ..data_tmp");
+    std::fs::rename(dir.path().join("..data_tmp"), dir.path().join("..data")).expect("swap ..data");
+
+    let count = poll_until(60, Duration::from_millis(250), || async {
+        let n = tool_count(&client, &server.base).await;
+        (n >= 2).then_some(n)
+    })
+    .await;
+    assert_eq!(
+        count,
+        Some(2),
+        "a ConfigMap `..data` symlink swap should hot-reload"
+    );
+    assert_eq!(backend_count(&client, &server.base).await, 1);
+}
+
+#[tokio::test]
 async fn removing_a_backend_hot_reloads_tools_away() {
     let backend = MockBackend::start(&["echo"]).await;
     let port = free_port();

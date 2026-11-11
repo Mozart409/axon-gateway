@@ -30,6 +30,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::authz::tool_matches_pattern;
+use crate::jobs;
 use crate::metrics;
 use crate::store::Store;
 
@@ -538,22 +539,17 @@ async fn run_writer(
     }
 }
 
-/// Deletes arguments and calls past their retention every hour, reading the
-/// retention from the database each time.
+/// Deletes arguments and calls past their retention every hour, on one replica
+/// at a time, reading the retention from the database each time.
 pub fn spawn_audit_purge(store: Store) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(PURGE_INTERVAL);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            match store.purge_audit().await {
-                Ok(purged) => tracing::debug!(
-                    arguments = purged.arguments,
-                    calls = purged.calls,
-                    "Purged audit rows past their retention"
-                ),
-                Err(error) => tracing::warn!(%error, "Failed to purge the audit tables"),
-            }
+    jobs::spawn_singleton(store, "audit", PURGE_INTERVAL, |store| async move {
+        match store.purge_audit().await {
+            Ok(purged) => tracing::debug!(
+                arguments = purged.arguments,
+                calls = purged.calls,
+                "Purged audit rows past their retention"
+            ),
+            Err(error) => tracing::warn!(%error, "Failed to purge the audit tables"),
         }
     });
 }

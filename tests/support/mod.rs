@@ -7,6 +7,7 @@
 pub mod mock_backend;
 pub mod mock_oidc;
 
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ pub struct ConfigBuilder {
     database_url_env: Option<String>,
     oidc_providers: Vec<String>,
     rbac: Option<String>,
+    rate_limit_per_minute: Option<u32>,
 }
 
 impl ConfigBuilder {
@@ -53,6 +55,7 @@ impl ConfigBuilder {
             database_url_env: None,
             oidc_providers: Vec::new(),
             rbac: None,
+            rate_limit_per_minute: None,
         }
     }
 
@@ -70,6 +73,12 @@ impl ConfigBuilder {
     /// Set `[gateway] allowed_hosts` (extra accepted MCP `Host` header values).
     pub fn allowed_hosts(mut self, hosts: &[&str]) -> Self {
         self.allowed_hosts = hosts.iter().map(|h| (*h).to_string()).collect();
+        self
+    }
+
+    /// Set `[gateway] rate_limit_per_minute` (the per-PAT limit in multi-user mode).
+    pub fn rate_limit_per_minute(mut self, limit: u32) -> Self {
+        self.rate_limit_per_minute = Some(limit);
         self
     }
 
@@ -171,6 +180,9 @@ impl ConfigBuilder {
                 .join(", ");
             let _ = writeln!(out, "allowed_hosts = [{hosts}]");
         }
+        if let Some(limit) = self.rate_limit_per_minute {
+            let _ = writeln!(out, "rate_limit_per_minute = {limit}");
+        }
         out.push('\n');
         for backend in &self.backends {
             out.push_str(backend);
@@ -192,11 +204,13 @@ impl ConfigBuilder {
 }
 
 /// A running gateway process bound to an ephemeral port. Killed on drop; the
-/// config file is a `NamedTempFile` cleaned up automatically.
+/// config file is a `NamedTempFile` cleaned up automatically, unless the test
+/// started the gateway on a path it owns ([`Gateway::start_at`]).
 pub struct Gateway {
     child: Child,
     pub base: String,
-    config: NamedTempFile,
+    config: Option<NamedTempFile>,
+    config_path: PathBuf,
 }
 
 impl Drop for Gateway {
@@ -218,8 +232,25 @@ impl Gateway {
         let mut file = NamedTempFile::new().expect("create temp config");
         std::io::Write::write_all(&mut file, config.as_bytes()).expect("write config");
 
+        let path = file.path().to_path_buf();
+        Self::spawn(path, Some(file), base, env).await
+    }
+
+    /// Spawn the gateway binary on the config file at `path`, which the test
+    /// owns (it is neither written nor removed here), and wait until it is
+    /// ready. For tests that lay the file out themselves, e.g. as symlinks.
+    pub async fn start_at(path: &Path, base: &str, env: &[(&str, &str)]) -> Self {
+        Self::spawn(path.to_path_buf(), None, base, env).await
+    }
+
+    async fn spawn(
+        config_path: PathBuf,
+        config: Option<NamedTempFile>,
+        base: &str,
+        env: &[(&str, &str)],
+    ) -> Self {
         let child = Command::new(BIN)
-            .arg(file.path())
+            .arg(&config_path)
             // ServeFile routes resolve assets relative to CWD.
             .current_dir(MANIFEST_DIR)
             .env("RUST_LOG", "warn")
@@ -230,7 +261,8 @@ impl Gateway {
         let gateway = Gateway {
             child,
             base: base.to_string(),
-            config: file,
+            config,
+            config_path,
         };
         gateway.wait_ready().await;
         gateway
@@ -264,7 +296,7 @@ impl Gateway {
 
     /// Overwrite the config file in place (to trigger the hot-reload watcher).
     pub fn rewrite_config(&self, config: &str) {
-        std::fs::write(self.config.path(), config).expect("rewrite config");
+        std::fs::write(&self.config_path, config).expect("rewrite config");
     }
 
     /// Atomically replace the config file via `rename(2)` — the way editors and
@@ -272,14 +304,10 @@ impl Gateway {
     /// detaches any inotify watch bound to the *original* inode, so it exercises
     /// the watcher's directory-level watching rather than a file-inode watch.
     pub fn replace_config_atomically(&self, config: &str) {
-        let dir = self
-            .config
-            .path()
-            .parent()
-            .expect("config has a parent dir");
+        let dir = self.config_path.parent().expect("config has a parent dir");
         let mut tmp = NamedTempFile::new_in(dir).expect("create sibling temp config");
         std::io::Write::write_all(&mut tmp, config.as_bytes()).expect("write new config");
-        tmp.persist(self.config.path())
+        tmp.persist(&self.config_path)
             .expect("atomic rename over config");
     }
 
