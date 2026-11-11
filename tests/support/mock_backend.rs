@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::extract::State;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -49,6 +50,28 @@ struct MockState {
     /// Cancellable tools whose request was cancelled.
     cancelled: Mutex<HashSet<String>>,
     calls: Mutex<Vec<CallRecord>>,
+    /// The headers (lowercase names) of every HTTP request the backend got.
+    requests: Mutex<Vec<HashMap<String, String>>>,
+}
+
+/// Records the headers of every request before it reaches the MCP service.
+async fn record_headers(
+    State(state): State<Arc<MockState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let headers = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    state.requests.lock().unwrap().push(headers);
+    next.run(request).await
 }
 
 #[derive(Clone)]
@@ -175,6 +198,19 @@ impl MockBackend {
         self.state.cancelled.lock().unwrap().contains(tool)
     }
 
+    /// The value of header `name` (case-insensitive) on every HTTP request
+    /// this backend received that carried it, oldest first.
+    pub fn header_values(&self, name: &str) -> Vec<String> {
+        let name = name.to_ascii_lowercase();
+        self.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|headers| headers.get(&name).cloned())
+            .collect()
+    }
+
     /// A snapshot of every recorded call.
     pub fn calls(&self) -> Vec<CallRecord> {
         self.state.calls.lock().unwrap().clone()
@@ -254,6 +290,7 @@ impl MockBackendBuilder {
             cancellable: self.cancellable,
             cancelled: Mutex::new(HashSet::new()),
             calls: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
         });
 
         let handler = MockHandler {
@@ -265,7 +302,9 @@ impl MockBackendBuilder {
             StreamableHttpServerConfig::default(),
         );
 
-        let router = axum::Router::new().nest_service("/mcp", service);
+        let router = axum::Router::new().nest_service("/mcp", service).layer(
+            axum::middleware::from_fn_with_state(state.clone(), record_headers),
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

@@ -70,6 +70,8 @@ pub struct RegistryActor {
     toolsets: Vec<ToolsetConfig>,
     /// Told when a backend's tools change; `None` publishes nothing
     changes: Option<ChangeBus>,
+    /// Whose tool lists a change here concerns (everyone, or one user's slot)
+    change_scope: ChangeScope,
 }
 
 impl RegistryActor {
@@ -80,6 +82,7 @@ impl RegistryActor {
             tool_cache: ToolCache::new(DEFAULT_CACHE_TTL_SECS),
             toolsets: Vec::new(),
             changes: None,
+            change_scope: ChangeScope::All,
         }
     }
 
@@ -91,6 +94,7 @@ impl RegistryActor {
             tool_cache: ToolCache::new(DEFAULT_CACHE_TTL_SECS),
             toolsets,
             changes: None,
+            change_scope: ChangeScope::All,
         }
     }
 
@@ -101,10 +105,18 @@ impl RegistryActor {
         self
     }
 
+    /// Publish changes under `scope` instead of [`ChangeScope::All`], for a
+    /// registry that holds one user's backends
+    #[must_use]
+    pub fn with_change_scope(mut self, scope: ChangeScope) -> Self {
+        self.change_scope = scope;
+        self
+    }
+
     /// Tell the subscribers that some caller's tool list may have changed
     fn publish_tools_changed(&self) {
         if let Some(bus) = &self.changes {
-            bus.publish(ChangeScope::All);
+            bus.publish(self.change_scope);
         }
     }
 
@@ -124,7 +136,7 @@ impl RegistryActor {
     fn build_tool_list(&self) -> Vec<ToolDefinition> {
         self.backends
             .iter()
-            .filter(|b| b.state == BackendState::Connected)
+            .filter(|b| matches!(b.state, BackendState::Connected | BackendState::Idle))
             .flat_map(|b| {
                 b.tools
                     .iter()
@@ -204,6 +216,26 @@ impl Message<RegisterBackend> for RegistryActor {
             msg.name.clone(),
             BackendInfo::new(msg.name, BackendState::Disconnected, Vec::new(), None),
         );
+    }
+}
+
+/// Mark a backend idle: its connection is closed on purpose, its cached tools
+/// stay listed and routable
+pub struct MarkIdle {
+    pub name: String,
+}
+
+impl Message<MarkIdle> for RegistryActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: MarkIdle,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Some(mut info) = self.backends.get_mut(&msg.name) {
+            info.state = BackendState::Idle;
+        }
     }
 }
 

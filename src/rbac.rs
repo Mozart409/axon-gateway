@@ -269,7 +269,7 @@ impl<'a> Admin<'a> {
     /// backends are the gateway's current ones.
     pub async fn from_state(state: &'a AppState, session: &SessionUser) -> Option<Admin<'a>> {
         let (store, oidc) = state.multi_user()?;
-        let backends = match state.gateway.ask(GetDetailedStatus).await {
+        let mut backends: Vec<String> = match state.gateway.ask(GetDetailedStatus).await {
             Ok(status) => status
                 .backends
                 .into_iter()
@@ -280,6 +280,10 @@ impl<'a> Admin<'a> {
                 Vec::new()
             }
         };
+        // Catalog entries are granted like shared backends
+        if let Some(hub) = &state.personal {
+            backends.extend(hub.catalog().into_iter().map(|item| item.name));
+        }
         let providers = oidc
             .iter()
             .map(|provider| provider.id().to_owned())

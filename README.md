@@ -126,6 +126,7 @@ argument (both example files already do this).
 | `/ui/tools`                             | GET    | "My tools" page (multi-user mode)                   |
 | `/ui/tokens`                            | GET    | Personal access tokens page (multi-user mode)       |
 | `/api/v1/...`                           | any    | JSON admin API for RBAC (multi-user mode, see RBAC) |
+| `/api/v1/me/backends`, `/api/v1/catalog`, ... | any | Personal MCP servers and catalog (see Personal MCP servers and the catalog) |
 | `/build`                                | GET    | Build/runtime metadata (version, pid, startup time) |
 | `/health`                               | GET    | Health check                                        |
 | `/livez`                                | GET    | Liveness probe (200 while the process is up)        |
@@ -362,7 +363,7 @@ need no sticky routing.
 
 Changes fan out through Postgres. Triggers run `NOTIFY axon_changes` when
 groups, IdP mappings, memberships, grants or role bindings change (payload kind
-`policy`), and when a user's opt-outs or toolsets change (kind `user`). Every
+`policy`), when a user's opt-outs, toolsets or personal servers change (kind `user`), and when the catalog changes (kind `catalog`). Every
 replica LISTENs on the channel: a policy notice reloads its policy, and a user
 notice sends `notifications/tools/list_changed` to that user's MCP clients.
 Changes made with `axon-gateway admin` or straight in SQL propagate the same way.
@@ -750,6 +751,120 @@ Only your own toolsets exist for you: someone else's id is a 404.
 - **Deleting** a toolset that a still-valid token is pinned to answers 409.
   Revoke or re-pin the token first.
 
+## Personal MCP servers and the catalog
+
+Users bring their own MCP servers, and admins publish backends that each user
+connects with their own credential. Both need a database and multi-user mode,
+and are on by default (`[personal_backends] enabled = true`). Their
+connections are per user and per replica; nothing here touches the shared
+backends.
+
+```toml
+[personal_backends]
+enabled = true
+max_per_user = 10          # personal servers + catalog credentials
+max_calls_per_minute = 0   # 0 = off
+max_instances = 500        # live per-user connections, all users
+egress_allow = []          # see Egress guard
+egress_deny = []
+
+[[backends]]
+name = "notes"
+url = "https://notes.example.com/mcp"
+transport = "http"
+credential_mode = "per_user"
+
+[[backends.credential_fields]]
+name = "api_token"
+label = "API token"
+header = "Authorization"
+prefix = "Bearer "
+```
+
+**Personal servers.** Any human user (the built-in Member role has
+`personal_backends.create`) adds a Streamable HTTP MCP server with a prefix and
+optional headers. stdio stays admin-only: config plus `allow_stdio`. Its tools
+appear as `<prefix>_<tool>` for that user only. No RBAC grant is needed, but
+the user's opt-outs, a token's scope and a pinned toolset still apply, so the
+user's personal access tokens see the tools within their scope. A shared tool
+wins a name collision. The prefix matches `^[a-z][a-z0-9-]{1,30}$`, is not one
+of `axon`, `mcp`, `admin`, `api`, `system`, `gateway`, `internal` or
+`catalog`, and must neither equal a shared or catalog name nor clash with one
+(`<prefix>_` is a prefix of a shared tool name, or the other way round). On
+save the egress guard is a hard reject; then the gateway connects, lists the
+tools and returns the result, and the server is saved either way. Header
+values are write-only: they are sealed and never returned or rendered. Admins
+(`users.manage`) list, disable and delete anyone's personal servers and never
+see header values.
+
+**Catalog.** A catalog entry is a backend whose users bring their own
+credential. Define it in the config as a `[[backends]]` entry with
+`credential_mode = "per_user"` and one `[[backends.credential_fields]]` per
+value (`name`, `label`, `header`, `prefix`): the gateway sends the header with
+`prefix` plus what the user entered. Config entries are read-only in the UI
+and API (409). Or create entries with `catalog.manage` through the API or the
+UI. A user sees an entry only if their RBAC grants cover that backend (admins
+see all). Entering a credential gives them their own connection; its tools
+`<entry>_<tool>` need a normal grant. Catalog entries get no egress check.
+
+| Endpoint                                         | Method        | Needs                    |
+| ------------------------------------------------ | ------------- | ------------------------ |
+| `/api/v1/me/backends`                            | GET, POST     | `personal_backends.create` to add |
+| `/api/v1/me/backends/{prefix}`                   | PATCH, DELETE | own server               |
+| `/api/v1/me/credentials`                         | GET           | your credentials and the entries you may use |
+| `/api/v1/me/credentials/{entry}`                 | PUT, DELETE   | a grant on the entry     |
+| `/api/v1/catalog`                                | GET, POST     | `catalog.manage` to create |
+| `/api/v1/catalog/{name}`                         | PATCH, DELETE | `catalog.manage`         |
+| `/api/v1/admin/personal-backends`                | GET           | `users.manage`           |
+| `/api/v1/admin/personal-backends/{owner_id}/{prefix}` | PATCH, DELETE | `users.manage`      |
+
+A personal server is `{"prefix", "url", "headers": {"name": "value"}}` (PATCH:
+`url`, `enabled`, `headers`) and the answer carries the connection `test`. A
+credential is `{"values": {"<field name>": "value"}}`. A catalog entry is
+`{"name", "description", "url", "credential_fields": [...]}`. Like the other
+write routes they need the session's `X-CSRF-Token`; without the personal hub
+(no database, or `enabled = false`) they answer 404.
+
+**Encryption.** Header and credential values are sealed per secret with a
+random data key (AES-256-GCM); the data key is wrapped by a key-encryption key
+(KEK), derived with HKDF-SHA256 from `AXON_KEK_FILE` (a path) or `AXON_KEK` (the
+text). It has one line per KEK, `[id:]secret`, a secret of at least 32
+characters, and the first line is the active key. With `[database]` and
+`[personal_backends] enabled = true` the gateway refuses to start without one.
+Generate a secret with `pwgen -s 48 1`.
+
+To rotate, put the new key first and keep the old line, restart, run
+`axon-gateway admin rewrap-secrets --config <path>` (it rewraps the data keys
+only and prints how many it moved), then drop the old line.
+
+**Egress guard.** A personal server URL is typed in by a user, so the gateway
+checks it: `http` or `https` only, no userinfo, every resolved address is
+checked and the first one is pinned for the connection (no second lookup), no
+redirects and no proxy. The order is `egress_deny`, then `egress_allow`, then
+the built-in default deny, then allow. The default deny covers `0.0.0.0/8`,
+`10.0.0.0/8`, `100.64.0.0/10` (CGNAT), `127.0.0.0/8`, `169.254.0.0/16`
+(link-local and cloud metadata), `172.16.0.0/12`, `192.0.0.0/24`,
+`192.168.0.0/16`, `198.18.0.0/15`, `224.0.0.0/4`, `240.0.0.0/4`, `::/128`,
+`::1/128`, `fc00::/7`, `fe80::/10` and `ff00::/8`. A rule is a CIDR, an IP, a
+host or `*.host` (subdomains only, not the apex). To reach a LAN:
+`egress_allow = ["10.0.0.0/8"]`.
+
+**Quotas.** `max_per_user` caps personal servers plus catalog credentials per
+user. `max_calls_per_minute` limits a user's calls to personal and catalog
+backends; shared calls never count. `max_instances` caps the live per-user
+connections of all users on a replica; the least recently used users are
+evicted and reconnect on their next call.
+
+**Audit.** A personal tool call is recorded with the user, tool, prefix,
+outcome and latency, never its arguments or result. Catalog calls are audited
+like shared ones.
+
+**Replicas.** Changes travel on the existing `NOTIFY` fan-out (kinds `user`
+and `catalog`), see [Multiple replicas](#multiple-replicas).
+
+**Limits.** Toolset endpoints, resources and prompts serve shared backends
+only.
+
 ## Tracing
 
 Logs go to stdout (`AXON_LOG_JSON=1` for JSON, `RUST_LOG` to filter). Set
@@ -766,17 +881,21 @@ Prometheus metrics are exposed at `/metrics`:
 - `axon_tool_calls_total` - Tool call counter by backend/tool
 - `axon_tool_call_duration_seconds` - Tool call latency histogram
 - `axon_tool_call_errors_total` - Tool call error counter
-- `axon_backend_state` - Backend connection state gauge
+- `axon_backend_connections{backend,state}` - Backend connection state gauge (1 for the current state)
 - `axon_http_requests_total` - HTTP request counter
 - `axon_health_checks_total` - Health check counter
 - `axon_resource_reads_total` - Resource read counter
 - `axon_prompt_gets_total` - Prompt get counter
+- `axon_backend_up` - Gauge per backend, 1 when the last connect or health probe succeeded
 - `axon_audit_dropped_total` - Tool-call audit events dropped on a full queue
 - `axon_audit_write_errors_total` - Tool-call audit batches the database refused
 
+The `idle` value of the backend state gauge counts backends closed by the idle
+timeout. Personal and catalog connections are not labelled in metrics.
+
 ## Gateway Settings
 
-Two `[gateway]` settings control what the gateway runs and answers to:
+These `[gateway]` settings control what the gateway runs and answers to:
 
 ```toml
 [gateway]
@@ -784,6 +903,7 @@ bind = "0.0.0.0:8080"
 base_url = "https://axon.example.com"
 allow_stdio = false # default
 allowed_hosts = ["axon.internal.example.com", "axon.internal.example.com:8443"]
+idle_timeout_secs = 300 # default
 ```
 
 - `allow_stdio` (default `false`): stdio backends spawn processes inside the
@@ -794,6 +914,14 @@ allowed_hosts = ["axon.internal.example.com", "axon.internal.example.com:8443"]
   that `/mcp` and the toolset endpoints accept. `localhost`, `127.0.0.1`, `::1`
   and the host of `base_url` (with its port, when it has one) are always
   accepted.
+- `idle_timeout_secs` (default `300`): a backend connection with no call for
+  this long is closed; `0` keeps it always connected. A backend's own
+  `idle_timeout_secs` wins, and stdio backends default to `0`. An idle backend
+  keeps its cached tools, shows state `idle` in the UI and metrics, and
+  reconnects on the next call. Shared backends keep their health probes while
+  idle (on a short-lived connection). Personal and catalog connections are
+  passive: no probes, health comes from call outcomes, and the UI shows
+  `last_ok_at` and `last_error`.
 
 > **Upgrading:** standalone setups that run stdio backends must now set
 > `allow_stdio = true` in `[gateway]`; without it the config no longer loads.
@@ -888,7 +1016,18 @@ src/
 ├── registry.rs  # Registry actor (tool aggregation)
 ├── backend.rs   # Backend actor (per-server connection via rmcp)
 ├── gateway.rs   # Gateway actor (orchestration)
-└── server.rs    # HTTP server (axum), MCP Streamable HTTP
+├── crypto.rs    # Envelope encryption, KEK keyring and rotation
+├── egress.rs    # Egress policy and SSRF guard for personal backend URLs
+├── personal.rs  # Personal and catalog backends (per-user instances, quotas)
+├── store/
+│   └── personal.rs  # Personal backend, catalog and credential storage
+├── server.rs    # HTTP server (axum), MCP Streamable HTTP
+└── server/
+    ├── personal_api.rs    # /api/v1 routes for personal servers and catalog
+    ├── personal_ui.rs     # Dashboard pages for them
+    └── personal_views.rs  # Their templates
+migrations/
+└── 0010_personal_backends.sql
 ```
 
 ## License

@@ -509,6 +509,8 @@ async fn fetch_backend_prompts(state: &AppState, backend_name: &str) -> Vec<Prom
             },
             caller: Arc::new(Caller::Open),
             relay: None,
+            personal: None,
+            hub: None,
         })
         .await
     {
@@ -554,6 +556,8 @@ async fn fetch_backend_resources(state: &AppState, backend_name: &str) -> Vec<Re
             },
             caller: Arc::new(Caller::Open),
             relay: None,
+            personal: None,
+            hub: None,
         })
         .await
     {

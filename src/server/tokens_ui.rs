@@ -37,6 +37,7 @@ pub(super) fn page_routes() -> Router<AppState> {
         .route("/ui/tokens", get(handle_tokens))
         .route("/ui/admin/service-accounts", get(handle_service_accounts))
         .merge(super::toolsets_ui::page_routes())
+        .merge(super::personal_ui::page_routes())
 }
 
 /// The POST actions, to merge into the routes behind the CSRF and same-site
@@ -66,6 +67,7 @@ pub(super) fn action_routes() -> Router<AppState> {
             post(handle_account_token_revoke),
         )
         .merge(super::toolsets_ui::action_routes())
+        .merge(super::personal_ui::action_routes())
 }
 
 /// The create token form, read as pairs because `scope_backends` repeats

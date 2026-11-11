@@ -42,6 +42,7 @@ use super::mcp_sessions::{PgSessionStore, SessionOwners, session_owner};
 use crate::audit::{CallOutcome, ToolCallEvent};
 use crate::auth::AuthManager;
 use crate::gateway::{Caller, DescribeTool, HandleRequest, HandleToolsetRequest};
+use crate::personal::{UserBackendKind, UserSlot};
 use crate::principal::{PrincipalPolicy, TokenScope};
 use crate::relay::{CallRelay, PROGRESS_BUFFER};
 use crate::types::{JsonRpcRequest, JsonRpcResponse};
@@ -274,8 +275,15 @@ impl CallAudit {
     }
 
     /// Queues the event. The tool lookup and the queueing run in a task, so
-    /// the response is not delayed; the arguments are never logged here.
-    fn finish(self, state: &AppState, response: Option<&JsonRpcResponse>) {
+    /// the response is not delayed; the arguments are never logged here. A
+    /// tool of the caller's own personal backend (found in `slot` when the
+    /// shared registry has no such tool) is recorded without its arguments.
+    fn finish(
+        self,
+        state: &AppState,
+        response: Option<&JsonRpcResponse>,
+        slot: Option<Arc<UserSlot>>,
+    ) {
         let Some(sink) = state.audit.clone() else {
             return;
         };
@@ -290,6 +298,27 @@ impl CallAudit {
                 .await
                 .ok()
                 .flatten();
+            let mut personal = false;
+            let described = match (described, slot) {
+                (None, Some(slot)) => {
+                    let own = slot
+                        .registry
+                        .ask(crate::registry::DescribeTool {
+                            namespaced_tool_name: self.name.clone(),
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                    personal = own.as_ref().is_some_and(|tool| {
+                        matches!(
+                            slot.kinds.get(&tool.backend_name),
+                            Some(UserBackendKind::Personal { .. })
+                        )
+                    });
+                    own
+                }
+                (described, _) => described,
+            };
             let (backend, tool, annotations) = match described {
                 Some(tool) => (tool.backend_name, tool.original_tool_name, tool.annotations),
                 None => (String::new(), self.name, None),
@@ -313,8 +342,13 @@ impl CallAudit {
                 trace_id: self.trace_id,
                 client_ip: self.client_ip,
                 user_agent: self.user_agent,
-                arguments: self.arguments,
+                arguments: if personal {
+                    Value::Null
+                } else {
+                    self.arguments
+                },
                 annotations,
+                personal,
             });
         });
     }
@@ -378,9 +412,14 @@ impl AxonMcp {
             params,
         };
         let audit = CallAudit::start(&self.state, auth, &request);
-        let response = self.ask_gateway(auth, request, relay).await;
+        let slot = if method.starts_with("tools/") && auth.toolset.is_none() {
+            self.personal_slot(auth).await
+        } else {
+            None
+        };
+        let response = self.ask_gateway(auth, request, relay, slot.clone()).await;
         if let Some(audit) = audit {
-            audit.finish(&self.state, response.as_ref().ok());
+            audit.finish(&self.state, response.as_ref().ok(), slot);
         }
         let result = into_result(response?)?;
         serde_json::from_value(result).map_err(|error| {
@@ -389,15 +428,28 @@ impl AxonMcp {
         })
     }
 
-    /// Sends the request to the gateway actor. On `/mcp/toolset/{name}` a principal
-    /// that owns a toolset of that name is narrowed with it and served like on
-    /// `/mcp`, listing and calls both; anyone else gets the config toolset, which
-    /// only filters `tools/list` (tool calls are forwarded normally).
+    /// The caller's own and catalog backends: for a principal with an owner
+    /// when personal backends are on and the user has any.
+    async fn personal_slot(&self, auth: &McpCaller) -> Option<Arc<UserSlot>> {
+        let hub = self.state.personal.as_ref()?;
+        let Caller::Principal(principal) = auth.caller.as_ref() else {
+            return None;
+        };
+        hub.slot(principal.owner_id()?).await
+    }
+
+    /// Sends the request to the gateway actor. On `/mcp` the caller's own
+    /// backends (`slot`) are served next to the shared ones. On `/mcp/toolset/{name}` a
+    /// principal that owns a toolset of that name is narrowed with it and served like
+    /// on `/mcp`, listing and calls both; anyone else gets the config toolset, which
+    /// only filters `tools/list` (tool calls are forwarded normally). Neither serves
+    /// personal tools.
     async fn ask_gateway(
         &self,
         auth: &McpCaller,
         request: JsonRpcRequest,
         relay: Option<CallRelay>,
+        slot: Option<Arc<UserSlot>>,
     ) -> Result<JsonRpcResponse, ErrorData> {
         let gateway = &self.state.gateway;
         let answer = match auth.toolset.as_deref() {
@@ -406,6 +458,8 @@ impl AxonMcp {
                     request,
                     caller: auth.caller.clone(),
                     relay,
+                    hub: slot.as_ref().and_then(|_| self.state.personal.clone()),
+                    personal: slot,
                 })
                 .await
                 .map_err(|error| format!("{error:?}")),
@@ -415,6 +469,8 @@ impl AxonMcp {
                         request,
                         caller: Arc::new(Caller::Principal(principal)),
                         relay,
+                        personal: None,
+                        hub: None,
                     })
                     .await
                     .map_err(|error| format!("{error:?}")),
@@ -822,6 +878,7 @@ mod tests {
             rate_limit_per_minute: 0,
             allow_stdio: false,
             allowed_hosts: vec![],
+            idle_timeout_secs: 300,
         };
         let state = AppState {
             auth_manager: SharedAuth::new(AuthManager::new(&config, &[])),
@@ -895,6 +952,7 @@ mod tests {
             rate_limit_per_minute: 0,
             allow_stdio: false,
             allowed_hosts: vec![],
+            idle_timeout_secs: 300,
         };
         let tokens = [named_token("a", "token-a"), named_token("b", "token-b")];
         let state = AppState {

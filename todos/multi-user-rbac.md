@@ -596,8 +596,8 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 11. Phased plan
 
-Status (2026-11-11): Phases 0 to 4b are done and committed. Resume at
-Phase 5 (Phase 8, config in the database, is planned). Open caveats: OIDC
+Status (2026-11-11): Phases 0 to 5 are done and committed. Resume at
+Phase 6 (Phase 8, config in the database, is planned). Open caveats: OIDC
 login is untested against a real IdP, and a plain-text 403 from the CSRF
 check can replace an admin page section (the htmx config swaps 4xx
 responses).
@@ -776,20 +776,35 @@ or protocol signals is refused (it was served before).
 
 ### Phase 5 - Personal MCP servers and catalog
 
-- [ ] Personal backends with namespacing rules.
-- [ ] Egress policy and SSRF guard; stdio admin-only.
-- [ ] `crypto/` envelope encryption, `AXON_KEK_FILE`, KEK rotation.
-- [ ] Per-user backend instances (`per_user` and personal only) with caps.
-- [ ] Idle timeout for all instances: `[gateway] idle_timeout_secs` (default
+- [x] Personal backends with namespacing rules.
+- [x] Egress policy and SSRF guard; stdio admin-only.
+- [x] `crypto/` envelope encryption, `AXON_KEK_FILE`, KEK rotation.
+- [x] Per-user backend instances (`per_user` and personal only) with caps.
+- [x] Idle timeout for all instances: `[gateway] idle_timeout_secs` (default
       300) with per-backend override (`0` = always connected); cached tool
       definitions, connect on first call, state `idle` in UI and metrics.
-- [ ] Health split: probes for shared backends keep running while idle
+- [x] Health split: probes for shared backends keep running while idle
       (stateless `ping` or open/`ping`/close); per-user and personal backends
       get passive health from call outcomes, with no probes.
-- [ ] Catalog and `per_user` credentials.
-- [ ] Per-user quotas.
+- [x] Catalog and `per_user` credentials.
+- [x] Per-user quotas.
 - Exit: a user adds a personal HTTP MCP and a catalog backend with their own
   credential; loopback and metadata targets are refused.
+
+Decisions (2026-11-11):
+
+- The catalog is `per_user` backends (config or API/UI created).
+- A database with personal backends enabled and no KEK: refuse to start.
+- Idle defaults: HTTP 300 s, stdio 0 (always connected).
+- Any human user may add personal servers.
+- PATs see personal tools within their scope.
+- Admins list, disable and delete personal servers, and never see header
+  values.
+- Test the connection on save and save anyway.
+- A catalog entry is visible only to users whose grants cover it.
+- The call quota counts personal and catalog calls only.
+- Personal calls are audited without arguments.
+- No infra change in this phase.
 
 ### Phase 6 - Observability completion
 

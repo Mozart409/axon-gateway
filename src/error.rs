@@ -52,6 +52,14 @@ pub enum ConfigError {
         part: &'static str,
     },
 
+    #[error("backend '{name}' uses credential_mode = \"per_user\" but {reason}")]
+    InvalidPerUserBackend { name: String, reason: String },
+
+    #[error(
+        "backend '{name}' uses credential_mode = \"per_user\" and needs a [database] section: user credentials are stored in Postgres"
+    )]
+    PerUserRequiresDatabase { name: String },
+
     #[error("[auth.oidc] needs a [database] section: logins and sessions are stored in Postgres")]
     OidcRequiresDatabase,
 

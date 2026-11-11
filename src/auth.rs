@@ -326,6 +326,7 @@ mod tests {
             rate_limit_per_minute: 0,
             allow_stdio: false,
             allowed_hosts: vec![],
+            idle_timeout_secs: 300,
         };
         let auth = AuthManager::new(&config, &[]);
 
@@ -342,6 +343,7 @@ mod tests {
             rate_limit_per_minute: 0,
             allow_stdio: false,
             allowed_hosts: vec![],
+            idle_timeout_secs: 300,
         };
         let tokens = vec![TokenConfig {
             name: "agent1".to_string(),
@@ -369,6 +371,7 @@ mod tests {
             rate_limit_per_minute: 0,
             allow_stdio: false,
             allowed_hosts: vec![],
+            idle_timeout_secs: 300,
         };
         let auth = AuthManager::new(&config, &[]);
 
@@ -403,6 +406,7 @@ mod tests {
             rate_limit_per_minute: 3,
             allow_stdio: false,
             allowed_hosts: vec![],
+            idle_timeout_secs: 300,
         };
         let auth = AuthManager::new(&config, &[]);
 
@@ -425,6 +429,7 @@ mod tests {
             rate_limit_per_minute,
             allow_stdio: false,
             allowed_hosts: vec![],
+            idle_timeout_secs: 300,
         }
     }
 

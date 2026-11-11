@@ -279,6 +279,9 @@ pub enum BackendState {
     CircuitOpen,
     /// Reconnecting after failure with exponential backoff
     Reconnecting,
+    /// Disconnected on purpose because nobody used it; the tools stay cached
+    /// and the next request connects again
+    Idle,
 }
 
 /// Info about a connected backend

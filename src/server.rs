@@ -67,6 +67,9 @@ mod auth;
 mod break_glass;
 mod mcp;
 mod mcp_sessions;
+mod personal_api;
+mod personal_ui;
+mod personal_views;
 mod session;
 mod tokens_api;
 mod tokens_ui;
@@ -104,6 +107,9 @@ pub struct AppState {
     /// `Host` values the MCP endpoints accept (DNS rebinding protection of the
     /// rmcp transport); empty accepts any
     pub mcp_allowed_hosts: Vec<String>,
+    /// Users' own and catalog backends; `None` without a database or with
+    /// `[personal_backends] enabled = false`
+    pub personal: Option<Arc<crate::personal::PersonalHub>>,
 }
 
 impl AppState {
@@ -444,6 +450,7 @@ mod tests {
                 rate_limit_per_minute: 0,
                 allow_stdio: false,
                 allowed_hosts: vec![],
+                idle_timeout_secs: 300,
             },
             backends: Vec::new(),
             tokens: Vec::new(),
@@ -452,6 +459,7 @@ mod tests {
             database: None,
             auth: crate::config::AuthConfig::default(),
             rbac: crate::policy::RbacConfig::default(),
+            personal_backends: crate::config::PersonalBackendsConfig::default(),
         };
 
         let registry =
@@ -471,6 +479,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: false,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 &[],
             )),
@@ -489,6 +498,7 @@ mod tests {
             audit: None,
             changes: crate::changes::ChangeBus::new(),
             mcp_allowed_hosts: Vec::new(),
+            personal: None,
         }
     }
 

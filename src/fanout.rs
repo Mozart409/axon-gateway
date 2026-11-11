@@ -9,11 +9,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use kameo::actor::ActorRef;
 use serde::Deserialize;
 use sqlx::postgres::PgListener;
 use uuid::Uuid;
 
 use crate::changes::{ChangeBus, ChangeScope};
+use crate::gateway::{GatewayActor, GetConfig};
+use crate::personal::PersonalHub;
 use crate::rbac::PolicyHandle;
 use crate::store::Store;
 
@@ -25,8 +28,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 enum Notice {
     /// Groups, mappings, memberships, grants or role bindings
     Policy,
-    /// One user's opt-outs or toolsets
+    /// One user's opt-outs, toolsets, personal backends or catalog credentials
     User(Uuid),
+    /// The catalog of backends every user may bring a credential for
+    Catalog,
 }
 
 #[derive(Deserialize)]
@@ -41,6 +46,7 @@ struct Payload {
 enum Kind {
     Policy,
     User { user: Uuid },
+    Catalog,
 }
 
 /// Parses a notification payload; `None` when it is malformed or for a schema
@@ -59,12 +65,26 @@ fn notice(payload: &str, schema: &str) -> Option<Notice> {
     Some(match payload.kind {
         Kind::Policy => Notice::Policy,
         Kind::User { user } => Notice::User(user),
+        Kind::Catalog => Notice::Catalog,
     })
+}
+
+/// What the listener acts on besides the policy and the change bus
+pub struct Handles {
+    /// Asked for the running config when the catalog changes
+    pub gateway: ActorRef<GatewayActor>,
+    /// Drops the slots of users whose backends or credentials changed
+    pub personal: Option<Arc<PersonalHub>>,
 }
 
 /// Listens for change notifications for as long as the process lives,
 /// reconnecting with a backoff when the connection fails.
-pub fn spawn_change_listener(store: Store, policy: Arc<PolicyHandle>, changes: ChangeBus) {
+pub fn spawn_change_listener(
+    store: Store,
+    policy: Arc<PolicyHandle>,
+    changes: ChangeBus,
+    handles: Handles,
+) {
     tokio::spawn(async move {
         let mut backoff = BACKOFF_START;
         let mut first = true;
@@ -81,7 +101,7 @@ pub fn spawn_change_listener(store: Store, policy: Arc<PolicyHandle>, changes: C
             backoff = BACKOFF_START;
             if !first {
                 // Notifications sent while we were not listening are lost
-                resync(&store, &policy, &changes).await;
+                resync(&store, &policy, &changes, &handles).await;
             }
             first = false;
             tracing::debug!(schema, "Listening for change notifications");
@@ -90,7 +110,13 @@ pub fn spawn_change_listener(store: Store, policy: Arc<PolicyHandle>, changes: C
                 match listener.try_recv().await {
                     Ok(Some(notification)) => match notice(notification.payload(), &schema) {
                         Some(Notice::Policy) => refresh(&store, &policy).await,
-                        Some(Notice::User(id)) => changes.publish(ChangeScope::User(id)),
+                        Some(Notice::User(id)) => {
+                            changes.publish(ChangeScope::User(id));
+                            if let Some(hub) = &handles.personal {
+                                hub.invalidate(id).await;
+                            }
+                        }
+                        Some(Notice::Catalog) => reload_catalog(&handles).await,
                         None => {}
                     },
                     Ok(None) => {
@@ -121,9 +147,29 @@ async fn refresh(store: &Store, policy: &PolicyHandle) {
     }
 }
 
+/// Rebuilds the catalog from the running config and the database, then drops
+/// every slot so each user's backends pick it up
+async fn reload_catalog(handles: &Handles) {
+    let Some(hub) = &handles.personal else {
+        return;
+    };
+    match handles.gateway.ask(GetConfig).await {
+        Ok(config) => {
+            if let Err(error) = hub.reload_catalog(&config.0).await {
+                tracing::warn!(%error, "Failed to reload the per-user catalog after a change notification");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not read the running config to reload the per-user catalog");
+        }
+    }
+    hub.invalidate_all().await;
+}
+
 /// Catches up after notifications may have been lost
-async fn resync(store: &Store, policy: &PolicyHandle, changes: &ChangeBus) {
+async fn resync(store: &Store, policy: &PolicyHandle, changes: &ChangeBus, handles: &Handles) {
     refresh(store, policy).await;
+    reload_catalog(handles).await;
     changes.publish(ChangeScope::All);
 }
 
@@ -145,6 +191,14 @@ mod tests {
         let expected = Uuid::parse_str(USER).ok().map(Notice::User);
         assert!(expected.is_some());
         assert_eq!(notice(&payload, "axon"), expected);
+    }
+
+    #[test]
+    fn parses_a_catalog_notice() {
+        let payload = r#"{"schema":"axon","kind":"catalog"}"#;
+        assert_eq!(notice(payload, "axon"), Some(Notice::Catalog));
+        let other = r#"{"schema":"other","kind":"catalog"}"#;
+        assert_eq!(notice(other, "axon"), None);
     }
 
     #[test]

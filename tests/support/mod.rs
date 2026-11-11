@@ -18,6 +18,10 @@ use tempfile::NamedTempFile;
 const BIN: &str = env!("CARGO_BIN_EXE_axon-gateway");
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
+/// The key a gateway with a database needs for personal backends; a test key,
+/// at least 32 characters.
+const TEST_KEK: &str = "axon-integration-test-kek-0123456789abcdef";
+
 /// Grab a free TCP port by binding to :0 and releasing it. A small race window
 /// exists before the gateway rebinds, which is acceptable for tests.
 pub fn free_port() -> u16 {
@@ -40,6 +44,8 @@ pub struct ConfigBuilder {
     oidc_providers: Vec<String>,
     rbac: Option<String>,
     rate_limit_per_minute: Option<u32>,
+    idle_timeout_secs: Option<u64>,
+    personal_backends: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -56,6 +62,8 @@ impl ConfigBuilder {
             oidc_providers: Vec::new(),
             rbac: None,
             rate_limit_per_minute: None,
+            idle_timeout_secs: None,
+            personal_backends: None,
         }
     }
 
@@ -79,6 +87,19 @@ impl ConfigBuilder {
     /// Set `[gateway] rate_limit_per_minute` (the per-PAT limit in multi-user mode).
     pub fn rate_limit_per_minute(mut self, limit: u32) -> Self {
         self.rate_limit_per_minute = Some(limit);
+        self
+    }
+
+    /// Set `[gateway] idle_timeout_secs` (disconnect idle connections after this long).
+    pub fn idle_timeout_secs(mut self, secs: u64) -> Self {
+        self.idle_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Add a `[personal_backends]` section; `toml` holds its keys as is
+    /// (e.g. `egress_allow = ["127.0.0.1/32"]`).
+    pub fn personal_backends(mut self, toml: &str) -> Self {
+        self.personal_backends = Some(toml.to_string());
         self
     }
 
@@ -183,6 +204,9 @@ impl ConfigBuilder {
         if let Some(limit) = self.rate_limit_per_minute {
             let _ = writeln!(out, "rate_limit_per_minute = {limit}");
         }
+        if let Some(secs) = self.idle_timeout_secs {
+            let _ = writeln!(out, "idle_timeout_secs = {secs}");
+        }
         out.push('\n');
         for backend in &self.backends {
             out.push_str(backend);
@@ -190,6 +214,9 @@ impl ConfigBuilder {
         }
         if let Some(url_env) = &self.database_url_env {
             let _ = writeln!(out, "[database]\nurl_env = \"{url_env}\"\n");
+        }
+        if let Some(personal) = &self.personal_backends {
+            let _ = writeln!(out, "[personal_backends]\n{personal}\n");
         }
         for provider in &self.oidc_providers {
             out.push_str(provider);
@@ -233,14 +260,29 @@ impl Gateway {
         std::io::Write::write_all(&mut file, config.as_bytes()).expect("write config");
 
         let path = file.path().to_path_buf();
-        Self::spawn(path, Some(file), base, env).await
+        Self::spawn(path, Some(file), base, env, &[]).await
+    }
+
+    /// Like [`Gateway::start_with_env`], with the environment variables in
+    /// `env_remove` removed from the gateway process (e.g. `AXON_KEK`).
+    pub async fn start_without_env(
+        config: &str,
+        base: &str,
+        env: &[(&str, &str)],
+        env_remove: &[&str],
+    ) -> Self {
+        let mut file = NamedTempFile::new().expect("create temp config");
+        std::io::Write::write_all(&mut file, config.as_bytes()).expect("write config");
+
+        let path = file.path().to_path_buf();
+        Self::spawn(path, Some(file), base, env, env_remove).await
     }
 
     /// Spawn the gateway binary on the config file at `path`, which the test
     /// owns (it is neither written nor removed here), and wait until it is
     /// ready. For tests that lay the file out themselves, e.g. as symlinks.
     pub async fn start_at(path: &Path, base: &str, env: &[(&str, &str)]) -> Self {
-        Self::spawn(path.to_path_buf(), None, base, env).await
+        Self::spawn(path.to_path_buf(), None, base, env, &[]).await
     }
 
     async fn spawn(
@@ -248,15 +290,20 @@ impl Gateway {
         config: Option<NamedTempFile>,
         base: &str,
         env: &[(&str, &str)],
+        env_remove: &[&str],
     ) -> Self {
-        let child = Command::new(BIN)
+        let mut command = Command::new(BIN);
+        command
             .arg(&config_path)
             // ServeFile routes resolve assets relative to CWD.
             .current_dir(MANIFEST_DIR)
             .env("RUST_LOG", "warn")
-            .envs(env.iter().copied())
-            .spawn()
-            .expect("gateway binary should start");
+            .env("AXON_KEK", TEST_KEK)
+            .envs(env.iter().copied());
+        for name in env_remove {
+            command.env_remove(name);
+        }
+        let child = command.spawn().expect("gateway binary should start");
 
         let gateway = Gateway {
             child,
@@ -278,12 +325,56 @@ impl Gateway {
             .arg(file.path())
             .current_dir(MANIFEST_DIR)
             .env("RUST_LOG", "warn")
+            .env("AXON_KEK", TEST_KEK)
             .spawn()
             .expect("gateway binary should start");
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait().expect("poll gateway") {
                 return Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Like [`Gateway::run_to_exit`], with extra environment variables, the
+    /// ones in `env_remove` removed, and what the gateway wrote to stderr
+    /// returned with its exit status.
+    pub fn run_to_exit_env(
+        config: &str,
+        timeout: Duration,
+        env: &[(&str, &str)],
+        env_remove: &[&str],
+    ) -> Option<(std::process::ExitStatus, String)> {
+        use std::io::Read as _;
+
+        let mut file = NamedTempFile::new().expect("create temp config");
+        std::io::Write::write_all(&mut file, config.as_bytes()).expect("write config");
+        let mut command = Command::new(BIN);
+        command
+            .arg(file.path())
+            .current_dir(MANIFEST_DIR)
+            .env("RUST_LOG", "warn")
+            .env("AXON_KEK", TEST_KEK)
+            .envs(env.iter().copied())
+            .stderr(std::process::Stdio::piped());
+        for name in env_remove {
+            command.env_remove(name);
+        }
+        let mut child = command.spawn().expect("gateway binary should start");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().expect("poll gateway") {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                return Some((status, stderr));
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();

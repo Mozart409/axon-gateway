@@ -5,6 +5,7 @@
 //! - `axon_tool_call_duration_seconds` — Histogram of tool call latencies
 //! - `axon_tool_call_errors_total` — Counter of failed tool calls
 //! - `axon_backend_connections` — Gauge of backend connection states
+//! - `axon_backend_up` — Gauge, 1 when the last connect or health probe succeeded
 //! - `axon_backend_inflight_calls` — Gauge of requests in flight per backend
 //! - `axon_requests_total` — Counter of HTTP requests by method/path
 //! - `axon_mcp_requests_total` — Counter of MCP requests by `Mcp-Method` header value
@@ -40,17 +41,21 @@ pub fn record_tool_call_error(backend: &str, tool: &str) {
     .increment(1);
 }
 
+/// The states `axon_backend_connections` tells apart
+pub const BACKEND_STATES: &[&str] = &[
+    "disconnected",
+    "connecting",
+    "connected",
+    "failed",
+    "circuit_open",
+    "reconnecting",
+    "idle",
+];
+
 /// Record backend connection state change
 pub fn record_backend_state(backend: &str, state: &str) {
     // Reset all state gauges for this backend, then set the current one
-    for s in &[
-        "disconnected",
-        "connecting",
-        "connected",
-        "failed",
-        "circuit_open",
-        "reconnecting",
-    ] {
+    for s in BACKEND_STATES {
         gauge!(
             "axon_backend_connections",
             "backend" => backend.to_string(),
@@ -64,6 +69,11 @@ pub fn record_backend_state(backend: &str, state: &str) {
         "state" => state.to_string()
     )
     .set(1.0);
+}
+
+/// Record whether the last connect attempt or health probe of a backend succeeded
+pub fn record_backend_up(backend: &str, up: bool) {
+    gauge!("axon_backend_up", "backend" => backend.to_string()).set(if up { 1.0 } else { 0.0 });
 }
 
 /// Counts a request as in flight for its backend until dropped.

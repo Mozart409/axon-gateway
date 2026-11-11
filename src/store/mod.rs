@@ -13,6 +13,7 @@ use thiserror::Error;
 mod audit;
 mod auth;
 mod break_glass;
+mod personal;
 mod rbac;
 mod replica;
 mod tokens;
@@ -21,6 +22,10 @@ mod views;
 
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
 pub use break_glass::{BREAK_GLASS_CODE_TTL, BREAK_GLASS_SESSION_MAX_AGE};
+pub use personal::{
+    AdminPersonalBackend, CatalogEntry, CatalogEntryUpdate, NewCatalogEntry, NewPersonalBackend,
+    PersonalBackend, PersonalBackendUpdate, PersonalError, SealedColumns, UserCredential,
+};
 pub use rbac::{Actor, AuditRecord};
 pub use replica::MCP_SESSION_IDLE;
 pub use tokens::{

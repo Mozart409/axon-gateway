@@ -267,6 +267,9 @@ pub struct ToolCallEvent {
     pub arguments: Value,
     /// The tool's MCP annotations, for the default capture mode
     pub annotations: Option<Value>,
+    /// The tool belongs to a user's own backend: its arguments are never kept,
+    /// whatever the capture rules say
+    pub personal: bool,
 }
 
 // `Debug` leaves the arguments out, so that logging an event with `{:?}` cannot
@@ -412,8 +415,12 @@ fn build_rows(events: Vec<ToolCallEvent>, rules: &[CaptureRule]) -> Vec<NewToolC
                 &event.tool,
                 event.annotations.as_ref(),
             );
-            let arguments = prepare_arguments(&event.arguments, mode, &drop_keys)
-                .map(|arguments| (mode, arguments));
+            let arguments = if event.personal {
+                None
+            } else {
+                prepare_arguments(&event.arguments, mode, &drop_keys)
+                    .map(|arguments| (mode, arguments))
+            };
             NewToolCall {
                 user_id: event.user_id,
                 principal_label: event.principal_label,
@@ -862,6 +869,7 @@ mod tests {
             user_agent: None,
             arguments: json!({"path": "/x", "password": "p"}),
             annotations: None,
+            personal: false,
         }
     }
 
@@ -890,6 +898,17 @@ mod tests {
         assert_eq!(rows[0].duration_ms, 12);
         assert_eq!(rows[0].tool, "write_file");
         assert_eq!(rows[0].outcome, CallOutcome::Ok);
+    }
+
+    #[test]
+    fn personal_calls_never_keep_arguments() {
+        let rules = [rule(1, "files", "*", CaptureMode::Full)];
+        let mut personal = event("write_file");
+        personal.personal = true;
+        let rows = build_rows(vec![personal], &rules);
+        assert_eq!(rows[0].arguments, None);
+        assert_eq!(rows[0].tool, "write_file");
+        assert_eq!(rows[0].backend, "files");
     }
 
     #[test]

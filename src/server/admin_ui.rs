@@ -214,7 +214,12 @@ pub(super) async fn backend_names(state: &AppState) -> Vec<String> {
                 .into_iter()
                 .map(|backend| backend.name)
                 .collect();
+            // Catalog entries are granted like shared backends
+            if let Some(hub) = &state.personal {
+                names.extend(hub.catalog().into_iter().map(|item| item.name));
+            }
             names.sort();
+            names.dedup();
             names
         }
         Err(error) => {

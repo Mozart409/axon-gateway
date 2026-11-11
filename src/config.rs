@@ -27,8 +27,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
 
@@ -57,6 +58,59 @@ pub struct Config {
     /// RBAC groups and tool grants (multi-user mode). Not hot-reloadable: changes need a restart.
     #[serde(default)]
     pub rbac: crate::policy::RbacConfig,
+    /// Per-user and personal backends (limits and egress rules).
+    /// Not hot-reloadable: changes need a restart.
+    #[serde(default)]
+    pub personal_backends: PersonalBackendsConfig,
+}
+
+/// `[personal_backends]` section: limits for per-user catalog credentials and
+/// the backends people add themselves. Not hot-reloadable: changes need a restart.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersonalBackendsConfig {
+    /// Let people add personal backends and store catalog credentials
+    #[serde(default = "default_personal_enabled")]
+    pub enabled: bool,
+    /// Max personal backends plus catalog credentials per user
+    #[serde(default = "default_personal_max_per_user")]
+    pub max_per_user: u32,
+    /// Max tool calls per minute per user across all backends (0 = unlimited)
+    #[serde(default)]
+    pub max_calls_per_minute: u32,
+    /// Max per-user and personal connections open at once per replica
+    #[serde(default = "default_personal_max_instances")]
+    pub max_instances: u32,
+    /// Host patterns or CIDRs personal backends may reach (empty = any public host)
+    #[serde(default)]
+    pub egress_allow: Vec<String>,
+    /// Host patterns or CIDRs personal backends may never reach
+    #[serde(default)]
+    pub egress_deny: Vec<String>,
+}
+
+const fn default_personal_enabled() -> bool {
+    true
+}
+
+const fn default_personal_max_per_user() -> u32 {
+    10
+}
+
+const fn default_personal_max_instances() -> u32 {
+    500
+}
+
+impl Default for PersonalBackendsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_personal_enabled(),
+            max_per_user: default_personal_max_per_user(),
+            max_calls_per_minute: 0,
+            max_instances: default_personal_max_instances(),
+            egress_allow: Vec::new(),
+            egress_deny: Vec::new(),
+        }
+    }
 }
 
 /// `[auth]` section: how people log in to the dashboard.
@@ -150,6 +204,16 @@ pub struct GatewayConfig {
     /// loopback and the host of `base_url`
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Seconds without a call before an HTTP/SSE backend connection is closed
+    /// (0 = always connected). A backend's own `idle_timeout_secs` wins, and
+    /// stdio backends stay connected unless they set one.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+/// Default value for `[gateway] idle_timeout_secs`
+const fn default_idle_timeout_secs() -> u64 {
+    300
 }
 
 /// `Host` values the MCP endpoints accept: loopback, the host (and `host:port`)
@@ -252,6 +316,71 @@ pub struct BackendConfig {
     /// Optional: environment variables to set for stdio backends
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Optional: seconds without a call before the connection is closed
+    /// (0 = always connected). Unset: the gateway default for HTTP/SSE
+    /// backends, always connected for stdio (restarting a process is slow).
+    pub idle_timeout_secs: Option<u64>,
+
+    /// `shared` (default): one connection with the backend's own credentials.
+    /// `per_user`: no shared connection, each user stores their own credential
+    /// (`credential_fields`) and gets their own connection.
+    #[serde(default)]
+    pub credential_mode: CredentialMode,
+
+    /// For `per_user` backends: the values each user enters, and the headers
+    /// they are sent in
+    #[serde(default)]
+    pub credential_fields: Vec<CredentialField>,
+}
+
+/// Whose credentials a backend connection uses
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialMode {
+    /// One shared connection with the backend's own `auth_token` and `headers`
+    #[default]
+    Shared,
+    /// A connection per user, with the credential that user stored
+    PerUser,
+}
+
+/// One credential a user enters for a `per_user` backend. The gateway sends
+/// header `header` with the value `prefix` + what the user entered for `name`
+/// (for example header `Authorization`, prefix `Bearer `).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CredentialField {
+    /// Key of the value, unique within the backend
+    pub name: String,
+    /// Label shown next to the input (defaults to `name`)
+    #[serde(default)]
+    pub label: Option<String>,
+    /// HTTP header the value is sent in
+    pub header: String,
+    /// Text put in front of the value in the header
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+impl BackendConfig {
+    /// How long the connection may sit idle before it is closed; `None` keeps
+    /// it always connected. The backend's own value wins, then stdio stays
+    /// connected, then `gateway_default_secs` applies. 0 means always connected.
+    #[must_use]
+    pub fn idle_timeout(&self, gateway_default_secs: u64) -> Option<Duration> {
+        let secs = match self.idle_timeout_secs {
+            Some(secs) => secs,
+            None if self.transport == TransportType::Stdio => 0,
+            None => gateway_default_secs,
+        };
+        (secs > 0).then(|| Duration::from_secs(secs))
+    }
+
+    /// Whether each user brings their own credential (no shared connection)
+    #[must_use]
+    pub fn is_per_user(&self) -> bool {
+        self.credential_mode == CredentialMode::PerUser
+    }
 }
 
 /// Default value for the `enabled` field when omitted from config
@@ -296,6 +425,9 @@ impl Default for BackendConfig {
             auth_token: None,
             headers: HashMap::new(),
             env: HashMap::new(),
+            idle_timeout_secs: None,
+            credential_mode: CredentialMode::Shared,
+            credential_fields: Vec::new(),
         }
     }
 }
@@ -470,6 +602,8 @@ impl Config {
             }
         }
 
+        self.validate_per_user_backends()?;
+
         if !self.gateway.allow_stdio {
             let stdio: Vec<&str> = self
                 .backends
@@ -495,6 +629,51 @@ impl Config {
 
         self.validate_auth()?;
         self.validate_rbac()
+    }
+
+    /// `per_user` backends: HTTP/SSE with a url, at least one well-formed
+    /// credential field, and a database to store the credentials in.
+    fn validate_per_user_backends(&self) -> Result<(), ConfigError> {
+        for backend in self.backends.iter().filter(|b| b.is_per_user()) {
+            let name = &backend.name;
+            let invalid = |reason: String| ConfigError::InvalidPerUserBackend {
+                name: name.clone(),
+                reason,
+            };
+            if backend.transport == TransportType::Stdio {
+                return Err(invalid("stdio is not supported, use http or sse".into()));
+            }
+            if backend.url.is_none() {
+                return Err(invalid("it needs a url".into()));
+            }
+            if backend.credential_fields.is_empty() {
+                return Err(invalid(
+                    "it needs at least one credential_fields entry".into(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for field in &backend.credential_fields {
+                if field.name.is_empty() {
+                    return Err(invalid("a credential field has an empty name".into()));
+                }
+                if !seen.insert(field.name.as_str()) {
+                    return Err(invalid(format!(
+                        "credential field '{}' is listed twice",
+                        field.name
+                    )));
+                }
+                if http::HeaderName::from_bytes(field.header.as_bytes()).is_err() {
+                    return Err(invalid(format!(
+                        "credential field '{}' has an invalid header name '{}'",
+                        field.name, field.header
+                    )));
+                }
+            }
+            if self.database.is_none() {
+                return Err(ConfigError::PerUserRequiresDatabase { name: name.clone() });
+            }
+        }
+        Ok(())
     }
 
     fn validate_rbac(&self) -> Result<(), ConfigError> {
@@ -754,6 +933,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: false,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: vec![BackendConfig {
                     name: "test".to_string(),
@@ -767,6 +947,7 @@ mod tests {
                 database: None,
                 auth: AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -789,6 +970,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: false,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: vec![BackendConfig {
                     name: "http_backend".to_string(),
@@ -802,6 +984,7 @@ mod tests {
                 database: None,
                 auth: AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             };
 
             let error = config.validate().expect_err("should require URL");
@@ -821,6 +1004,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: true,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: vec![BackendConfig {
                     name: "stdio_backend".to_string(),
@@ -834,6 +1018,7 @@ mod tests {
                 database: None,
                 auth: AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             };
 
             let error = config.validate().expect_err("should require command");
@@ -853,6 +1038,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: false,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: vec![
                     BackendConfig {
@@ -880,6 +1066,7 @@ mod tests {
                 database: None,
                 auth: AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             };
 
             let error = config.validate().expect_err("should refuse stdio");
@@ -899,6 +1086,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: false,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: vec![BackendConfig {
                     name: "valid".to_string(),
@@ -912,6 +1100,7 @@ mod tests {
                 database: None,
                 auth: AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             };
 
             config.validate().expect("valid config should pass");
@@ -926,6 +1115,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: false,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: vec![BackendConfig {
                     name: "hdr".to_string(),
@@ -940,6 +1130,7 @@ mod tests {
                 database: None,
                 auth: AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             }
         }
 
@@ -991,6 +1182,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: true,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: vec![BackendConfig {
                     name: "stdio".to_string(),
@@ -1005,6 +1197,7 @@ mod tests {
                 database: None,
                 auth: AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             };
 
             config.validate().expect("valid config should pass");
@@ -1428,6 +1621,7 @@ name = "same"
                 rate_limit_per_minute: 0,
                 allow_stdio: false,
                 allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_string()).collect(),
+                idle_timeout_secs: 300,
             }
         }
 
@@ -1474,6 +1668,241 @@ name = "same"
                 .expect("should deserialize");
             assert!(!gateway.allow_stdio);
             assert_eq!(gateway.allowed_hosts, Vec::<String>::new());
+        }
+    }
+
+    mod idle_timeout {
+        use super::*;
+
+        fn backend(transport: TransportType, idle: Option<u64>) -> BackendConfig {
+            BackendConfig {
+                transport,
+                idle_timeout_secs: idle,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn http_and_sse_use_the_gateway_default() {
+            for transport in [TransportType::Http, TransportType::Sse] {
+                assert_eq!(
+                    backend(transport, None).idle_timeout(300),
+                    Some(Duration::from_secs(300))
+                );
+            }
+        }
+
+        #[test]
+        fn gateway_default_zero_means_always_connected() {
+            assert_eq!(backend(TransportType::Http, None).idle_timeout(0), None);
+        }
+
+        #[test]
+        fn stdio_defaults_to_always_connected() {
+            assert_eq!(backend(TransportType::Stdio, None).idle_timeout(300), None);
+        }
+
+        #[test]
+        fn backend_value_overrides_the_default() {
+            assert_eq!(
+                backend(TransportType::Http, Some(60)).idle_timeout(300),
+                Some(Duration::from_secs(60))
+            );
+            assert_eq!(
+                backend(TransportType::Stdio, Some(120)).idle_timeout(300),
+                Some(Duration::from_secs(120))
+            );
+        }
+
+        #[test]
+        fn backend_zero_means_always_connected() {
+            assert_eq!(
+                backend(TransportType::Http, Some(0)).idle_timeout(300),
+                None
+            );
+        }
+    }
+
+    mod per_user_and_personal {
+        use super::*;
+
+        const BASE: &str = r#"
+            [gateway]
+            bind = "0.0.0.0:8080"
+        "#;
+
+        const FIELD: &str = r#"
+            credential_fields = [
+                { name = "token", header = "Authorization", prefix = "Bearer " },
+            ]
+        "#;
+
+        fn parse(backend: &str, extra: &str) -> Config {
+            let toml = format!("{BASE}\n[[backends]]\nname = \"cat\"\n{backend}\n{extra}");
+            toml::from_str(&toml).expect("should parse")
+        }
+
+        fn per_user(extra: &str) -> Config {
+            parse(
+                "transport = \"http\"\nurl = \"http://localhost:9000\"\ncredential_mode = \"per_user\"",
+                extra,
+            )
+        }
+
+        fn reason(config: &Config) -> String {
+            match config.validate().expect_err("should be invalid") {
+                ConfigError::InvalidPerUserBackend { reason, .. } => reason,
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn empty_config_has_the_defaults() {
+            let config: Config =
+                toml::from_str(&format!("backends = []\n{BASE}")).expect("should parse");
+            assert_eq!(config.gateway.idle_timeout_secs, 300);
+
+            let personal = config.personal_backends;
+            assert!(personal.enabled);
+            assert_eq!(personal.max_per_user, 10);
+            assert_eq!(personal.max_calls_per_minute, 0);
+            assert_eq!(personal.max_instances, 500);
+            assert_eq!(personal.egress_allow, Vec::<String>::new());
+            assert_eq!(personal.egress_deny, Vec::<String>::new());
+        }
+
+        #[test]
+        fn parses_the_new_keys() {
+            let toml = r#"
+                backends = []
+
+                [gateway]
+                bind = "0.0.0.0:8080"
+                idle_timeout_secs = 120
+
+                [personal_backends]
+                enabled = false
+                max_per_user = 3
+                max_calls_per_minute = 60
+                max_instances = 50
+                egress_allow = ["*.example.com"]
+                egress_deny = ["10.0.0.0/8"]
+            "#;
+            let config: Config = toml::from_str(toml).expect("should parse");
+            assert_eq!(config.gateway.idle_timeout_secs, 120);
+
+            let personal = config.personal_backends;
+            assert!(!personal.enabled);
+            assert_eq!(personal.max_per_user, 3);
+            assert_eq!(personal.max_calls_per_minute, 60);
+            assert_eq!(personal.max_instances, 50);
+            assert_eq!(personal.egress_allow, ["*.example.com"]);
+            assert_eq!(personal.egress_deny, ["10.0.0.0/8"]);
+        }
+
+        #[test]
+        fn parses_a_per_user_backend() {
+            let config = per_user(&format!("idle_timeout_secs = 30\n{FIELD}\n[database]"));
+            let backend = &config.backends[0];
+            assert!(backend.is_per_user());
+            assert_eq!(backend.idle_timeout_secs, Some(30));
+            assert_eq!(
+                backend.credential_fields,
+                [CredentialField {
+                    name: "token".into(),
+                    label: None,
+                    header: "Authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                }]
+            );
+            config.validate().expect("should be valid");
+        }
+
+        #[test]
+        fn backends_are_shared_by_default() {
+            let config = parse("transport = \"http\"\nurl = \"http://x\"", "");
+            assert_eq!(config.backends[0].credential_mode, CredentialMode::Shared);
+            assert!(!config.backends[0].is_per_user());
+            assert_eq!(config.backends[0].credential_fields.len(), 0);
+            assert_eq!(config.backends[0].idle_timeout_secs, None);
+        }
+
+        #[test]
+        fn credential_field_round_trips_through_json() {
+            let field = CredentialField {
+                name: "key".into(),
+                label: Some("API key".into()),
+                header: "X-Api-Key".into(),
+                prefix: None,
+            };
+            let json = serde_json::to_string(&field).expect("should serialize");
+            let back: CredentialField = serde_json::from_str(&json).expect("should parse");
+            assert_eq!(back, field);
+        }
+
+        #[test]
+        fn stdio_is_rejected() {
+            let config = parse(
+                "transport = \"stdio\"\ncommand = \"x\"\ncredential_mode = \"per_user\"",
+                &format!("{FIELD}\n[database]"),
+            );
+            assert!(reason(&config).contains("stdio"));
+        }
+
+        #[test]
+        fn url_is_required() {
+            let config = parse(
+                "transport = \"http\"\ncredential_mode = \"per_user\"",
+                &format!("{FIELD}\n[database]"),
+            );
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::MissingUrl { .. } | ConfigError::InvalidPerUserBackend { .. })
+            ));
+        }
+
+        #[test]
+        fn a_credential_field_is_required() {
+            let config = per_user("[database]");
+            assert!(reason(&config).contains("at least one"));
+        }
+
+        #[test]
+        fn field_names_must_be_non_empty() {
+            let config =
+                per_user("credential_fields = [{ name = \"\", header = \"X-Key\" }]\n[database]");
+            assert!(reason(&config).contains("empty name"));
+        }
+
+        #[test]
+        fn field_names_must_be_unique() {
+            let config = per_user(
+                "credential_fields = [{ name = \"k\", header = \"X-A\" }, { name = \"k\", header = \"X-B\" }]\n[database]",
+            );
+            assert!(reason(&config).contains("twice"));
+        }
+
+        #[test]
+        fn header_must_be_a_valid_name() {
+            let config = per_user(
+                "credential_fields = [{ name = \"k\", header = \"bad header\" }]\n[database]",
+            );
+            assert!(reason(&config).contains("invalid header name"));
+        }
+
+        #[test]
+        fn a_database_is_required() {
+            let config = per_user(FIELD);
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::PerUserRequiresDatabase { .. })
+            ));
+        }
+
+        #[test]
+        fn shared_backends_need_none_of_it() {
+            let config = parse("transport = \"http\"\nurl = \"http://x\"", "");
+            config.validate().expect("should be valid");
         }
     }
 }

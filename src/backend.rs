@@ -4,10 +4,12 @@
 //! - Maintains the connection (reconnects on failure with exponential backoff)
 //! - Fetches tool, resource, and prompt lists on connect
 //! - Forwards tool calls, resource reads, and prompt gets
-//! - Performs periodic health checks
+//! - Performs periodic health checks (or none, when health is passive)
+//! - Closes the connection after an idle timeout and reconnects on the next request
 //! - Implements circuit breaker pattern for failing backends
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::BoxError;
@@ -34,6 +36,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{BackendConfig, TransportType};
+use crate::egress::EgressPolicy;
 use crate::registry::{RegistryActor, UpdateBackend};
 use crate::relay::CallRelay;
 use crate::types::{BackendState, PromptDefinition, ResourceDefinition, ToolDefinition};
@@ -46,6 +49,93 @@ const BASE_BACKOFF_SECS: u64 = 1;
 
 /// Maximum number of requests in flight to one backend at a time
 const MAX_INFLIGHT_CALLS_PER_BACKEND: usize = 32;
+
+/// Called after every connect attempt: `None` when it succeeded, otherwise the error
+pub type OutcomeHook = Arc<dyn Fn(Option<String>) + Send + Sync>;
+
+/// How a backend actor differs from the plain always-connected shared backend
+#[derive(Clone, Default)]
+pub struct BackendOptions {
+    /// Close the connection after this long without requests; `None` keeps it open
+    pub idle_timeout: Option<Duration>,
+    /// Check every connect against this policy and pin the connection to the checked address
+    pub egress: Option<Arc<EgressPolicy>>,
+    /// No periodic health check and no background reconnect: the next request retries
+    pub passive_health: bool,
+    /// Told the outcome of every connect attempt
+    pub on_outcome: Option<OutcomeHook>,
+}
+
+impl std::fmt::Debug for BackendOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendOptions")
+            .field("idle_timeout", &self.idle_timeout)
+            .field("egress", &self.egress)
+            .field("passive_health", &self.passive_health)
+            .field("on_outcome", &self.on_outcome.as_ref().map(|_| "<hook>"))
+            .finish()
+    }
+}
+
+/// How long ago the backend was last used and how many requests are in flight,
+/// for the idle timeout. Shared with the request tasks.
+struct Activity {
+    epoch: Instant,
+    /// Milliseconds after `epoch` of the last request start or finish
+    last_ms: AtomicU64,
+    active: AtomicUsize,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_ms: AtomicU64::new(0),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Note that the backend was just used
+    fn touch(&self) {
+        self.last_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> Duration {
+        let last = self.last_ms.load(Ordering::Relaxed);
+        Duration::from_millis(self.elapsed_ms().saturating_sub(last))
+    }
+
+    fn is_busy(&self) -> bool {
+        self.active.load(Ordering::Relaxed) > 0
+    }
+
+    /// Count a request as in flight until the returned guard is dropped
+    fn begin(self: &Arc<Self>) -> ActiveCall {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+        ActiveCall(Arc::clone(self))
+    }
+}
+
+/// A request in flight, for the idle timeout
+struct ActiveCall(Arc<Activity>);
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+        self.0.touch();
+    }
+}
+
+/// How often the idle timeout is checked at most
+const MAX_IDLE_CHECK_PERIOD: Duration = Duration::from_secs(30);
+
+/// Timeout of the health check ping
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reply of the request handlers, sent from the task that runs the request
 type CallReply = DelegatedReply<Result<serde_json::Value, String>>;
@@ -319,6 +409,27 @@ impl CircuitBreaker {
     }
 }
 
+/// The streamable HTTP transport for `url`: through a client pinned to the
+/// address the egress policy allowed, when there is a policy
+pub(crate) async fn http_transport(
+    url: &str,
+    config: StreamableHttpClientTransportConfig,
+    egress: Option<&EgressPolicy>,
+    connect_timeout: Duration,
+) -> Result<StreamableHttpClientTransport<reqwest::Client>, String> {
+    let Some(egress) = egress else {
+        return Ok(StreamableHttpClientTransport::from_config(config));
+    };
+    let target = egress
+        .check_url(url)
+        .await
+        .map_err(|e| format!("egress refused: {e}"))?;
+    let client = target
+        .client(connect_timeout)
+        .map_err(|e| format!("egress refused: {e}"))?;
+    Ok(StreamableHttpClientTransport::with_client(client, config))
+}
+
 /// Actor managing a single backend MCP server connection
 pub struct BackendActor {
     config: BackendConfig,
@@ -337,10 +448,19 @@ pub struct BackendActor {
     inflight: Arc<Semaphore>,
     /// Routes the backend's progress notifications to the calls waiting on them
     progress: ProgressDispatcher,
+    options: BackendOptions,
+    /// Last use and requests in flight, for the idle timeout
+    activity: Arc<Activity>,
+    /// Whether a health check is already scheduled, so a reconnect adds no second chain
+    health_check_scheduled: bool,
 }
 
 impl BackendActor {
-    pub fn new(config: BackendConfig, registry: ActorRef<RegistryActor>) -> Self {
+    pub fn with_options(
+        config: BackendConfig,
+        registry: ActorRef<RegistryActor>,
+        options: BackendOptions,
+    ) -> Self {
         let circuit_breaker = CircuitBreaker::new(
             config.max_consecutive_failures,
             config.circuit_breaker_cooldown_secs,
@@ -356,23 +476,34 @@ impl BackendActor {
             cancel_token: CancellationToken::new(),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CALLS_PER_BACKEND)),
             progress: ProgressDispatcher::new(),
+            options,
+            activity: Arc::new(Activity::new()),
+            health_check_scheduled: false,
         }
     }
 
-    /// The client handler for a new connection to the backend
-    fn client_handler(&self) -> BackendClient {
+    /// The client handler for a new connection to the backend; a `probe` connection
+    /// is not the actor's, so it does not refresh the tools
+    fn client_handler(&self, probe: bool) -> BackendClient {
         BackendClient {
             backend: self.config.name.clone(),
             progress: self.progress.clone(),
-            actor: self.self_ref.clone(),
+            actor: if probe { None } else { self.self_ref.clone() },
         }
     }
 
-    /// Connect to the backend MCP server
+    /// Connect to the backend MCP server and report the outcome
     async fn connect(&mut self) -> Result<(), BoxError> {
-        self.state = BackendState::Connecting;
-        tracing::info!("Connecting to backend: {}", self.config.name);
+        let result = self.try_connect().await;
+        crate::metrics::record_backend_up(&self.config.name, result.is_ok());
+        if let Some(hook) = &self.options.on_outcome {
+            hook(result.as_ref().err().map(ToString::to_string));
+        }
+        result
+    }
 
+    /// Open a connection to the backend MCP server
+    async fn open_client(&self, probe: bool) -> Result<McpClient, BoxError> {
         let client = match self.config.transport {
             TransportType::Sse | TransportType::Http => {
                 let url = self.config.url.as_ref().ok_or("Missing URL for backend")?;
@@ -403,9 +534,15 @@ impl BackendActor {
                         .collect();
                     transport_config = transport_config.custom_headers(custom_headers);
                 }
-                let transport = StreamableHttpClientTransport::from_config(transport_config);
+                let transport = http_transport(
+                    url,
+                    transport_config,
+                    self.options.egress.as_deref(),
+                    connect_timeout,
+                )
+                .await?;
 
-                let service = timeout(connect_timeout, self.client_handler().serve(transport))
+                let service = timeout(connect_timeout, self.client_handler(probe).serve(transport))
                     .await
                     .map_err(|_| format!("Connection timeout after {}s", self.config.timeout_secs))?
                     .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
@@ -440,7 +577,7 @@ impl BackendActor {
                     .map_err(|e| format!("Failed to spawn process {cmd}: {e}"))?;
 
                 let connect_timeout = Duration::from_secs(self.config.timeout_secs);
-                let service = timeout(connect_timeout, self.client_handler().serve(transport))
+                let service = timeout(connect_timeout, self.client_handler(probe).serve(transport))
                     .await
                     .map_err(|_| {
                         format!(
@@ -460,7 +597,18 @@ impl BackendActor {
             }
         };
 
+        Ok(client)
+    }
+
+    /// Connect to the backend MCP server and publish its tools
+    async fn try_connect(&mut self) -> Result<(), BoxError> {
+        self.state = BackendState::Connecting;
+        tracing::info!("Connecting to backend: {}", self.config.name);
+
+        let client = self.open_client(false).await?;
+
         self.client = Some(client);
+        self.activity.touch();
         self.state = BackendState::Connected;
         self.reconnect_attempts = 0;
         self.circuit_breaker.reset();
@@ -628,8 +776,19 @@ impl BackendActor {
     ///
     /// A half-open circuit lets one request through as a probe, as before.
     fn admit_call(&self) -> Result<Peer<RoleClient>, String> {
+        self.check_state()?;
+
+        self.client
+            .as_ref()
+            .map(|client| client.peer().clone())
+            .ok_or_else(|| "No client connection available".to_string())
+    }
+
+    /// The state and circuit breaker part of [`Self::admit_call`]; an idle backend is
+    /// admitted, as the request wakes it first
+    fn check_state(&self) -> Result<(), String> {
         match self.state {
-            BackendState::Connected | BackendState::CircuitOpen => {}
+            BackendState::Connected | BackendState::CircuitOpen | BackendState::Idle => {}
             BackendState::Reconnecting => {
                 return Err(format!(
                     "Backend '{}' is reconnecting (attempt {})",
@@ -658,20 +817,66 @@ impl BackendActor {
             ));
         }
 
-        self.client
-            .as_ref()
-            .map(|client| client.peer().clone())
-            .ok_or_else(|| "No client connection available".to_string())
+        Ok(())
+    }
+
+    /// Connect before a request when the backend is idle, or failed and probed only by
+    /// requests (passive health). One actor message at a time, so concurrent requests
+    /// during the wake wait here and share the connection.
+    async fn wake(&mut self) -> Result<(), String> {
+        let from_idle = self.state == BackendState::Idle;
+        let wakeable = match self.state {
+            BackendState::Idle => true,
+            BackendState::Disconnected | BackendState::Failed | BackendState::CircuitOpen => {
+                self.options.passive_health
+            }
+            _ => false,
+        };
+        if !wakeable {
+            return Ok(());
+        }
+
+        if self.circuit_breaker.is_open() {
+            if !self.circuit_breaker.should_attempt_close() {
+                return Err(format!(
+                    "Backend '{}' circuit breaker is open",
+                    self.config.name
+                ));
+            }
+            self.circuit_breaker.reset();
+        }
+
+        tracing::debug!("Backend '{}' connecting for a request", self.config.name);
+        // Drops a stale connection
+        self.disconnect().await;
+
+        let Err(e) = self.connect().await else {
+            return Ok(());
+        };
+        let error_msg = format!("Backend '{}' failed to connect: {e}", self.config.name);
+
+        self.disconnect().await;
+        if from_idle {
+            // The tools stay cached; the next request tries again
+            self.state = BackendState::Idle;
+            crate::metrics::record_backend_state(&self.config.name, "idle");
+        } else {
+            self.state = BackendState::Failed;
+            crate::metrics::record_backend_state(&self.config.name, "failed");
+        }
+        self.handle_call_failure(&error_msg).await;
+        Err(error_msg)
     }
 
     /// Run a request against the backend in a spawned task, so the actor stays free to handle
     /// other messages (including more requests) while it is in flight.
     ///
-    /// The state and circuit breaker checks happen here, synchronously. The task waits for a
-    /// permit, runs `request` under the backend timeout, sends the reply and then reports the
-    /// outcome back to the actor, which owns the circuit breaker.
-    fn spawn_call<T, E, Fut>(
-        &self,
+    /// A backend that needs to connect first does so here, then the state and circuit breaker
+    /// checks run. The task waits for a permit, runs `request` under the backend timeout,
+    /// sends the reply and then reports the outcome back to the actor, which owns the circuit
+    /// breaker.
+    async fn spawn_call<T, E, Fut>(
+        &mut self,
         ctx: &mut Context<Self, CallReply>,
         labels: CallLabels,
         request: impl FnOnce(Peer<RoleClient>) -> Fut + Send + 'static,
@@ -683,7 +888,7 @@ impl BackendActor {
     {
         let (delegated, reply_tx) = ctx.reply_sender();
 
-        let peer = match self.admit_call() {
+        let peer = match self.wake().await.and_then(|()| self.admit_call()) {
             Ok(peer) => peer,
             Err(e) => {
                 if let Some(reply_tx) = reply_tx {
@@ -692,6 +897,7 @@ impl BackendActor {
                 return delegated;
             }
         };
+        let active = self.activity.begin();
 
         let backend = self.config.name.clone();
         let timeout_secs = self.config.timeout_secs;
@@ -699,6 +905,7 @@ impl BackendActor {
         let self_ref = self.self_ref.clone();
 
         tokio::spawn(async move {
+            let _active = active;
             let Ok(_permit) = semaphore.acquire().await else {
                 if let Some(reply_tx) = reply_tx {
                     reply_tx.send(Err(format!("Backend '{backend}' call limiter is closed")));
@@ -792,6 +999,10 @@ impl BackendActor {
 
     /// Schedule a reconnection attempt with exponential backoff
     async fn schedule_reconnect(&mut self) {
+        if self.options.passive_health {
+            return; // The next request reconnects
+        }
+
         if let Some(self_ref) = &self.self_ref
             && let Some(actor_ref) = self_ref.upgrade()
         {
@@ -840,6 +1051,10 @@ impl BackendActor {
 
     /// Schedule a reconnection attempt after circuit breaker cooldown
     fn schedule_reconnect_with_cooldown(&mut self) {
+        if self.options.passive_health {
+            return; // The first request after the cooldown reconnects
+        }
+
         if let Some(self_ref) = &self.self_ref
             && let Some(actor_ref) = self_ref.upgrade()
         {
@@ -869,9 +1084,12 @@ impl BackendActor {
     }
 
     /// Schedule periodic health check
-    fn schedule_health_check(&self) {
-        if self.config.health_check_interval_secs == 0 {
+    fn schedule_health_check(&mut self) {
+        if self.config.health_check_interval_secs == 0 || self.options.passive_health {
             return; // Health checks disabled
+        }
+        if self.health_check_scheduled {
+            return; // The chain of checks is still running
         }
 
         if let Some(self_ref) = &self.self_ref
@@ -880,6 +1098,7 @@ impl BackendActor {
             let interval = Duration::from_secs(self.config.health_check_interval_secs);
             let name = self.config.name.clone();
             let token = self.cancel_token.clone();
+            self.health_check_scheduled = true;
 
             tokio::spawn(async move {
                 tokio::select! {
@@ -896,6 +1115,62 @@ impl BackendActor {
         }
     }
 
+    /// Check the idle timeout periodically
+    fn schedule_idle_checks(&self) {
+        let Some(idle_timeout) = self.options.idle_timeout else {
+            return;
+        };
+        let Some(self_ref) = self.self_ref.clone() else {
+            return;
+        };
+
+        let period = idle_timeout
+            .min(MAX_IDLE_CHECK_PERIOD)
+            .max(Duration::from_secs(1));
+        let name = self.config.name.clone();
+        let token = self.cancel_token.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // The first tick is immediate
+            loop {
+                tokio::select! {
+                    () = token.cancelled() => {
+                        tracing::debug!("Idle check task cancelled for '{}'", name);
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        // A weak reference, so this task does not keep the actor alive
+                        let Some(actor_ref) = self_ref.upgrade() else {
+                            break;
+                        };
+                        if actor_ref.tell(IdleCheck).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Check an idle backend with a short-lived connection of its own
+    async fn probe_idle(&self) -> Result<(), String> {
+        let client = self
+            .open_client(true)
+            .await
+            .map_err(|e| format!("Health check failed: {e}"))?;
+
+        let result = timeout(HEALTH_CHECK_TIMEOUT, client.peer().list_tools(None)).await;
+        client.cancel().await;
+
+        match result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("Health check failed: {e}")),
+            Err(_) => Err("Health check timeout".to_string()),
+        }
+    }
+
     /// Perform health check by pinging the backend
     async fn perform_health_check(&mut self) -> Result<(), String> {
         if self.state != BackendState::Connected {
@@ -907,8 +1182,8 @@ impl BackendActor {
         };
 
         // Try to ping by listing tools (lightweight operation)
-        let check_timeout = Duration::from_secs(10); // Short timeout for health checks
-        let result = timeout(check_timeout, client.peer().list_tools(None)).await;
+        let result = timeout(HEALTH_CHECK_TIMEOUT, client.peer().list_tools(None)).await;
+        crate::metrics::record_backend_up(&self.config.name, matches!(result, Ok(Ok(_))));
 
         match result {
             Ok(Ok(_)) => {
@@ -940,6 +1215,7 @@ impl Actor for BackendActor {
         tracing::info!("Backend actor started: {}", state.config.name);
 
         state.self_ref = Some(actor_ref.downgrade());
+        state.schedule_idle_checks();
 
         if let Err(e) = state.connect().await {
             tracing::error!("Failed to connect to {}: {}", state.config.name, e);
@@ -1019,6 +1295,7 @@ impl Message<CallTool> for BackendActor {
                 }
             }
         })
+        .await
     }
 }
 
@@ -1050,6 +1327,7 @@ impl Message<ReadResource> for BackendActor {
                     .await
             }
         })
+        .await
     }
 }
 
@@ -1096,6 +1374,7 @@ impl Message<GetPrompt> for BackendActor {
 
             async move { peer.get_prompt(params).await }
         })
+        .await
     }
 }
 
@@ -1127,9 +1406,11 @@ impl Message<ListResources> for BackendActor {
         _msg: ListResources,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.wake().await?;
         if self.state != BackendState::Connected {
             return Err(format!("Backend '{}' is not connected", self.config.name));
         }
+        self.activity.touch();
 
         self.fetch_resources()
             .await
@@ -1148,9 +1429,11 @@ impl Message<ListPrompts> for BackendActor {
         _msg: ListPrompts,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.wake().await?;
         if self.state != BackendState::Connected {
             return Err(format!("Backend '{}' is not connected", self.config.name));
         }
+        self.activity.touch();
 
         self.fetch_prompts()
             .await
@@ -1169,8 +1452,8 @@ impl Message<Reconnect> for BackendActor {
         _msg: Reconnect,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Only reconnect if not already connected
-        if self.state == BackendState::Connected {
+        // Only reconnect if not already connected (an idle backend connects on demand)
+        if matches!(self.state, BackendState::Connected | BackendState::Idle) {
             return;
         }
 
@@ -1233,6 +1516,23 @@ impl Message<PerformHealthCheck> for BackendActor {
         _msg: PerformHealthCheck,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.health_check_scheduled = false;
+
+        // An idle backend is probed over a connection of its own and stays idle
+        if self.state == BackendState::Idle {
+            let result = self.probe_idle().await;
+            crate::metrics::record_backend_up(&self.config.name, result.is_ok());
+            crate::metrics::record_health_check(&self.config.name, result.is_ok());
+            match result {
+                Ok(()) => {
+                    tracing::debug!("Idle backend '{}' health check passed", self.config.name);
+                }
+                Err(e) => tracing::warn!("Idle backend '{}' {}", self.config.name, e),
+            }
+            self.schedule_health_check();
+            return;
+        }
+
         if let Err(e) = self.perform_health_check().await {
             // Health check failed, trigger circuit breaker
             self.handle_call_failure(&e).await;
@@ -1252,6 +1552,46 @@ impl Message<PerformHealthCheck> for BackendActor {
         // Schedule next health check if still connected
         if self.state == BackendState::Connected {
             self.schedule_health_check();
+        }
+    }
+}
+
+/// Close the connection when the backend has been unused for the idle timeout
+struct IdleCheck;
+
+impl Message<IdleCheck> for BackendActor {
+    type Reply = ();
+
+    async fn handle(&mut self, _msg: IdleCheck, _ctx: &mut Context<Self, Self::Reply>) {
+        let Some(idle_timeout) = self.options.idle_timeout else {
+            return;
+        };
+        if self.state != BackendState::Connected
+            || self.activity.is_busy()
+            || self.activity.idle_for() < idle_timeout
+        {
+            return;
+        }
+
+        tracing::debug!(
+            "Backend '{}' idle for {:?}, closing the connection",
+            self.config.name,
+            self.activity.idle_for()
+        );
+        if let Some(client) = self.client.take() {
+            client.cancel().await;
+        }
+        // The registry keeps the tools; they are served while the backend sleeps
+        self.state = BackendState::Idle;
+        crate::metrics::record_backend_state(&self.config.name, "idle");
+        if let Err(error) = self
+            .registry
+            .tell(crate::registry::MarkIdle {
+                name: self.config.name.clone(),
+            })
+            .await
+        {
+            tracing::debug!("Failed to mark '{}' idle: {error}", self.config.name);
         }
     }
 }
@@ -1445,6 +1785,63 @@ mod tests {
             cb.reset();
             assert!(!cb.is_open());
             assert_eq!(cb.consecutive_failures, 0);
+        }
+    }
+
+    mod idle {
+        use super::*;
+        use crate::registry::RegistryActor;
+        use kameo::actor::Spawn;
+        use kameo::mailbox;
+
+        fn backend(options: BackendOptions) -> BackendActor {
+            let registry =
+                RegistryActor::spawn_with_mailbox(RegistryActor::new(), mailbox::unbounded());
+            let config = BackendConfig {
+                name: "test".to_string(),
+                ..Default::default()
+            };
+            BackendActor::with_options(config, registry, options)
+        }
+
+        #[test]
+        fn default_options_have_no_idle_timeout_or_egress() {
+            let options = BackendOptions::default();
+            assert_eq!(options.idle_timeout, None);
+            assert!(options.egress.is_none());
+            assert!(!options.passive_health);
+            assert!(options.on_outcome.is_none());
+        }
+
+        #[test]
+        fn metrics_state_list_contains_idle() {
+            assert!(crate::metrics::BACKEND_STATES.contains(&"idle"));
+        }
+
+        #[tokio::test]
+        async fn idle_backend_is_admitted() {
+            let mut actor = backend(BackendOptions {
+                idle_timeout: Some(Duration::from_secs(60)),
+                ..Default::default()
+            });
+            actor.state = BackendState::Idle;
+            assert_eq!(actor.check_state(), Ok(()));
+        }
+
+        #[tokio::test]
+        async fn disconnected_backend_is_not_admitted() {
+            let actor = backend(BackendOptions::default());
+            assert!(actor.check_state().is_err());
+        }
+
+        #[test]
+        fn activity_is_busy_while_a_call_is_in_flight() {
+            let activity = Arc::new(Activity::new());
+            assert!(!activity.is_busy());
+            let call = activity.begin();
+            assert!(activity.is_busy());
+            drop(call);
+            assert!(!activity.is_busy());
         }
     }
 

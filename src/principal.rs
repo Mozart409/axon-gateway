@@ -121,6 +121,18 @@ impl PrincipalPolicy {
             })
             && self.effective.visible(tool, &self.opt_outs)
     }
+
+    /// Like [`PrincipalPolicy::permits`] for a tool of the caller's own personal
+    /// backend: no grant is needed (the user owns it), but opt-outs, the token
+    /// scope and the pinned toolset narrow it the same way.
+    pub fn permits_personal(&self, tool: ToolRef<'_>, namespaced: &str) -> bool {
+        self.scope.allows_backend(tool.backend)
+            && self.scope.allows_tool(namespaced)
+            && self.toolset.as_ref().is_none_or(|toolset| {
+                toolset.allows_backend(tool.backend) && toolset.allows_tool(namespaced)
+            })
+            && !self.opt_outs.hides(tool.backend, tool.name)
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +336,37 @@ mod tests {
         let scoped_out = principal(&["it", "dev"], OptOuts::default(), scope(&["forgejo"], &[]));
         assert!(!scoped_out.backend_permitted("prom"));
         assert!(scoped_out.backend_permitted("forgejo"));
+    }
+
+    #[test]
+    fn personal_tools_need_no_grant() {
+        let policy = principal(&[], OptOuts::default(), TokenScope::default());
+        assert!(!policy.permits(tool("mine", "run"), "mine_run"));
+        assert!(policy.permits_personal(tool("mine", "run"), "mine_run"));
+    }
+
+    #[test]
+    fn personal_tools_honour_opt_outs() {
+        let opt_outs = OptOuts::new([
+            ("mine".to_string(), Some("run".to_string())),
+            ("other".to_string(), None),
+        ]);
+        let policy = principal(&[], opt_outs, TokenScope::default());
+        assert!(!policy.permits_personal(tool("mine", "run"), "mine_run"));
+        assert!(policy.permits_personal(tool("mine", "list"), "mine_list"));
+        assert!(!policy.permits_personal(tool("other", "run"), "other_run"));
+    }
+
+    #[test]
+    fn personal_tools_honour_scope_and_toolset() {
+        let scoped = principal(&[], OptOuts::default(), scope(&["prom"], &[]));
+        assert!(!scoped.permits_personal(tool("mine", "run"), "mine_run"));
+        let globbed = principal(&[], OptOuts::default(), scope(&[], &["mine_r*"]));
+        assert!(globbed.permits_personal(tool("mine", "run"), "mine_run"));
+        assert!(!globbed.permits_personal(tool("mine", "list"), "mine_list"));
+        let pinned = principal(&[], OptOuts::default(), TokenScope::default())
+            .with_toolset(scope(&["mine"], &["mine_list"]));
+        assert!(pinned.permits_personal(tool("mine", "list"), "mine_list"));
+        assert!(!pinned.permits_personal(tool("mine", "run"), "mine_run"));
     }
 }

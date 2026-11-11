@@ -259,6 +259,11 @@ pub(super) fn render_admin_page(
                 p class="mt-3 text-sm" {
                     a href="/ui/admin/users" class=(LINK) { "Users" }
                 }
+                @if state.personal.is_some() {
+                    p class="mt-3 text-sm" {
+                        a href="/ui/admin/personal-backends" class=(LINK) { "Personal MCP servers" }
+                    }
+                }
             }
             @if overview.access.manage_service_accounts {
                 p class="mt-3 text-sm" {

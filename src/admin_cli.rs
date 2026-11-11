@@ -2,14 +2,16 @@
 //! directly, for when the dashboard cannot be reached the usual way.
 //!
 //! Today that is `admin login-link`, the break-glass admin login for an
-//! identity provider that is down.
+//! identity provider that is down, and `admin rewrap-secrets`, which moves
+//! the sealed secrets of personal backends onto the active key.
 
 use std::env;
 
 use color_eyre::eyre::{WrapErr, eyre};
 
 use crate::config::Config;
-use crate::store::{BREAK_GLASS_CODE_TTL, Store};
+use crate::crypto::{Keyring, Sealed};
+use crate::store::{BREAK_GLASS_CODE_TTL, SealedColumns, Store};
 
 const USAGE: &str = "\
 Usage: axon-gateway admin <command>
@@ -17,6 +19,10 @@ Usage: axon-gateway admin <command>
 Commands:
   login-link [--config <path>]   Print a one-time URL that starts a 1-hour
                                  admin session as the break-glass user
+  rewrap-secrets [--config <path>]
+                                 Re-wrap every sealed secret of personal
+                                 backends and catalog credentials under the
+                                 active key (AXON_SECRET_KEYS)
 
 The config path falls back to AXON_GATEWAY_CONFIG, then config.toml.";
 
@@ -25,6 +31,8 @@ The config path falls back to AXON_GATEWAY_CONFIG, then config.toml.";
 enum Command {
     /// `login-link`, with the `--config` path when one was given
     LoginLink { config: Option<String> },
+    /// `rewrap-secrets`, with the `--config` path when one was given
+    RewrapSecrets { config: Option<String> },
     /// `--help`
     Help,
 }
@@ -37,24 +45,33 @@ fn parse(args: &[String]) -> Result<Command, String> {
         return Err("not an admin command".to_owned());
     }
     match args.next() {
-        Some("login-link") => {
-            let mut config = None;
-            while let Some(arg) = args.next() {
-                if let Some(path) = arg.strip_prefix("--config=") {
-                    config = Some(path.to_owned());
-                } else if arg == "--config" {
-                    let path = args.next().ok_or("--config needs a path")?;
-                    config = Some(path.to_owned());
-                } else {
-                    return Err(format!("unexpected argument '{arg}'"));
-                }
-            }
-            Ok(Command::LoginLink { config })
-        }
+        Some("login-link") => Ok(Command::LoginLink {
+            config: parse_config(args)?,
+        }),
+        Some("rewrap-secrets") => Ok(Command::RewrapSecrets {
+            config: parse_config(args)?,
+        }),
         Some("--help" | "-h" | "help") => Ok(Command::Help),
         Some(other) => Err(format!("unknown admin command '{other}'")),
         None => Err("missing admin command".to_owned()),
     }
+}
+
+/// The `--config <path>` (or `--config=<path>`) of a command line that takes
+/// nothing else
+fn parse_config<'a>(mut args: impl Iterator<Item = &'a str>) -> Result<Option<String>, String> {
+    let mut config = None;
+    while let Some(arg) = args.next() {
+        if let Some(path) = arg.strip_prefix("--config=") {
+            config = Some(path.to_owned());
+        } else if arg == "--config" {
+            let path = args.next().ok_or("--config needs a path")?;
+            config = Some(path.to_owned());
+        } else {
+            return Err(format!("unexpected argument '{arg}'"));
+        }
+    }
+    Ok(config)
 }
 
 /// `--config`, else `AXON_GATEWAY_CONFIG`, else `config.toml`
@@ -75,6 +92,9 @@ pub async fn run(args: &[String]) -> color_eyre::Result<()> {
     match parse(args) {
         Ok(Command::LoginLink { config }) => {
             login_link(&config_path(config, env::var("AXON_GATEWAY_CONFIG").ok())).await
+        }
+        Ok(Command::RewrapSecrets { config }) => {
+            rewrap_secrets(&config_path(config, env::var("AXON_GATEWAY_CONFIG").ok())).await
         }
         Ok(Command::Help) => {
             println!("{USAGE}");
@@ -111,6 +131,48 @@ async fn login_link(config_path: &str) -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// Re-wraps the data key of every sealed secret that is not under the active
+/// key, and prints how many it moved.
+async fn rewrap_secrets(config_path: &str) -> color_eyre::Result<()> {
+    let config = Config::load(config_path)
+        .wrap_err_with(|| format!("failed to load config from '{config_path}'"))?;
+    let database = config.database.as_ref().ok_or_else(|| {
+        eyre!("'{config_path}' has no [database] section; the secrets live there")
+    })?;
+    let keyring = Keyring::from_env()
+        .wrap_err("failed to read the secret keys")?
+        .ok_or_else(|| {
+            eyre!("no secret keys are configured, so there is nothing to re-wrap with")
+        })?;
+    let store = Store::connect(database)
+        .await
+        .wrap_err("failed to connect to the database")?;
+
+    let mut rewrapped = 0_u64;
+    let mut current = 0_u64;
+    for (target, columns) in store
+        .sealed_secrets()
+        .await
+        .wrap_err("failed to read the sealed secrets")?
+    {
+        let sealed = Sealed::from(&columns);
+        let Some(fresh) = keyring
+            .rewrap(&sealed)
+            .wrap_err_with(|| format!("failed to re-wrap {target:?}"))?
+        else {
+            current += 1;
+            continue;
+        };
+        store
+            .replace_sealed(&target, &SealedColumns::from(fresh))
+            .await
+            .wrap_err_with(|| format!("failed to store the re-wrapped {target:?}"))?;
+        rewrapped += 1;
+    }
+    println!("rewrapped {rewrapped}, already current {current}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +199,21 @@ mod tests {
                 config: Some("b.toml".to_owned())
             })
         );
+    }
+
+    #[test]
+    fn rewrap_secrets_takes_an_optional_config() {
+        assert_eq!(
+            parse(&args(&["admin", "rewrap-secrets"])),
+            Ok(Command::RewrapSecrets { config: None })
+        );
+        assert_eq!(
+            parse(&args(&["admin", "rewrap-secrets", "--config", "a.toml"])),
+            Ok(Command::RewrapSecrets {
+                config: Some("a.toml".to_owned())
+            })
+        );
+        assert!(parse(&args(&["admin", "rewrap-secrets", "stray"])).is_err());
     }
 
     #[test]

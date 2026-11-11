@@ -17,10 +17,11 @@ use kameo::reply::DelegatedReply;
 
 use crate::auth::{AuthManager, TokenIdentity};
 use crate::backend::{
-    BackendActor, CallTool, ForceReconnect, GetBackendInfo, GetPrompt, ListPrompts, ListResources,
-    ReadResource,
+    BackendActor, BackendOptions, CallTool, ForceReconnect, GetBackendInfo, GetPrompt, ListPrompts,
+    ListResources, ReadResource,
 };
 use crate::config::{BackendConfig, Config};
+use crate::personal::{PersonalHub, UserBackendKind, UserSlot};
 use crate::policy::ToolRef;
 use crate::principal::PrincipalPolicy;
 use crate::registry::{
@@ -39,6 +40,8 @@ pub struct GatewayActor {
     /// Copy-on-write so request tasks can hold a snapshot while the actor
     /// adds or removes backends.
     backends: Arc<HashMap<String, ActorRef<BackendActor>>>,
+    /// Told to reload its catalog and drop its slots when the config reloads
+    personal: Option<Arc<PersonalHub>>,
 }
 
 impl GatewayActor {
@@ -47,7 +50,15 @@ impl GatewayActor {
             config,
             registry,
             backends: Arc::new(HashMap::new()),
+            personal: None,
         }
+    }
+
+    /// Keep the users' backends in step with config reloads
+    #[must_use]
+    pub fn with_personal(mut self, hub: Arc<PersonalHub>) -> Self {
+        self.personal = Some(hub);
+        self
     }
 
     /// Mutable access to the backend map (clones it if a request task still
@@ -71,6 +82,13 @@ impl GatewayActor {
                 tracing::info!("Skipping disabled backend: {}", backend_config.name);
                 continue;
             }
+            if backend_config.is_per_user() {
+                tracing::debug!(
+                    "Skipping per-user backend (no shared connection): {}",
+                    backend_config.name
+                );
+                continue;
+            }
 
             // Register in registry
             self.registry
@@ -81,7 +99,10 @@ impl GatewayActor {
                 .map_err(|e| Box::new(e) as BoxError)?;
 
             // Spawn backend actor
-            let backend_actor = BackendActor::new(backend_config.clone(), self.registry.clone());
+            let options =
+                shared_backend_options(backend_config, self.config.gateway.idle_timeout_secs);
+            let backend_actor =
+                BackendActor::with_options(backend_config.clone(), self.registry.clone(), options);
             let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
 
             Arc::make_mut(&mut self.backends).insert(backend_config.name.clone(), actor_ref);
@@ -90,6 +111,15 @@ impl GatewayActor {
         }
 
         Ok(())
+    }
+}
+
+/// The options of a shared backend: it closes its connection when idle for the
+/// backend's own timeout or the gateway default
+fn shared_backend_options(config: &BackendConfig, gateway_idle_secs: u64) -> BackendOptions {
+    BackendOptions {
+        idle_timeout: config.idle_timeout(gateway_idle_secs),
+        ..Default::default()
     }
 }
 
@@ -115,6 +145,11 @@ pub struct HandleRequest {
     pub caller: Arc<Caller>,
     /// The client's progress and cancellation for a `tools/call`
     pub relay: Option<crate::relay::CallRelay>,
+    /// The caller's own and catalog backends, merged into `tools/list` and
+    /// `tools/call` after the shared ones; `None` when they have none
+    pub personal: Option<Arc<UserSlot>>,
+    /// Counts the caller's calls of those backends against their quota
+    pub hub: Option<Arc<PersonalHub>>,
 }
 
 impl Message<HandleRequest> for GatewayActor {
@@ -131,8 +166,12 @@ impl Message<HandleRequest> for GatewayActor {
         let router = self.router();
         let (delegated, sender) = ctx.reply_sender();
         tokio::spawn(async move {
+            let personal = msg.personal.as_deref().map(|slot| PersonalScope {
+                slot,
+                hub: msg.hub.as_deref(),
+            });
             let response = router
-                .handle_request(msg.request, &msg.caller, msg.relay)
+                .handle_request(msg.request, &msg.caller, msg.relay, personal)
                 .await;
             if let Some(sender) = sender {
                 sender.send(response);
@@ -148,6 +187,13 @@ impl Message<HandleRequest> for GatewayActor {
 struct RequestRouter {
     registry: ActorRef<RegistryActor>,
     backends: Arc<HashMap<String, ActorRef<BackendActor>>>,
+}
+
+/// The caller's own backends while one request is served
+#[derive(Clone, Copy)]
+struct PersonalScope<'a> {
+    slot: &'a UserSlot,
+    hub: Option<&'a PersonalHub>,
 }
 
 /// The authenticated caller of an MCP request.
@@ -211,6 +257,23 @@ impl Caller {
         }
     }
 
+    /// Whether the caller may see and call a tool of its own slot. A catalog
+    /// tool goes through the full check (grants name the entry as the backend);
+    /// a personal one needs no grant, the user owns it.
+    fn slot_tool_permitted(&self, kind: UserBackendKind, tool: &NamespacedTool) -> bool {
+        match (kind, self) {
+            (UserBackendKind::Personal { .. }, Self::Principal(policy)) => policy.permits_personal(
+                ToolRef {
+                    backend: &tool.backend_name,
+                    name: &tool.original_name,
+                    read_only_hint: tool.definition.read_only_hint(),
+                },
+                &tool.namespaced_name,
+            ),
+            _ => self.tool_permitted(tool),
+        }
+    }
+
     /// Whether the caller is restricted at all (`Open` and a legacy token with
     /// empty lists are unrestricted).
     fn is_restricted(&self) -> bool {
@@ -228,7 +291,149 @@ fn unknown_tool(id: Option<serde_json::Value>, tool_name: &str) -> JsonRpcRespon
     JsonRpcResponse::error(id, -32601, format!("Unknown tool: {tool_name}"))
 }
 
+/// The tools of the slot's connected backends with what each backend is
+async fn slot_tools(slot: &UserSlot) -> Vec<(NamespacedTool, UserBackendKind)> {
+    let listed: HashSet<String> = slot
+        .registry
+        .ask(ListTools)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    let backends = slot
+        .registry
+        .ask(GetBackendStatus)
+        .await
+        .unwrap_or_default();
+    backends
+        .into_iter()
+        .flat_map(|backend| backend.tools)
+        .filter(|tool| listed.contains(&tool.namespaced_name))
+        .filter_map(|tool| {
+            let kind = *slot.kinds.get(&tool.backend_name)?;
+            Some((tool, kind))
+        })
+        .collect()
+}
+
+/// Forwards a tool call to its backend actor and records the call metrics
+/// (`metrics` is off for personal backends, whose names are user chosen).
+async fn call_backend(
+    backend: &ActorRef<BackendActor>,
+    backend_name: &str,
+    original_tool_name: &str,
+    id: Option<serde_json::Value>,
+    arguments: serde_json::Value,
+    relay: Option<crate::relay::CallRelay>,
+    metrics: bool,
+) -> JsonRpcResponse {
+    if metrics {
+        crate::metrics::record_tool_call(backend_name, original_tool_name);
+    }
+    let start = std::time::Instant::now();
+
+    match backend
+        .ask(CallTool {
+            tool_name: original_tool_name.to_string(),
+            arguments,
+            relay,
+        })
+        .await
+    {
+        Ok(content) => {
+            if metrics {
+                crate::metrics::record_tool_call_duration(
+                    backend_name,
+                    original_tool_name,
+                    start.elapsed().as_secs_f64(),
+                );
+            }
+            JsonRpcResponse::success(id, content)
+        }
+        Err(e) => {
+            if metrics {
+                crate::metrics::record_tool_call_error(backend_name, original_tool_name);
+                crate::metrics::record_tool_call_duration(
+                    backend_name,
+                    original_tool_name,
+                    start.elapsed().as_secs_f64(),
+                );
+            }
+            JsonRpcResponse::error(id, -32000, format!("Failed to call backend: {e}"))
+        }
+    }
+}
+
 impl RequestRouter {
+    /// The caller's own tools it may see, minus the names in `shared`: a shared
+    /// tool of the same name wins.
+    async fn personal_tools(
+        slot: &UserSlot,
+        caller: &Caller,
+        shared: &HashSet<String>,
+    ) -> Vec<ToolDefinition> {
+        slot_tools(slot)
+            .await
+            .into_iter()
+            .filter(|(tool, kind)| {
+                !shared.contains(&tool.namespaced_name) && caller.slot_tool_permitted(*kind, tool)
+            })
+            .map(|(tool, _)| tool.definition)
+            .collect()
+    }
+
+    /// Serves a `tools/call` for a tool the shared registry does not know:
+    /// one of the caller's own backends, or unknown. Permission and quota come
+    /// before the call.
+    async fn call_personal(
+        scope: Option<PersonalScope<'_>>,
+        caller: &Caller,
+        id: Option<serde_json::Value>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        relay: Option<crate::relay::CallRelay>,
+    ) -> JsonRpcResponse {
+        let Some(scope) = scope else {
+            return unknown_tool(id, tool_name);
+        };
+        let found = slot_tools(scope.slot)
+            .await
+            .into_iter()
+            .find(|(tool, kind)| {
+                tool.namespaced_name == tool_name && caller.slot_tool_permitted(*kind, tool)
+            });
+        let Some((tool, kind)) = found else {
+            return unknown_tool(id, tool_name);
+        };
+
+        if let Some(hub) = scope.hub
+            && let Caller::Principal(policy) = caller
+            && let Some(user) = policy.owner_id()
+            && !hub.admit_call(user).await
+        {
+            return JsonRpcResponse::error(id, -32000, "per-user call quota exceeded".to_string());
+        }
+
+        let Some(backend) = scope.slot.backends.get(&tool.backend_name) else {
+            return JsonRpcResponse::error(
+                id,
+                -32000,
+                format!("Backend '{}' not available", tool.backend_name),
+            );
+        };
+        call_backend(
+            backend,
+            &tool.backend_name,
+            &tool.original_name,
+            id,
+            arguments,
+            relay,
+            kind == UserBackendKind::Catalog,
+        )
+        .await
+    }
+
     /// Backends the caller may access.
     fn permitted_backends<'a>(
         &'a self,
@@ -297,6 +502,7 @@ impl RequestRouter {
         request: JsonRpcRequest,
         caller: &Caller,
         relay: Option<crate::relay::CallRelay>,
+        personal: Option<PersonalScope<'_>>,
     ) -> JsonRpcResponse {
         tracing::debug!("Handling MCP request: {}", request.method);
 
@@ -321,14 +527,20 @@ impl RequestRouter {
             // Liveness check used by MCP clients/inspectors
             "ping" => JsonRpcResponse::success(request.id.clone(), serde_json::json!({})),
 
-            // List all tools from all backends
+            // List all tools from all backends, then the caller's own
             "tools/list" => match self.registry.ask(ListTools).await {
-                Ok(tools) => JsonRpcResponse::success(
-                    request.id.clone(),
-                    serde_json::json!({
-                        "tools": self.filter_tools(tools, caller).await
-                    }),
-                ),
+                Ok(tools) => {
+                    let shared: HashSet<String> =
+                        tools.iter().map(|tool| tool.name.clone()).collect();
+                    let mut tools = self.filter_tools(tools, caller).await;
+                    if let Some(scope) = personal {
+                        tools.extend(Self::personal_tools(scope.slot, caller, &shared).await);
+                    }
+                    JsonRpcResponse::success(
+                        request.id.clone(),
+                        serde_json::json!({ "tools": tools }),
+                    )
+                }
                 Err(e) => JsonRpcResponse::error(
                     request.id.clone(),
                     -32000,
@@ -389,44 +601,16 @@ impl RequestRouter {
 
                         // Get the backend actor
                         if let Some(backend) = self.backends.get(&backend_name) {
-                            // Record metrics
-                            crate::metrics::record_tool_call(&backend_name, &original_tool_name);
-                            let start = std::time::Instant::now();
-
-                            // Forward the call
-                            match backend
-                                .ask(CallTool {
-                                    tool_name: original_tool_name.clone(),
-                                    arguments,
-                                    relay,
-                                })
-                                .await
-                            {
-                                Ok(content) => {
-                                    crate::metrics::record_tool_call_duration(
-                                        &backend_name,
-                                        &original_tool_name,
-                                        start.elapsed().as_secs_f64(),
-                                    );
-                                    JsonRpcResponse::success(request.id.clone(), content)
-                                }
-                                Err(e) => {
-                                    crate::metrics::record_tool_call_error(
-                                        &backend_name,
-                                        &original_tool_name,
-                                    );
-                                    crate::metrics::record_tool_call_duration(
-                                        &backend_name,
-                                        &original_tool_name,
-                                        start.elapsed().as_secs_f64(),
-                                    );
-                                    JsonRpcResponse::error(
-                                        request.id.clone(),
-                                        -32000,
-                                        format!("Failed to call backend: {e}"),
-                                    )
-                                }
-                            }
+                            call_backend(
+                                backend,
+                                &backend_name,
+                                &original_tool_name,
+                                request.id.clone(),
+                                arguments,
+                                relay,
+                                true,
+                            )
+                            .await
                         } else {
                             JsonRpcResponse::error(
                                 request.id.clone(),
@@ -435,7 +619,17 @@ impl RequestRouter {
                             )
                         }
                     }
-                    None => unknown_tool(request.id.clone(), &tool_name),
+                    None => {
+                        Self::call_personal(
+                            personal,
+                            caller,
+                            request.id.clone(),
+                            &tool_name,
+                            arguments,
+                            relay,
+                        )
+                        .await
+                    }
                 }
             }
 
@@ -702,7 +896,7 @@ impl RequestRouter {
         }
 
         // For all other methods, delegate to the normal handler
-        self.handle_request(request, caller, relay).await
+        self.handle_request(request, caller, relay, None).await
     }
 }
 
@@ -858,6 +1052,12 @@ impl Message<AddBackend> for GatewayActor {
             return Err(format!("Backend '{name}' is disabled"));
         }
 
+        if msg.config.is_per_user() {
+            return Err(format!(
+                "Backend '{name}' is per-user, not a shared backend"
+            ));
+        }
+
         // Register in registry
         self.registry
             .tell(RegisterBackend { name: name.clone() })
@@ -865,7 +1065,8 @@ impl Message<AddBackend> for GatewayActor {
             .map_err(|e| format!("Failed to register backend: {e:?}"))?;
 
         // Spawn backend actor
-        let backend_actor = BackendActor::new(msg.config, self.registry.clone());
+        let options = shared_backend_options(&msg.config, self.config.gateway.idle_timeout_secs);
+        let backend_actor = BackendActor::with_options(msg.config, self.registry.clone(), options);
         let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
 
         self.backends_mut().insert(name.clone(), actor_ref);
@@ -982,6 +1183,13 @@ impl Message<EnableBackendMsg> for GatewayActor {
             .ok_or_else(|| format!("Backend '{}' not found in config", msg.backend_name))?
             .clone();
 
+        if backend_config.is_per_user() {
+            return Err(format!(
+                "Backend '{}' is per-user, not a shared backend",
+                msg.backend_name
+            ));
+        }
+
         // Register in registry
         self.registry
             .tell(RegisterBackend {
@@ -991,13 +1199,35 @@ impl Message<EnableBackendMsg> for GatewayActor {
             .map_err(|e| format!("Failed to register backend: {e:?}"))?;
 
         // Spawn backend actor
-        let backend_actor = BackendActor::new(backend_config, self.registry.clone());
+        let options =
+            shared_backend_options(&backend_config, self.config.gateway.idle_timeout_secs);
+        let backend_actor =
+            BackendActor::with_options(backend_config, self.registry.clone(), options);
         let actor_ref = BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
         self.backends_mut()
             .insert(msg.backend_name.clone(), actor_ref);
 
         tracing::info!("Enabled backend: {}", msg.backend_name);
         Ok(())
+    }
+}
+
+/// The configuration the gateway currently runs on
+pub struct GetConfig;
+
+/// A copy of the running [`Config`]
+#[derive(Clone, kameo::Reply)]
+pub struct ConfigSnapshot(pub Config);
+
+impl Message<GetConfig> for GatewayActor {
+    type Reply = ConfigSnapshot;
+
+    async fn handle(
+        &mut self,
+        _msg: GetConfig,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        ConfigSnapshot(self.config.clone())
     }
 }
 
@@ -1024,7 +1254,7 @@ impl Message<ReloadConfig> for GatewayActor {
         let new_names: std::collections::HashSet<_> = new_config
             .backends
             .iter()
-            .filter(|b| b.enabled)
+            .filter(|b| b.enabled && !b.is_per_user())
             .map(|b| b.name.clone())
             .collect();
 
@@ -1044,7 +1274,7 @@ impl Message<ReloadConfig> for GatewayActor {
 
         // Add new backends
         for backend_config in &new_config.backends {
-            if !backend_config.enabled {
+            if !backend_config.enabled || backend_config.is_per_user() {
                 continue;
             }
             if !current_names.contains(&backend_config.name) {
@@ -1064,8 +1294,13 @@ impl Message<ReloadConfig> for GatewayActor {
                 }
 
                 // Spawn backend actor
-                let backend_actor =
-                    BackendActor::new(backend_config.clone(), self.registry.clone());
+                let options =
+                    shared_backend_options(backend_config, new_config.gateway.idle_timeout_secs);
+                let backend_actor = BackendActor::with_options(
+                    backend_config.clone(),
+                    self.registry.clone(),
+                    options,
+                );
                 let actor_ref =
                     BackendActor::spawn_with_mailbox(backend_actor, mailbox::unbounded());
                 self.backends_mut()
@@ -1076,6 +1311,19 @@ impl Message<ReloadConfig> for GatewayActor {
 
         // Update internal config
         self.config = new_config;
+
+        // The catalog comes from the config's `per_user` entries: reload it,
+        // then rebuild every user's slot. Off the mailbox, so a slow backend
+        // shutdown does not hold up the gateway.
+        if let Some(hub) = self.personal.clone() {
+            let config = self.config.clone();
+            tokio::spawn(async move {
+                if let Err(error) = hub.reload_catalog(&config).await {
+                    tracing::warn!(%error, "Could not reload the per-user catalog after a config reload");
+                }
+                hub.invalidate_all().await;
+            });
+        }
 
         tracing::info!(
             "Config reloaded: {} added, {} removed, {} errors",
@@ -1380,6 +1628,7 @@ mod tests {
                     rate_limit_per_minute: 0,
                     allow_stdio: false,
                     allowed_hosts: vec![],
+                    idle_timeout_secs: 300,
                 },
                 backends: Vec::new(),
                 tokens: Vec::new(),
@@ -1388,6 +1637,7 @@ mod tests {
                 database: None,
                 auth: crate::config::AuthConfig::default(),
                 rbac: crate::policy::RbacConfig::default(),
+                personal_backends: crate::config::PersonalBackendsConfig::default(),
             };
             GatewayActor::spawn_with_mailbox(
                 GatewayActor::new(config, registry),
@@ -1411,6 +1661,8 @@ mod tests {
                     },
                     caller,
                     relay: None,
+                    personal: None,
+                    hub: None,
                 })
                 .await
                 .unwrap()
@@ -1640,6 +1892,177 @@ mod tests {
             // fails on lookup instead.
             let error = response.error.expect("no backend actor");
             assert!(error.message.contains("not available"), "{}", error.message);
+        }
+
+        /// A slot whose registry knows the given `(backend, kind, tools)`, with
+        /// no backend actors.
+        async fn slot(backends: &[(&str, UserBackendKind, &[&str])]) -> Arc<UserSlot> {
+            let registry =
+                RegistryActor::spawn_with_mailbox(RegistryActor::new(), mailbox::unbounded());
+            let mut kinds = HashMap::new();
+            for (name, kind, tools) in backends {
+                registry
+                    .ask(UpdateBackend {
+                        name: (*name).to_string(),
+                        state: BackendState::Connected,
+                        tools: tools.iter().copied().map(tool).collect(),
+                        error: None,
+                    })
+                    .await
+                    .unwrap();
+                kinds.insert((*name).to_string(), *kind);
+            }
+            Arc::new(UserSlot {
+                registry,
+                backends: Arc::new(HashMap::new()),
+                kinds,
+            })
+        }
+
+        fn personal_kind() -> UserBackendKind {
+            UserBackendKind::Personal {
+                id: uuid::Uuid::from_u128(1),
+            }
+        }
+
+        async fn call_with_slot(
+            gateway: &ActorRef<GatewayActor>,
+            method: &str,
+            params: serde_json::Value,
+            caller: &Arc<Caller>,
+            slot: &Arc<UserSlot>,
+        ) -> JsonRpcResponse {
+            gateway
+                .ask(HandleRequest {
+                    request: JsonRpcRequest {
+                        jsonrpc: String::from("2.0"),
+                        id: Some(serde_json::json!(1)),
+                        method: method.to_string(),
+                        params,
+                    },
+                    caller: Arc::clone(caller),
+                    relay: None,
+                    personal: Some(Arc::clone(slot)),
+                    hub: None,
+                })
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn personal_tools_are_merged_without_a_grant() {
+            let gateway = gateway().await;
+            let slot = slot(&[("mine", personal_kind(), &["run", "list"])]).await;
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let response = call_with_slot(
+                &gateway,
+                "tools/list",
+                serde_json::json!({}),
+                &caller,
+                &slot,
+            )
+            .await;
+            assert_eq!(
+                tool_names(&response),
+                ["mine_list", "mine_run", "public_read", "public_write"]
+            );
+        }
+
+        #[tokio::test]
+        async fn shared_tool_wins_a_name_collision() {
+            let gateway = gateway().await;
+            let slot = slot(&[("public", personal_kind(), &["read"])]).await;
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let response = call_with_slot(
+                &gateway,
+                "tools/list",
+                serde_json::json!({}),
+                &caller,
+                &slot,
+            )
+            .await;
+            assert_eq!(tool_names(&response), ["public_read", "public_write"]);
+
+            // the call goes to the shared backend, which has no actor here
+            let params = serde_json::json!({ "name": "public_read" });
+            let response = call_with_slot(&gateway, "tools/call", params, &caller, &slot).await;
+            let error = response.error.expect("no backend actor");
+            assert!(error.message.contains("not available"), "{}", error.message);
+        }
+
+        #[tokio::test]
+        async fn opt_out_hides_a_personal_tool() {
+            let gateway = gateway().await;
+            let slot = slot(&[("mine", personal_kind(), &["run", "list"])]).await;
+            let opted_out = [("mine", Some("run"))];
+            let caller = principal(&[], &opted_out, TokenScope::default());
+            let response = call_with_slot(
+                &gateway,
+                "tools/list",
+                serde_json::json!({}),
+                &caller,
+                &slot,
+            )
+            .await;
+            assert_eq!(tool_names(&response), ["mine_list"]);
+
+            let params = serde_json::json!({ "name": "mine_run" });
+            let response = call_with_slot(&gateway, "tools/call", params, &caller, &slot).await;
+            assert_looks_unknown(&response, "mine_run");
+        }
+
+        #[tokio::test]
+        async fn catalog_tool_needs_a_grant() {
+            let gateway = gateway().await;
+            // `public` is granted to the group, `cat` is not
+            let slot = slot(&[
+                ("public", UserBackendKind::Catalog, &["extra"]),
+                ("cat", UserBackendKind::Catalog, &["thing"]),
+            ])
+            .await;
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let response = call_with_slot(
+                &gateway,
+                "tools/list",
+                serde_json::json!({}),
+                &caller,
+                &slot,
+            )
+            .await;
+            assert_eq!(
+                tool_names(&response),
+                ["public_extra", "public_read", "public_write"]
+            );
+
+            let params = serde_json::json!({ "name": "cat_thing" });
+            let response = call_with_slot(&gateway, "tools/call", params, &caller, &slot).await;
+            assert_looks_unknown(&response, "cat_thing");
+            // granted, so it reaches the (absent) backend actor
+            let params = serde_json::json!({ "name": "public_extra" });
+            let response = call_with_slot(&gateway, "tools/call", params, &caller, &slot).await;
+            let error = response.error.expect("no backend actor");
+            assert!(error.message.contains("not available"), "{}", error.message);
+        }
+
+        #[tokio::test]
+        async fn personal_tools_stay_out_of_the_toolset_endpoint() {
+            let gateway = gateway().await;
+            let caller = principal(&["dev"], &[], TokenScope::default());
+            let response = gateway
+                .ask(HandleToolsetRequest {
+                    request: JsonRpcRequest {
+                        jsonrpc: String::from("2.0"),
+                        id: Some(serde_json::json!(1)),
+                        method: String::from("tools/call"),
+                        params: serde_json::json!({ "name": "mine_run" }),
+                    },
+                    caller,
+                    toolset_name: String::from("any"),
+                    relay: None,
+                })
+                .await
+                .unwrap();
+            assert_looks_unknown(&response, "mine_run");
         }
 
         #[tokio::test]

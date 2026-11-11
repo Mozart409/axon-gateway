@@ -24,6 +24,7 @@ futures = "0.3"
 getrandom = "0.4"
 hex = "0.4"
 http = "1"
+ipnet = "2"
 # OIDC: oauth2 for the authorization URL, PKCE and code exchange, jsonwebtoken
 # for the ID token signature on aws-lc (already in the tree through rustls), so
 # without the `rsa` crate (RUSTSEC-2023-0071). Never enable its `rust_crypto`
@@ -47,6 +48,7 @@ opentelemetry = { version = "0.33", default-features = false, features = ["trace
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "internal-logs"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "rt-tokio", "internal-logs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+ring = "0.17"
 rmcp = { version = "3.4", features = [
     "client",
     "macros",

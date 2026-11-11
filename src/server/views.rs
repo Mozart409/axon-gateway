@@ -302,6 +302,20 @@ pub(super) fn render_user_bar(state: &AppState, user: &SessionUser) -> Markup {
             {
                 "Toolsets"
             }
+            @if state.personal.is_some() {
+                a
+                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
+                    href="/ui/me/backends"
+                {
+                    "My MCP servers"
+                }
+                a
+                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
+                    href="/ui/catalog"
+                {
+                    "Catalog"
+                }
+            }
             @if admin_pages {
                 a
                     class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
@@ -933,12 +947,14 @@ fn backend_state_text(state: BackendState) -> &'static str {
         BackendState::Failed => "Failed",
         BackendState::CircuitOpen => "Circuit Open",
         BackendState::Reconnecting => "Reconnecting",
+        BackendState::Idle => "Idle",
     }
 }
 
 fn backend_state_class(state: BackendState) -> &'static str {
     match state {
         BackendState::Connected => "text-emerald-700 dark:text-emerald-400",
+        BackendState::Idle => "text-slate-600 dark:text-slate-400",
         BackendState::Connecting | BackendState::Reconnecting => {
             "text-amber-700 dark:text-amber-400"
         }

@@ -14,12 +14,15 @@ mod authz;
 mod backend;
 mod changes;
 mod config;
+mod crypto;
+mod egress;
 mod error;
 mod fanout;
 mod gateway;
 mod jobs;
 mod metrics;
 mod oidc;
+mod personal;
 mod policy;
 mod principal;
 mod rbac;
@@ -40,6 +43,7 @@ use tokio::sync::broadcast;
 
 use color_eyre::eyre::{Result, WrapErr};
 
+use kameo::actor::ActorRef;
 use kameo::actor::Spawn;
 use kameo::mailbox;
 
@@ -48,6 +52,7 @@ use crate::changes::ChangeBus;
 use crate::config::Config;
 use crate::gateway::GatewayActor;
 use crate::oidc::OidcProviders;
+use crate::personal::PersonalHub;
 use crate::registry::RegistryActor;
 use crate::server::AppState;
 
@@ -92,12 +97,11 @@ fn setup_auth(config: &Config, multi_user: bool) -> SharedAuth {
 }
 
 /// Spawns the background tasks that need the database: the purges, the audit
-/// writer (returned), the RBAC policy refresh and the change listener.
+/// writer (returned) and the RBAC policy refresh.
 async fn start_store_tasks(
     store: Option<&store::Store>,
     has_oidc: bool,
     policy: &Arc<rbac::PolicyHandle>,
-    changes: &ChangeBus,
 ) -> Option<audit::AuditSink> {
     if let Some(store) = store {
         spawn_purges(store);
@@ -113,9 +117,43 @@ async fn start_store_tasks(
             tracing::warn!(%error, "Could not load RBAC rows from the database, using [rbac] from the config only");
         }
         rbac::spawn_policy_refresh(Arc::clone(policy), store.clone());
-        fanout::spawn_change_listener(store.clone(), Arc::clone(policy), changes.clone());
     }
     audit
+}
+
+/// The shared registry actor, with toolsets if configured
+fn spawn_registry(config: &Config, changes: &ChangeBus) -> ActorRef<RegistryActor> {
+    if config.toolsets.is_empty() {
+        RegistryActor::spawn_with_mailbox(
+            RegistryActor::new().with_change_bus(changes.clone()),
+            mailbox::unbounded(),
+        )
+    } else {
+        tracing::info!(
+            "Toolsets configured: {:?}",
+            config.toolsets.iter().map(|g| &g.name).collect::<Vec<_>>()
+        );
+        RegistryActor::spawn_with_mailbox(
+            RegistryActor::with_toolsets(config.toolsets.clone()).with_change_bus(changes.clone()),
+            mailbox::unbounded(),
+        )
+    }
+}
+
+/// Wait until the gateway actor has finished initializing. kameo runs
+/// `on_start` (which spawns every backend) to completion before the actor
+/// starts processing its mailbox, so this `ask` only resolves once the
+/// gateway is ready — a deterministic replacement for a fixed-duration sleep.
+async fn await_gateway_ready(gateway: &ActorRef<GatewayActor>) {
+    match gateway.ask(crate::gateway::GetStatus).await {
+        Ok(status) => {
+            tracing::info!(
+                "Gateway initialized with {} backend(s)",
+                status.backend_count
+            );
+        }
+        Err(e) => tracing::warn!("Gateway readiness check failed: {e:?}"),
+    }
 }
 
 #[tokio::main]
@@ -164,7 +202,8 @@ async fn main() -> Result<()> {
     let policy =
         Arc::new(rbac::PolicyHandle::new(config.rbac.clone()).with_change_bus(changes.clone()));
 
-    let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy, &changes).await;
+    let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy).await;
+    let personal = setup_personal(&config, store.as_ref(), &changes).await?;
 
     // Initialize Prometheus metrics exporter
     let prometheus_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -179,38 +218,27 @@ async fn main() -> Result<()> {
     // the gateway actor.
     let mcp_allowed_hosts = config::mcp_allowed_hosts(&config.gateway);
 
-    // Spawn registry actor (with toolsets if configured)
-    let registry = if config.toolsets.is_empty() {
-        RegistryActor::spawn_with_mailbox(
-            RegistryActor::new().with_change_bus(changes.clone()),
-            mailbox::unbounded(),
-        )
-    } else {
-        tracing::info!(
-            "Toolsets configured: {:?}",
-            config.toolsets.iter().map(|g| &g.name).collect::<Vec<_>>()
+    let registry = spawn_registry(&config, &changes);
+
+    let mut gateway_actor = GatewayActor::new(config, registry);
+    if let Some(hub) = &personal {
+        gateway_actor = gateway_actor.with_personal(Arc::clone(hub));
+    }
+    let gateway = GatewayActor::spawn_with_mailbox(gateway_actor, mailbox::unbounded());
+
+    await_gateway_ready(&gateway).await;
+
+    // Database changes (policy, users, the catalog) reach this replica here
+    if let (Some(store), true) = (&store, oidc.is_some()) {
+        fanout::spawn_change_listener(
+            store.clone(),
+            Arc::clone(&policy),
+            changes.clone(),
+            fanout::Handles {
+                gateway: gateway.clone(),
+                personal: personal.clone(),
+            },
         );
-        RegistryActor::spawn_with_mailbox(
-            RegistryActor::with_toolsets(config.toolsets.clone()).with_change_bus(changes.clone()),
-            mailbox::unbounded(),
-        )
-    };
-
-    let gateway =
-        GatewayActor::spawn_with_mailbox(GatewayActor::new(config, registry), mailbox::unbounded());
-
-    // Wait until the gateway actor has finished initializing. kameo runs
-    // `on_start` (which spawns every backend) to completion before the actor
-    // starts processing its mailbox, so this `ask` only resolves once the
-    // gateway is ready — a deterministic replacement for a fixed-duration sleep.
-    match gateway.ask(crate::gateway::GetStatus).await {
-        Ok(status) => {
-            tracing::info!(
-                "Gateway initialized with {} backend(s)",
-                status.backend_count
-            );
-        }
-        Err(e) => tracing::warn!("Gateway readiness check failed: {e:?}"),
     }
 
     // Start config file watcher for hot reload
@@ -240,6 +268,7 @@ async fn main() -> Result<()> {
         audit,
         changes,
         mcp_allowed_hosts,
+        personal,
     };
 
     // Run server with graceful shutdown
@@ -256,6 +285,43 @@ async fn main() -> Result<()> {
     tracing::info!("Shutdown complete");
     telemetry.shutdown();
     Ok(())
+}
+
+/// The hub of the users' own and catalog backends, or `None` without a
+/// database or with `[personal_backends] enabled = false`. It needs a key to
+/// seal the users' secrets, so a missing one stops the start.
+async fn setup_personal(
+    config: &Config,
+    store: Option<&store::Store>,
+    changes: &ChangeBus,
+) -> Result<Option<Arc<PersonalHub>>> {
+    let Some(store) = store.filter(|_| config.personal_backends.enabled) else {
+        return Ok(None);
+    };
+    let keyring = crypto::Keyring::from_env()
+        .wrap_err("failed to read the personal backends key")?
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "personal backends need a key: set AXON_KEK_FILE or AXON_KEK (or [personal_backends] enabled = false)"
+            )
+        })?;
+    let egress = egress::EgressPolicy::new(
+        &config.personal_backends.egress_allow,
+        &config.personal_backends.egress_deny,
+    )
+    .wrap_err("invalid [personal_backends] egress rule")?;
+    let hub = PersonalHub::new(
+        store.clone(),
+        Arc::new(keyring),
+        Arc::new(egress),
+        config,
+        changes.clone(),
+    );
+    if let Err(error) = hub.reload_catalog(config).await {
+        tracing::warn!(%error, "Could not load the per-user catalog from the database");
+    }
+    tracing::info!("Personal backends enabled");
+    Ok(Some(Arc::new(hub)))
 }
 
 /// The OIDC providers for the dashboard login, or `None` without any.
