@@ -150,15 +150,14 @@ pub fn describe_mcp_metrics() {
     );
 }
 
-/// The `principal_type` label of a caller. A principal without an owner user or
-/// with a `config:` label is a config service account; a personal access token
-/// is `pat` (a service account's token too, as a principal does not tell them apart).
+/// The `principal_type` label of a caller: `service` for a config `[[tokens]]`
+/// account or a service account's token, `pat` for a person's own token.
 pub fn principal_type(caller: &Caller) -> &'static str {
     match caller {
         Caller::Open => "open",
         Caller::Token(_) => "legacy_token",
         Caller::Principal(principal) => {
-            if principal.owner_id().is_none() || principal.label().starts_with("config:") {
+            if principal.is_service_account() {
                 "service"
             } else {
                 "pat"
@@ -420,17 +419,20 @@ mod tests {
     use crate::policy::{OptOuts, Policy, RbacConfig};
     use crate::principal::{PrincipalPolicy, TokenScope};
 
-    fn principal(label: &str, owner: Option<Uuid>) -> Caller {
+    fn principal(label: &str, owner: Option<Uuid>, service: bool) -> Caller {
         let effective = Policy::from_config(&RbacConfig::default()).effective(&[]);
-        Caller::Principal(
-            PrincipalPolicy::new(
-                label.to_owned(),
-                effective,
-                OptOuts::default(),
-                TokenScope::default(),
-            )
-            .with_identity(owner, None),
+        let policy = PrincipalPolicy::new(
+            label.to_owned(),
+            effective,
+            OptOuts::default(),
+            TokenScope::default(),
         )
+        .with_identity(owner, None);
+        Caller::Principal(if service {
+            policy.with_service_account()
+        } else {
+            policy
+        })
     }
 
     #[test]
@@ -444,8 +446,20 @@ mod tests {
         });
         assert_eq!(principal_type(&token), "legacy_token");
         let user = Some(Uuid::from_u128(1));
-        assert_eq!(principal_type(&principal("a@b.c / laptop", user)), "pat");
-        assert_eq!(principal_type(&principal("config:ci", None)), "service");
+        assert_eq!(
+            principal_type(&principal("a@b.c / laptop", user, false)),
+            "pat"
+        );
+        // A principal without an owner and without the service flag is not a service
+        assert_eq!(principal_type(&principal("config:ci", None, false)), "pat");
+        assert_eq!(
+            principal_type(&principal("config:ci", None, true)),
+            "service"
+        );
+        assert_eq!(
+            principal_type(&principal("ci / deploy", user, true)),
+            "service"
+        );
     }
 
     #[test]

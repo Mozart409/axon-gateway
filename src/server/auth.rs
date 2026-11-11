@@ -198,15 +198,18 @@ async fn within_rate_limit(
 fn config_account(identity: &TokenIdentity, state: &AppState) -> Caller {
     let policy = state.policy.current();
     let groups = policy.groups_for_config_account(&identity.name);
-    Caller::Principal(PrincipalPolicy::new(
-        format!("config:{}", identity.name),
-        policy.effective(&groups),
-        OptOuts::default(),
-        TokenScope {
-            backends: identity.allowed_backends.clone(),
-            tools: identity.allowed_tools.clone(),
-        },
-    ))
+    Caller::Principal(
+        PrincipalPolicy::new(
+            format!("config:{}", identity.name),
+            policy.effective(&groups),
+            OptOuts::default(),
+            TokenScope {
+                backends: identity.allowed_backends.clone(),
+                tools: identity.allowed_tools.clone(),
+            },
+        )
+        .with_service_account(),
+    )
 }
 
 /// A personal access token or a service account's token.
@@ -267,6 +270,9 @@ async fn authenticate_pat(
         },
     )
     .with_identity(Some(owner.id), Some(principal.token.id));
+    if principal.is_service_account {
+        caller = caller.with_service_account();
+    }
     if let Some(toolset) = principal.toolset {
         caller = caller.with_toolset(toolset);
     }

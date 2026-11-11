@@ -44,6 +44,8 @@ pub struct PrincipalPolicy {
     toolset: Option<TokenScope>,
     owner_id: Option<Uuid>,
     token_id: Option<Uuid>,
+    /// A service account: a config `[[tokens]]` account or a service account's token
+    service: bool,
 }
 
 impl PrincipalPolicy {
@@ -62,6 +64,7 @@ impl PrincipalPolicy {
             toolset: None,
             owner_id: None,
             token_id: None,
+            service: false,
         }
     }
 
@@ -80,6 +83,13 @@ impl PrincipalPolicy {
         self
     }
 
+    /// Mark the caller as a service account rather than a person
+    #[must_use]
+    pub fn with_service_account(mut self) -> Self {
+        self.service = true;
+        self
+    }
+
     /// The owning user; `None` for a config `[[tokens]]` principal
     pub fn owner_id(&self) -> Option<Uuid> {
         self.owner_id
@@ -88,6 +98,11 @@ impl PrincipalPolicy {
     /// The personal access token presented; `None` for a config `[[tokens]]` principal
     pub fn token_id(&self) -> Option<Uuid> {
         self.token_id
+    }
+
+    /// A service account rather than a person's own token
+    pub fn is_service_account(&self) -> bool {
+        self.service
     }
 
     /// Owner email, or service account name and token name

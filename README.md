@@ -964,7 +964,7 @@ Prometheus metrics are exposed at `/metrics`:
 - `axon_backend_up` - Gauge per backend, 1 when the last connect or health probe succeeded
 - `axon_audit_dropped_total` - Tool-call audit events dropped on a full queue
 - `axon_audit_write_errors_total` - Tool-call audit batches the database refused
-- `axon_mcp_requests_total{method,principal_type}` - MCP requests by `Mcp-Method`; `principal_type` is `pat`, `service`, `legacy_token` or `open`
+- `axon_mcp_requests_total{method,principal_type}` - MCP requests by `Mcp-Method`; `principal_type` is `open`, `legacy_token`, `service` (config `[[tokens]]` accounts and service-account tokens) or `pat`
 - `axon_user_tool_calls_total{user,backend,outcome}` - Tool calls per user; `outcome` is `ok`, `error` or `denied`, `backend` is `personal` for personal backends; only callers with an owner user are counted
 - `axon_authn_total{method,result}` - Authentication attempts; `method` is `pat`, `service_token`, `legacy_token`, `session`, `break_glass` or `open`; `result` is `ok`, `invalid`, `expired`, `disabled` or `rate_limited`
 - `axon_authz_denied_total{reason}` - Denied calls; `reason` is `tool`, `backend`, `quota` or `rate_limit`

@@ -817,9 +817,6 @@ Decisions (2026-11-11):
 - [x] Helm chart under `deploy/helm/axon-gateway/` (section 7).
 - [x] Grafana dashboard and alert rules in `example/observability/`.
 - [x] `traceparent` propagation to backends and MCP `_meta`.
-- Notes: `principal_type` on `axon_mcp_requests_total` labels a service
-  account's token as `pat` when it has an owner user (heuristic, a principal
-  has no service flag); config service accounts are `service`.
 - Exit: dashboards and alerts load against a running instance.
 
 ### Phase 7 - Enterprise auth
