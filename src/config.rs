@@ -148,9 +148,25 @@ pub struct OidcProviderConfig {
     /// Members of any of these groups are gateway admins
     #[serde(default)]
     pub admin_groups: Vec<String>,
+    /// Accept JWT access tokens this provider issued as bearer tokens
+    /// (resource-server mode). The subject acts as the user with that issuer
+    /// and subject, or as the service account bound to it. Needs the
+    /// `[database]` every provider needs.
+    #[serde(default)]
+    pub accept_access_tokens: bool,
+    /// The `aud` an accepted access token must carry; defaults to `client_id`
+    #[serde(default)]
+    pub access_token_audience: Option<String>,
 }
 
 impl OidcProviderConfig {
+    /// The audience of accepted access tokens: `access_token_audience`, or the client id
+    pub fn access_token_audience(&self) -> &str {
+        self.access_token_audience
+            .as_deref()
+            .unwrap_or(&self.client_id)
+    }
+
     /// Button label: `display_name`, or the id when unset
     pub fn display_name(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.id)
@@ -724,6 +740,9 @@ impl Config {
             }
             if provider.client_id.is_empty() {
                 return Err(invalid("client_id must not be empty"));
+            }
+            if provider.access_token_audience.as_deref() == Some("") {
+                return Err(invalid("access_token_audience must not be empty"));
             }
         }
         Ok(())
@@ -1589,6 +1608,38 @@ name = "same"
         fn rejects_empty_client_id() {
             let extra = "[[auth.oidc]]\nid = \"a\"\nissuer = \"https://idp.example.com\"\nclient_id = \"\"\n";
             assert!(invalid_reason(&with_db(extra)).contains("client_id"));
+        }
+
+        #[test]
+        fn access_tokens_default_to_off_and_the_client_id_audience() {
+            let config = with_db(&provider("a", "https://idp.example.com"));
+            config.validate().expect("valid");
+            let [one] = config.auth.oidc.as_slice() else {
+                panic!("one provider");
+            };
+            assert!(!one.accept_access_tokens);
+            assert_eq!(one.access_token_audience(), "cid");
+
+            let extra = format!(
+                "{}accept_access_tokens = true\naccess_token_audience = \"api://axon\"\n",
+                provider("a", "https://idp.example.com")
+            );
+            let config = with_db(&extra);
+            config.validate().expect("valid");
+            let [one] = config.auth.oidc.as_slice() else {
+                panic!("one provider");
+            };
+            assert!(one.accept_access_tokens);
+            assert_eq!(one.access_token_audience(), "api://axon");
+        }
+
+        #[test]
+        fn rejects_an_empty_access_token_audience() {
+            let extra = format!(
+                "{}access_token_audience = \"\"\n",
+                provider("a", "https://idp.example.com")
+            );
+            assert!(invalid_reason(&with_db(&extra)).contains("access_token_audience"));
         }
     }
 

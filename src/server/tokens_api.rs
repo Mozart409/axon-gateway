@@ -18,7 +18,7 @@ use super::AppState;
 use super::admin_api::{ApiJson, ApiPath, ApiResult, admin};
 use crate::principal::TokenScope;
 use crate::rbac::{AdminError, MyTokens, TokenState};
-use crate::store::{ApiToken, IssuedToken, PAT_PREFIX, ServiceAccount, SessionUser};
+use crate::store::{ApiToken, IssuedToken, JwtBinding, PAT_PREFIX, ServiceAccount, SessionUser};
 
 /// The token routes, without guards: `admin_api::router` adds them.
 pub(super) fn routes() -> Router<AppState> {
@@ -43,6 +43,14 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/api/v1/service-accounts/{id}/tokens/{token_id}",
             delete(handle_revoke_account_token),
+        )
+        .route(
+            "/api/v1/service-accounts/{id}/jwt-bindings",
+            get(handle_list_jwt_bindings).post(handle_create_jwt_binding),
+        )
+        .route(
+            "/api/v1/service-accounts/{id}/jwt-bindings/{binding_id}",
+            delete(handle_delete_jwt_binding),
         )
         .merge(super::toolsets_api::routes())
 }
@@ -81,6 +89,17 @@ fn account_json(account: &ServiceAccount) -> Value {
         "description": account.description,
         "disabled": account.disabled,
         "created_at": account.created_at.to_rfc3339(),
+    })
+}
+
+fn binding_json(binding: &JwtBinding) -> Value {
+    json!({
+        "id": binding.id,
+        "service_account_id": binding.service_account_id,
+        "issuer": binding.issuer,
+        "subject": binding.subject,
+        "created_at": binding.created_at.to_rfc3339(),
+        "created_by": binding.created_by,
     })
 }
 
@@ -257,6 +276,71 @@ async fn handle_revoke_account_token(
     admin(&state, &session)
         .await?
         .revoke_service_account_token(id, token_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Refuses an issuer that is not a configured OIDC provider with
+/// `accept_access_tokens`: a binding to it could never match a token.
+pub(super) fn require_accepting_issuer(state: &AppState, issuer: &str) -> Result<(), AdminError> {
+    let accepted = state.multi_user().is_some_and(|(_, oidc)| {
+        oidc.iter()
+            .any(|provider| provider.accepts_access_tokens() && provider.issuer() == issuer.trim())
+    });
+    if accepted {
+        Ok(())
+    } else {
+        Err(AdminError::Invalid(
+            "the issuer is not an OIDC provider with accept_access_tokens = true".to_owned(),
+        ))
+    }
+}
+
+/// `GET /api/v1/service-accounts/{id}/jwt-bindings`
+async fn handle_list_jwt_bindings(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let bindings = admin(&state, &session).await?.jwt_bindings(id).await?;
+    let bindings: Vec<Value> = bindings.iter().map(binding_json).collect();
+    Ok(Json(json!({ "jwt_bindings": bindings })))
+}
+
+/// `POST /api/v1/service-accounts/{id}/jwt-bindings` body
+#[derive(Debug, Deserialize)]
+struct CreateJwtBindingBody {
+    /// The issuer of a provider that accepts access tokens
+    issuer: String,
+    /// The `sub` of the tokens that act as the account
+    subject: String,
+}
+
+/// `POST /api/v1/service-accounts/{id}/jwt-bindings`
+async fn handle_create_jwt_binding(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(body): ApiJson<CreateJwtBindingBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let admin = admin(&state, &session).await?;
+    admin.service_account(id).await?;
+    require_accepting_issuer(&state, &body.issuer)?;
+    let binding = admin
+        .create_jwt_binding(id, &body.issuer, &body.subject)
+        .await?;
+    Ok((StatusCode::CREATED, Json(binding_json(&binding))))
+}
+
+/// `DELETE /api/v1/service-accounts/{id}/jwt-bindings/{binding_id}`
+async fn handle_delete_jwt_binding(
+    State(state): State<AppState>,
+    Extension(session): Extension<SessionUser>,
+    ApiPath((id, binding_id)): ApiPath<(Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    admin(&state, &session)
+        .await?
+        .delete_jwt_binding(id, binding_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

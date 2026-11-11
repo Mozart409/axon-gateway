@@ -66,6 +66,14 @@ pub(super) fn action_routes() -> Router<AppState> {
             "/ui/actions/admin/service-accounts/{id}/tokens/{token_id}/revoke",
             post(handle_account_token_revoke),
         )
+        .route(
+            "/ui/actions/admin/service-accounts/{id}/jwt-bindings",
+            post(handle_account_jwt_binding_create),
+        )
+        .route(
+            "/ui/actions/admin/service-accounts/{id}/jwt-bindings/{binding_id}/delete",
+            post(handle_account_jwt_binding_delete),
+        )
         .merge(super::toolsets_ui::action_routes())
         .merge(super::personal_ui::action_routes())
 }
@@ -248,11 +256,23 @@ async fn load_accounts(
     let mut rows = Vec::with_capacity(accounts.len());
     for account in accounts {
         let tokens = admin.service_account_tokens(account.id).await?;
-        rows.push(AccountRow { account, tokens });
+        let bindings = admin.jwt_bindings(account.id).await?;
+        rows.push(AccountRow {
+            account,
+            tokens,
+            bindings,
+        });
     }
+    let issuers = state.multi_user().map_or_else(Vec::new, |(_, oidc)| {
+        oidc.iter()
+            .filter(|provider| provider.accepts_access_tokens())
+            .map(|provider| provider.issuer().to_owned())
+            .collect()
+    });
     Ok(ServiceAccountsOverview {
         accounts: rows,
         backends: backend_names(state).await,
+        issuers,
     })
 }
 
@@ -401,6 +421,56 @@ pub(super) async fn handle_account_token_revoke(
         Err(response) => return *response,
     };
     if let Err(error) = admin.revoke_service_account_token(id, token_id).await {
+        return error_response(&error);
+    }
+    accounts_fragment(&state, &admin, None).await
+}
+
+/// `POST /ui/actions/admin/service-accounts/{id}/jwt-bindings` form
+#[derive(Debug, Deserialize)]
+pub(super) struct JwtBindingForm {
+    issuer: String,
+    subject: String,
+}
+
+/// Handle POST /ui/actions/admin/service-accounts/{id}/jwt-bindings - bind an
+/// `IdP` subject to the account
+pub(super) async fn handle_account_jwt_binding_create(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+    Path(id): Path<Uuid>,
+    AdminForm(form): AdminForm<JwtBindingForm>,
+) -> Response {
+    let (_, admin) = match admin_for(&state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    if let Err(error) = admin.service_account(id).await {
+        return error_response(&error);
+    }
+    if let Err(error) = super::tokens_api::require_accepting_issuer(&state, &form.issuer) {
+        return error_response(&error);
+    }
+    if let Err(error) = admin
+        .create_jwt_binding(id, &form.issuer, &form.subject)
+        .await
+    {
+        return error_response(&error);
+    }
+    accounts_fragment(&state, &admin, None).await
+}
+
+/// Handle POST /ui/actions/admin/service-accounts/{id}/jwt-bindings/{binding_id}/delete
+pub(super) async fn handle_account_jwt_binding_delete(
+    State(state): State<AppState>,
+    user: Option<Extension<SessionUser>>,
+    Path((id, binding_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    let (_, admin) = match admin_for(&state, user).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    if let Err(error) = admin.delete_jwt_binding(id, binding_id).await {
         return error_response(&error);
     }
     accounts_fragment(&state, &admin, None).await

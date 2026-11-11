@@ -97,6 +97,38 @@ pub enum OidcError {
     /// The user's email is not in `allowed_email_domains`.
     #[error("email domain is not allowed to log in")]
     EmailDomainNotAllowed,
+    /// The access token verified except that it has expired.
+    #[error("the access token has expired")]
+    Expired,
+}
+
+/// What an access token is: its issuer, subject and who it identifies.
+pub struct AccessTokenClaims {
+    /// The provider's issuer, as configured.
+    pub issuer: String,
+    /// The `sub` claim.
+    pub subject: String,
+    /// The groups in the provider's `groups_claim`; `None` when the token has none.
+    pub groups: Option<Vec<String>>,
+    /// The `email` claim, if any.
+    pub email: Option<String>,
+    /// The token as presented, for forwarding in a token exchange.
+    #[allow(dead_code)] // read by the token-exchange passthrough (Phase 7b)
+    pub token: String,
+}
+
+impl fmt::Debug for AccessTokenClaims {
+    // By hand, so the bearer token can never end up in a log line.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccessTokenClaims")
+            .field("issuer", &self.issuer)
+            .field("subject", &self.subject)
+            .field("groups", &self.groups)
+            .field("email", &self.email)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// What the browser is sent to the provider with, and what must be kept until
@@ -276,6 +308,21 @@ impl OidcProviders {
             .map(|provider| provider.id.as_str())
     }
 
+    /// The provider that issued `token` (by its unverified `iss`) when it
+    /// accepts access tokens. Only picks who must verify the token: nothing
+    /// here is trusted until [`Provider::verify_access_token`] has run.
+    #[must_use]
+    pub fn access_token_provider(&self, token: &str) -> Option<&Provider> {
+        #[derive(Deserialize)]
+        struct Unverified {
+            iss: String,
+        }
+        let Unverified { iss } = jsonwebtoken::dangerous::insecure_decode_claims(token).ok()?;
+        self.providers
+            .iter()
+            .find(|provider| provider.accept_access_tokens && provider.issuer == iss)
+    }
+
     /// The providers in config order.
     pub fn iter(&self) -> impl Iterator<Item = &Provider> {
         self.providers.iter()
@@ -294,6 +341,8 @@ pub struct Provider {
     groups_claim: String,
     allowed_email_domains: Vec<String>,
     admin_groups: Vec<String>,
+    accept_access_tokens: bool,
+    access_token_audience: String,
     http: reqwest::Client,
     discovery: RwLock<Option<Arc<Discovery>>>,
 }
@@ -355,6 +404,8 @@ impl Provider {
             groups_claim: config.groups_claim.clone(),
             allowed_email_domains: config.allowed_email_domains.clone(),
             admin_groups: config.admin_groups.clone(),
+            accept_access_tokens: config.accept_access_tokens,
+            access_token_audience: config.access_token_audience().to_owned(),
             http,
             discovery: RwLock::new(None),
         })
@@ -370,6 +421,59 @@ impl Provider {
     #[must_use]
     pub fn display_name(&self) -> &str {
         &self.display_name
+    }
+
+    /// The issuer, as configured.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Whether JWT access tokens of this provider are accepted as bearer tokens.
+    #[must_use]
+    pub fn accepts_access_tokens(&self) -> bool {
+        self.accept_access_tokens
+    }
+
+    /// Verifies a JWT access token this provider issued for this gateway (as
+    /// [`verify_access_jwt`] says) against the cached keys, fetched again once
+    /// for a key the cache does not know yet, like [`Self::verify`].
+    ///
+    /// # Errors
+    /// [`OidcError::Expired`] for a token that only fails on `exp`,
+    /// [`OidcError::Rejected`] for any other refusal and
+    /// [`OidcError::Provider`] when discovery or the key fetch fails.
+    pub async fn verify_access_token(&self, token: &str) -> Result<AccessTokenClaims, OidcError> {
+        let discovery = self.discovery().await?;
+        let expected = AccessExpected {
+            issuer: &self.issuer,
+            audience: &self.access_token_audience,
+            algorithms: &discovery.algorithms,
+        };
+        let now = unix_now();
+        let first = verify_access_jwt(token, &discovery.keys.read().await.set, &expected, now);
+        let result = if matches!(first, Err(Rejection::UnknownKey)) {
+            discovery
+                .refresh_keys(&self.id, &self.http)
+                .await
+                .map_err(|error| self.error(error))?;
+            verify_access_jwt(token, &discovery.keys.read().await.set, &expected, now)
+        } else {
+            first
+        };
+        let verified = result.map_err(|error| match error {
+            Rejection::Expired => OidcError::Expired,
+            other => OidcError::Rejected(other.to_string()),
+        })?;
+        Ok(AccessTokenClaims {
+            issuer: verified.iss,
+            subject: verified.sub,
+            groups: claim_at(&verified.extra, &self.groups_claim)
+                .is_some()
+                .then(|| groups_from(&verified.extra, &self.groups_claim)),
+            email: verified.email,
+            token: token.to_owned(),
+        })
     }
 
     fn error(&self, message: String) -> OidcError {
@@ -719,9 +823,37 @@ enum Rejection {
     /// It names a key the key set does not have (yet).
     #[error("signed with a key the provider does not publish")]
     UnknownKey,
+    /// An access token past its `exp` (and the leeway).
+    #[error("expired")]
+    Expired,
     /// Anything else.
     #[error("{0}")]
     Invalid(String),
+}
+
+/// What an access token has to match besides its signature.
+struct AccessExpected<'a> {
+    issuer: &'a str,
+    audience: &'a str,
+    algorithms: &'a [Algorithm],
+}
+
+/// The access token claims that are checked or kept.
+#[derive(Debug, Deserialize)]
+struct AccessTokenJwt {
+    iss: String,
+    sub: String,
+    exp: u64,
+    iat: Option<u64>,
+    nbf: Option<u64>,
+    /// Only present in an ID token.
+    nonce: Option<Value>,
+    /// Keycloak marks its ID tokens `"ID"` here.
+    typ: Option<Value>,
+    email: Option<String>,
+    /// Every other claim, for the groups.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 /// Validates an ID token from the token endpoint as OIDC Core 3.1.3.7 asks:
@@ -735,27 +867,9 @@ fn verify_id_token(
     expected: &Expected<'_>,
     now: u64,
 ) -> Result<IdTokenClaims, Rejection> {
-    let header = jsonwebtoken::decode_header(token)
-        .map_err(|error| Rejection::Invalid(format!("malformed: {error}")))?;
-    if !expected.algorithms.contains(&header.alg) {
-        return Err(Rejection::Invalid(format!(
-            "algorithm {:?} is not accepted",
-            header.alg
-        )));
-    }
-    let jwk = signing_key(keys, header.kid.as_deref())?;
-    if let Some(key_alg) = &jwk.common.key_algorithm
-        && key_alg.to_string().parse::<Algorithm>().ok() != Some(header.alg)
-    {
-        return Err(Rejection::Invalid(format!(
-            "the key is for {key_alg}, the token says {:?}",
-            header.alg
-        )));
-    }
-    let key = DecodingKey::from_jwk(jwk)
-        .map_err(|error| Rejection::Invalid(format!("unusable key: {error}")))?;
+    let (alg, key) = decoding_key(token, keys, expected.algorithms)?;
 
-    let mut validation = Validation::new(header.alg);
+    let mut validation = Validation::new(alg);
     validation.set_issuer(&[expected.issuer]);
     validation.set_audience(&[expected.client_id]);
     validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
@@ -799,6 +913,92 @@ fn verify_id_token(
     Ok(claims)
 }
 
+/// The algorithm of `token`, if one of `algorithms`, and the key of `keys` that
+/// it names, which must be for that algorithm when it says so.
+fn decoding_key(
+    token: &str,
+    keys: &JwkSet,
+    algorithms: &[Algorithm],
+) -> Result<(Algorithm, DecodingKey), Rejection> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|error| Rejection::Invalid(format!("malformed: {error}")))?;
+    if !algorithms.contains(&header.alg) {
+        return Err(Rejection::Invalid(format!(
+            "algorithm {:?} is not accepted",
+            header.alg
+        )));
+    }
+    let jwk = signing_key(keys, header.kid.as_deref())?;
+    if let Some(key_alg) = &jwk.common.key_algorithm
+        && key_alg.to_string().parse::<Algorithm>().ok() != Some(header.alg)
+    {
+        return Err(Rejection::Invalid(format!(
+            "the key is for {key_alg}, the token says {:?}",
+            header.alg
+        )));
+    }
+    let key = DecodingKey::from_jwk(jwk)
+        .map_err(|error| Rejection::Invalid(format!("unusable key: {error}")))?;
+    Ok((header.alg, key))
+}
+
+/// Validates a JWT access token the way RFC 9068 and RFC 8725 ask, with the
+/// same algorithm rules as [`verify_id_token`]: an accepted asymmetric
+/// algorithm, a signature by one of the provider's `keys`, the issuer in
+/// `iss`, the configured audience in `aud` (a string or an array), a `sub`, an
+/// `exp` that has not passed and an `iat` and `nbf` that are not in the future
+/// at `now` (Unix seconds, give or take [`LEEWAY_SECS`]). A token that carries
+/// a `nonce` or has the type `ID` is an ID token, which is refused.
+fn verify_access_jwt(
+    token: &str,
+    keys: &JwkSet,
+    expected: &AccessExpected<'_>,
+    now: u64,
+) -> Result<AccessTokenJwt, Rejection> {
+    let (alg, key) = decoding_key(token, keys, expected.algorithms)?;
+
+    let mut validation = Validation::new(alg);
+    validation.set_issuer(&[expected.issuer]);
+    validation.set_audience(&[expected.audience]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    // Time claims are checked below against `now`, as for ID tokens.
+    validation.validate_exp = false;
+    validation.validate_nbf = false;
+    let claims = jsonwebtoken::decode::<AccessTokenJwt>(token, &key, &validation)
+        .map_err(|error| Rejection::Invalid(error.to_string()))?
+        .claims;
+
+    if claims.exp.saturating_add(LEEWAY_SECS) < now {
+        return Err(Rejection::Expired);
+    }
+    if claims
+        .iat
+        .is_some_and(|iat| iat > now.saturating_add(LEEWAY_SECS))
+    {
+        return Err(Rejection::Invalid("issued in the future".to_owned()));
+    }
+    if claims
+        .nbf
+        .is_some_and(|nbf| nbf > now.saturating_add(LEEWAY_SECS))
+    {
+        return Err(Rejection::Invalid("not valid yet (nbf)".to_owned()));
+    }
+    if claims.sub.is_empty() {
+        return Err(Rejection::Invalid("the subject is empty".to_owned()));
+    }
+    let id_type = claims
+        .typ
+        .as_ref()
+        .and_then(Value::as_str)
+        .is_some_and(|typ| typ.eq_ignore_ascii_case("ID"));
+    if claims.nonce.as_ref().is_some_and(|nonce| !nonce.is_null()) || id_type {
+        return Err(Rejection::Invalid(
+            "this is an ID token, not an access token".to_owned(),
+        ));
+    }
+    Ok(claims)
+}
+
 /// The signing key `kid` names, or the only one when the token names none.
 /// Keys published for encryption only are passed over.
 fn signing_key<'k>(keys: &'k JwkSet, kid: Option<&str>) -> Result<&'k Jwk, Rejection> {
@@ -822,21 +1022,26 @@ fn signing_key<'k>(keys: &'k JwkSet, kid: Option<&str>) -> Result<&'k Jwk, Rejec
     }
 }
 
-/// The groups in the claim at the dotted `path` (`groups`,
-/// `realm_access.roles`): an array of strings (anything else in it is
-/// ignored) or a single string. Empty when the claim is missing or of another
-/// type. A claim whose own name contains dots (a URL, say) is found as is
-/// before the path is split.
-fn groups_from(claims: &Map<String, Value>, path: &str) -> Vec<String> {
-    let value = claims.get(path).or_else(|| {
+/// The claim at the dotted `path`; a claim whose own name contains dots is
+/// found as is before the path is split.
+fn claim_at<'a>(claims: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    claims.get(path).or_else(|| {
         let mut parts = path.split('.');
         let mut current = claims.get(parts.next()?)?;
         for part in parts {
             current = current.as_object()?.get(part)?;
         }
         Some(current)
-    });
-    match value {
+    })
+}
+
+/// The groups in the claim at the dotted `path` (`groups`,
+/// `realm_access.roles`): an array of strings (anything else in it is
+/// ignored) or a single string. Empty when the claim is missing or of another
+/// type. A claim whose own name contains dots (a URL, say) is found as is
+/// before the path is split.
+fn groups_from(claims: &Map<String, Value>, path: &str) -> Vec<String> {
+    match claim_at(claims, path) {
         Some(Value::Array(items)) => items
             .iter()
             .filter_map(Value::as_str)
@@ -1421,6 +1626,8 @@ mod tests {
             groups_claim: "groups".to_owned(),
             allowed_email_domains: Vec::new(),
             admin_groups: Vec::new(),
+            accept_access_tokens: false,
+            access_token_audience: None,
         }
     }
 
@@ -1677,5 +1884,206 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    /// The claims of a good access token: [`claims`] without the nonce.
+    fn access_claims_with(changes: &Value) -> Value {
+        let mut claims = claims_with(&json!({"nonce": null, "groups": ["ops"]}));
+        let map = claims.as_object_mut().unwrap();
+        for (name, value) in changes.as_object().unwrap() {
+            if value.is_null() {
+                map.remove(name);
+            } else {
+                map.insert(name.clone(), value.clone());
+            }
+        }
+        claims
+    }
+
+    fn verify_access(token: &str, keys: &JwkSet) -> Result<AccessTokenJwt, Rejection> {
+        let expected = AccessExpected {
+            issuer: ISSUER,
+            audience: CLIENT,
+            algorithms: &ALGORITHMS,
+        };
+        verify_access_jwt(token, keys, &expected, NOW)
+    }
+
+    /// Why an access token is refused; fails the test if it is accepted.
+    fn access_refusal(changes: &Value) -> Rejection {
+        let key = Key::rsa("k1");
+        let token = key.token(&access_claims_with(changes));
+        verify_access(&token, &jwks(&[&key])).expect_err("the token should be refused")
+    }
+
+    #[test]
+    fn a_good_access_token_gives_the_claims() {
+        let key = Key::rsa("k1");
+        let token = key.token(&access_claims_with(&json!({})));
+        let verified = verify_access(&token, &jwks(&[&key])).unwrap();
+        assert_eq!(verified.iss, ISSUER);
+        assert_eq!(verified.sub, "user-1");
+        assert_eq!(verified.email.as_deref(), Some("ada@example.com"));
+        assert_eq!(groups_from(&verified.extra, "groups"), ["ops"]);
+    }
+
+    #[test]
+    fn an_access_token_with_the_audience_in_an_array_passes() {
+        let key = Key::ec("k1");
+        let token = key.token(&access_claims_with(&json!({"aud": ["other", CLIENT]})));
+        assert!(verify_access(&token, &jwks(&[&key])).is_ok());
+    }
+
+    #[test]
+    fn an_access_token_for_another_audience_is_refused() {
+        assert!(matches!(
+            access_refusal(&json!({"aud": "someone-else"})),
+            Rejection::Invalid(why) if why.contains("Audience")
+        ));
+        assert!(matches!(
+            access_refusal(&json!({"aud": null})),
+            Rejection::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn an_expired_access_token_is_refused_after_the_leeway() {
+        assert_eq!(
+            access_refusal(&json!({"exp": NOW - LEEWAY_SECS - 1})),
+            Rejection::Expired
+        );
+        let key = Key::rsa("k1");
+        let token = key.token(&access_claims_with(&json!({"exp": NOW - LEEWAY_SECS})));
+        assert!(verify_access(&token, &jwks(&[&key])).is_ok());
+        assert!(matches!(
+            access_refusal(&json!({"exp": null})),
+            Rejection::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn an_access_token_from_the_future_is_refused() {
+        assert!(matches!(
+            access_refusal(&json!({"nbf": NOW + LEEWAY_SECS + 1})),
+            Rejection::Invalid(why) if why.contains("nbf")
+        ));
+        assert!(matches!(
+            access_refusal(&json!({"iat": NOW + LEEWAY_SECS + 1})),
+            Rejection::Invalid(why) if why.contains("future")
+        ));
+    }
+
+    #[test]
+    fn an_access_token_from_another_issuer_is_refused() {
+        assert!(matches!(
+            access_refusal(&json!({"iss": "https://evil.example.com"})),
+            Rejection::Invalid(why) if why.contains("Issuer")
+        ));
+    }
+
+    #[test]
+    fn an_access_token_needs_a_subject() {
+        assert!(matches!(
+            access_refusal(&json!({"sub": null})),
+            Rejection::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn an_id_token_is_not_an_access_token() {
+        assert!(matches!(
+            access_refusal(&json!({"nonce": NONCE})),
+            Rejection::Invalid(why) if why.contains("ID token")
+        ));
+        for typ in ["ID", "id"] {
+            assert!(
+                matches!(
+                    access_refusal(&json!({"typ": typ})),
+                    Rejection::Invalid(why) if why.contains("ID token")
+                ),
+                "{typ}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_access_token_signed_with_an_unknown_key_asks_for_fresh_keys() {
+        let (known, rotated) = (Key::rsa("k1"), Key::rsa("k2"));
+        let token = rotated.token(&access_claims_with(&json!({})));
+        assert_eq!(
+            verify_access(&token, &jwks(&[&known])).unwrap_err(),
+            Rejection::UnknownKey
+        );
+    }
+
+    #[test]
+    fn only_a_provider_that_accepts_access_tokens_and_issued_the_token_is_picked() {
+        let key = Key::rsa("k1");
+        let token = key.token(&access_claims_with(&json!({})));
+        let mut config = config_for(ISSUER);
+
+        assert!(
+            providers_for(&config)
+                .access_token_provider(&token)
+                .is_none()
+        );
+
+        config.accept_access_tokens = true;
+        let providers = providers_for(&config);
+        assert_eq!(
+            providers.access_token_provider(&token).map(Provider::id),
+            Some("test")
+        );
+
+        // another issuer, and things that are not JWTs at all
+        let foreign = key.token(&access_claims_with(
+            &json!({"iss": "https://other.example"}),
+        ));
+        assert!(providers.access_token_provider(&foreign).is_none());
+        for junk in ["", "axon_legacy_secret", "a.b.c", "e30.e30.e30"] {
+            assert!(providers.access_token_provider(junk).is_none(), "{junk}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_access_token_is_verified_against_the_provider() {
+        let key = Key::rsa("k1");
+        let (issuer, _fake) = fake_provider(&[&key]).await;
+        let mut config = config_for(&issuer);
+        config.accept_access_tokens = true;
+        let providers = providers_for(&config);
+        let provider = providers.get("test").unwrap();
+        assert_eq!(provider.issuer(), issuer);
+
+        let now = unix_now();
+        let fresh = json!({"iss": issuer, "exp": now + 300, "iat": now});
+        let token = key.token(&access_claims_with(&fresh));
+        let claims = provider.verify_access_token(&token).await.unwrap();
+        assert_eq!(claims.issuer, issuer);
+        assert_eq!(claims.subject, "user-1");
+        assert_eq!(claims.email.as_deref(), Some("ada@example.com"));
+        assert_eq!(claims.groups, Some(vec!["ops".to_owned()]));
+        assert_eq!(claims.token, token);
+        assert!(!format!("{claims:?}").contains(&token));
+
+        // no groups claim at all is not the same as an empty one
+        let without = json!({"iss": issuer, "exp": now + 300, "iat": now, "groups": null});
+        let token = key.token(&access_claims_with(&without));
+        let claims = provider.verify_access_token(&token).await.unwrap();
+        assert_eq!(claims.groups, None);
+
+        let expired = json!({"iss": issuer, "exp": now - 600, "iat": now - 900});
+        let token = key.token(&access_claims_with(&expired));
+        assert!(matches!(
+            provider.verify_access_token(&token).await,
+            Err(OidcError::Expired)
+        ));
+
+        let wrong_audience = json!({"iss": issuer, "exp": now + 300, "aud": "other"});
+        let token = key.token(&access_claims_with(&wrong_audience));
+        assert!(matches!(
+            provider.verify_access_token(&token).await,
+            Err(OidcError::Rejected(_))
+        ));
     }
 }

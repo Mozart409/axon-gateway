@@ -166,6 +166,7 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         .route("/api/v1/users/{id}", patch(handle_update_user))
         .route("/api/v1/audit", get(handle_list_audit))
         .merge(super::tokens_api::routes())
+        .merge(super::oauth_api::routes())
         .merge(super::personal_api::routes())
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(

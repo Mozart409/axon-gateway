@@ -20,6 +20,9 @@
 //!   accounts and their tokens (multi-user mode only)
 //! - GET /auth/login, /auth/login/{id}, /auth/callback, POST /auth/logout - OIDC
 //!   dashboard login (only with `[auth.oidc]` and `[database]`)
+//! - /.well-known/oauth-protected-resource, /.well-known/oauth-authorization-server and
+//!   /oauth/{register,authorize,token,revoke} - the OAuth authorization server for MCP
+//!   clients; GET /ui/me/apps lists a user's connected apps (multi-user mode only)
 //! - /api/v1/... - JSON admin API for RBAC, personal access tokens and service accounts
 //!   (session login; multi-user mode only)
 //! - GET /status/toolsets - List toolsets (`/status/groups` is a deprecated alias)
@@ -28,7 +31,8 @@
 //! HTML rendering lives in the [`views`] submodule (`admin_views` for the admin
 //! pages). Handlers live in `ui`, `mcp` (the MCP handler behind rmcp's transport) and `api`, the admin
 //! JSON API in
-//! `admin_api` (token routes in `tokens_api`), the admin pages in `admin_ui` (token pages in
+//! `admin_api` (token routes in `tokens_api`, grant routes in `oauth_api`), the OAuth server in
+//! `oauth` (consent pages in `oauth_ui` and `oauth_views`), the admin pages in `admin_ui` (token pages in
 //! `tokens_ui` and `tokens_views`), token checks in `auth`, the
 //! dashboard login in `session`; this module owns the shared state, routing, middleware, and server lifecycle.
 
@@ -67,6 +71,10 @@ mod auth;
 mod break_glass;
 mod mcp;
 mod mcp_sessions;
+mod oauth;
+mod oauth_api;
+mod oauth_ui;
+mod oauth_views;
 mod personal_api;
 mod personal_ui;
 mod personal_views;
@@ -173,6 +181,7 @@ fn ui_action_routes(state: &AppState) -> Router<AppState> {
         )
         .merge(admin_ui::action_routes())
         .merge(tokens_ui::action_routes())
+        .merge(oauth_ui::action_routes())
         .merge(audit_ui::action_routes())
         .route_layer(middleware::from_fn(session::require_csrf))
         .route_layer(middleware::from_fn_with_state(
@@ -213,6 +222,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ui/partials/backends", get(ui::handle_ui_backends_partial))
         .merge(admin_ui::page_routes())
         .merge(tokens_ui::page_routes())
+        .merge(oauth_ui::page_routes())
         .merge(audit_ui::page_routes())
         .merge(ui_actions)
         .route_layer(middleware::from_fn_with_state(
@@ -248,6 +258,9 @@ pub fn create_router(state: AppState) -> Router {
         .merge(ui_routes)
         // Dashboard login
         .merge(auth_routes)
+        // MCP OAuth authorization server (multi-user mode only)
+        .merge(oauth::routes(&state))
+        .merge(oauth_ui::consent_routes(&state))
         .merge(break_glass::routes())
         // JSON admin API
         .merge(admin_api::router(state.clone()))

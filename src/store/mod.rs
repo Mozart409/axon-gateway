@@ -13,6 +13,8 @@ use thiserror::Error;
 mod audit;
 mod auth;
 mod break_glass;
+mod jwt_bindings;
+mod oauth;
 mod personal;
 mod rbac;
 mod replica;
@@ -24,6 +26,11 @@ mod views;
 
 pub use auth::{LoginUser, OidcFlow, SESSION_MAX_AGE, SessionUser, User};
 pub use break_glass::{BREAK_GLASS_CODE_TTL, BREAK_GLASS_SESSION_MAX_AGE};
+pub use jwt_bindings::{JwtBinding, JwtBindingError, JwtSubject};
+pub use oauth::{
+    ACCESS_TOKEN_TTL, AccessLookup, AuthRequest, CodeRedemption, IssuedOauthTokens, NewAuthRequest,
+    NewCode, NewOauthClient, OAUTH_ACCESS_PREFIX, OauthClient, OauthGrant,
+};
 pub use personal::{
     AdminPersonalBackend, CatalogEntry, CatalogEntryUpdate, NewCatalogEntry, NewPersonalBackend,
     PersonalBackend, PersonalBackendUpdate, PersonalError, SealedColumns, UserCredential,

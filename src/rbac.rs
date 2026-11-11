@@ -23,8 +23,9 @@ use crate::policy::{
 use crate::principal::TokenScope;
 use crate::server::AppState;
 use crate::store::{
-    Actor, ApiToken, AuditRecord, DEFAULT_TOKEN_LIFETIME, IssuedToken, NewToken, NewToolset,
-    ServiceAccount, SessionUser, Store, StoreError, TokenError, Toolset, ToolsetError, User,
+    Actor, ApiToken, AuditRecord, DEFAULT_TOKEN_LIFETIME, IssuedToken, JwtBinding, JwtBindingError,
+    NewToken, NewToolset, ServiceAccount, SessionUser, Store, StoreError, TokenError, Toolset,
+    ToolsetError, User,
 };
 
 /// How often the policy is re-read from the database, so that changes made
@@ -33,6 +34,9 @@ pub const POLICY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Longest group description, in characters.
 const MAX_DESCRIPTION_CHARS: usize = 500;
+
+/// Longest `IdP` subject of a JWT binding, in characters.
+const MAX_JWT_SUBJECT_CHARS: usize = 255;
 
 /// Most backends or tool globs one toolset holds.
 const MAX_TOOLSET_LIST_ENTRIES: usize = 100;
@@ -173,6 +177,17 @@ impl From<ToolsetError> for AdminError {
             ToolsetError::NameTaken | ToolsetError::Pinned => Self::Conflict(error.to_string()),
             ToolsetError::Store(error) => Self::Store(error),
             ToolsetError::Query(error) => Self::Store(StoreError::Query(error)),
+        }
+    }
+}
+
+impl From<JwtBindingError> for AdminError {
+    fn from(error: JwtBindingError) -> Self {
+        match error {
+            JwtBindingError::UnknownServiceAccount => Self::NotFound,
+            JwtBindingError::AlreadyBound => Self::Conflict(error.to_string()),
+            JwtBindingError::Store(error) => Self::Store(error),
+            JwtBindingError::Query(error) => Self::Store(StoreError::Query(error)),
         }
     }
 }
@@ -1130,6 +1145,63 @@ impl Admin<'_> {
         if !self
             .store
             .revoke_token(&self.actor, Some(id), token_id)
+            .await?
+        {
+            return Err(AdminError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// The `IdP` subjects bound to a service account.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown id.
+    pub async fn jwt_bindings(&self, id: Uuid) -> Result<Vec<JwtBinding>, AdminError> {
+        self.account(id).await?;
+        Ok(self.store.list_jwt_bindings(id).await?)
+    }
+
+    /// Binds an `IdP` subject to a service account, so a JWT access token for it
+    /// acts as the account. The caller checks that the issuer accepts access tokens.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown
+    /// account, invalid for an empty or overlong issuer or subject, conflict
+    /// when the subject is bound already.
+    pub async fn create_jwt_binding(
+        &self,
+        id: Uuid,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<JwtBinding, AdminError> {
+        self.account(id).await?;
+        let (issuer, subject) = (issuer.trim(), subject.trim());
+        if issuer.is_empty() || subject.is_empty() {
+            return Err(AdminError::Invalid(
+                "the issuer and the subject must not be empty".to_owned(),
+            ));
+        }
+        if subject.chars().count() > MAX_JWT_SUBJECT_CHARS {
+            return Err(AdminError::Invalid(format!(
+                "the subject is longer than {MAX_JWT_SUBJECT_CHARS} characters"
+            )));
+        }
+        Ok(self
+            .store
+            .create_jwt_binding(&self.actor, id, issuer, subject)
+            .await?)
+    }
+
+    /// Removes a binding of a service account.
+    ///
+    /// # Errors
+    /// Forbidden without `service_accounts.manage`, not found for an unknown
+    /// account or a binding that is not one of its.
+    pub async fn delete_jwt_binding(&self, id: Uuid, binding_id: Uuid) -> Result<(), AdminError> {
+        self.account(id).await?;
+        if !self
+            .store
+            .delete_jwt_binding(&self.actor, id, binding_id)
             .await?
         {
             return Err(AdminError::NotFound);

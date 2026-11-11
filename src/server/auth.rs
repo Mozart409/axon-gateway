@@ -13,9 +13,10 @@ use uuid::Uuid;
 use super::AppState;
 use crate::auth::{AuthError, TokenIdentity};
 use crate::gateway::Caller;
+use crate::oidc::{OidcError, Provider};
 use crate::policy::OptOuts;
 use crate::principal::{PrincipalPolicy, TokenScope};
-use crate::store::{PAT_PREFIX, Store, StoreError};
+use crate::store::{JwtSubject, PAT_PREFIX, Store, StoreError};
 
 /// 401 with the `WWW-Authenticate` challenge.
 fn unauthorized() -> Response {
@@ -82,7 +83,9 @@ fn select_client_ip(peer: Option<IpAddr>, forwarded_for: &str) -> Option<String>
 ///
 /// A bearer token with the personal access token prefix (multi-user mode only)
 /// becomes a [`Caller::Principal`]: its owner's policy, narrowed by the token
-/// scope and the owner's opt-outs. Anything else goes through the legacy
+/// scope and the owner's opt-outs. So does a JWT access token of an OIDC provider that
+/// accepts them (resource-server mode), as the user or bound service account it names,
+/// with no narrowing. Anything else goes through the legacy
 /// [`AuthManager`](crate::auth::AuthManager). Standalone, a named `[[tokens]]`
 /// entry is a [`Caller::Token`], the shared token or no auth at all is
 /// [`Caller::Open`]. In multi-user mode a `[[tokens]]` entry is a config service
@@ -103,6 +106,18 @@ pub(super) async fn authenticate(
 
     if provided_token.starts_with(PAT_PREFIX) {
         return authenticate_pat(provided_token, state, client_ip).await;
+    }
+
+    if provided_token.starts_with(crate::store::OAUTH_ACCESS_PREFIX) {
+        return super::oauth::authenticate_oauth_token(provided_token, state, client_ip).await;
+    }
+
+    // A JWT of no accepting provider is not ours: it may be a legacy token
+    if let Some((_, oidc)) = state.multi_user()
+        && looks_like_jwt(provided_token)
+        && let Some(provider) = oidc.access_token_provider(provided_token)
+    {
+        return authenticate_jwt(provided_token, provider, state).await;
     }
 
     let auth_manager = state.auth_manager.load();
@@ -279,6 +294,98 @@ async fn authenticate_pat(
     Ok(Caller::Principal(caller))
 }
 
+/// Three non-empty base64url parts, which is all a JWT has to look like
+fn looks_like_jwt(token: &str) -> bool {
+    let mut parts = token.split('.');
+    let base64url = |part: Option<&str>| {
+        part.is_some_and(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+    };
+    base64url(parts.next())
+        && base64url(parts.next())
+        && base64url(parts.next())
+        && parts.next().is_none()
+}
+
+/// A JWT access token of `provider`, acting as the bound service account or as the user
+/// with that issuer and subject. The token's groups replace the stored ones when it has
+/// any. Not narrowed: the caller has the policy of the principal it acts as.
+async fn authenticate_jwt(
+    token: &str,
+    provider: &Provider,
+    state: &AppState,
+) -> Result<Caller, Box<Response>> {
+    let Some((store, _)) = state.multi_user() else {
+        return Err(Box::new(unauthorized()));
+    };
+    let claims = match provider.verify_access_token(token).await {
+        Ok(claims) => claims,
+        Err(OidcError::Expired) => {
+            crate::metrics::record_authn("jwt", "expired");
+            return Err(Box::new(unauthorized()));
+        }
+        Err(error) => {
+            tracing::info!(provider = provider.id(), %error, "A JWT access token was refused");
+            crate::metrics::record_authn("jwt", "invalid");
+            return Err(Box::new(unauthorized()));
+        }
+    };
+    let subject = match store
+        .resolve_jwt_subject(provider.issuer(), &claims.subject)
+        .await
+    {
+        Ok(Some(subject)) => subject,
+        Ok(None) => {
+            crate::metrics::record_authn("jwt", "invalid");
+            return Err(Box::new(unauthorized()));
+        }
+        Err(error) => return Err(Box::new(unavailable(&error))),
+    };
+    let (owner, is_service_account) = match subject {
+        JwtSubject::ServiceAccount(owner) => (owner, true),
+        JwtSubject::User(owner) => (owner, false),
+    };
+    within_rate_limit(
+        store,
+        "jwt",
+        &format!("jwt:{}", owner.id),
+        state.auth_manager.load().effective_limit(0),
+    )
+    .await?;
+
+    crate::metrics::record_authn("jwt", "ok");
+
+    let policy = state.policy.current();
+    let groups = if is_service_account {
+        policy.groups_for_service_account(owner.id, &owner.subject)
+    } else {
+        let claim_groups = claims.groups.as_ref().unwrap_or(&owner.groups);
+        policy.groups_for(owner.id, provider.id(), claim_groups)
+    };
+    let opt_outs = opt_outs(store, owner.id).await?;
+
+    let owner_label = owner
+        .email
+        .clone()
+        .or_else(|| owner.display_name.clone())
+        .unwrap_or_else(|| owner.id.to_string());
+    let mut caller = PrincipalPolicy::new(
+        format!("{owner_label} / jwt"),
+        policy.effective(&groups),
+        opt_outs,
+        TokenScope::default(),
+    )
+    .with_identity(Some(owner.id), None);
+    if is_service_account {
+        caller = caller.with_service_account();
+    }
+    Ok(Caller::Principal(caller))
+}
+
 async fn opt_outs(store: &Store, user_id: Uuid) -> Result<OptOuts, Box<Response>> {
     store
         .opt_outs(user_id)
@@ -300,6 +407,24 @@ mod tests {
 
     fn ip(text: &str) -> Option<IpAddr> {
         text.parse().ok()
+    }
+
+    #[test]
+    fn a_jwt_has_three_base64url_parts() {
+        assert!(looks_like_jwt(
+            "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln-_"
+        ));
+        for other in [
+            "",
+            "a.b",
+            "a.b.c.d",
+            "a..c",
+            "axon_pat_x",
+            "a.b.c=",
+            "a b.c.d",
+        ] {
+            assert!(!looks_like_jwt(other), "{other:?}");
+        }
     }
 
     #[test]

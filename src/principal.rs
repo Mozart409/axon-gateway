@@ -46,6 +46,9 @@ pub struct PrincipalPolicy {
     token_id: Option<Uuid>,
     /// A service account: a config `[[tokens]]` account or a service account's token
     service: bool,
+    /// The MCP endpoint URL an OAuth access token was issued for (RFC 8707); `None` for
+    /// every other kind of caller
+    resource: Option<String>,
 }
 
 impl PrincipalPolicy {
@@ -65,6 +68,7 @@ impl PrincipalPolicy {
             owner_id: None,
             token_id: None,
             service: false,
+            resource: None,
         }
     }
 
@@ -88,6 +92,19 @@ impl PrincipalPolicy {
     pub fn with_service_account(mut self) -> Self {
         self.service = true;
         self
+    }
+
+    /// Bind the caller to the MCP endpoint its OAuth access token was issued for
+    #[must_use]
+    pub fn with_resource(mut self, resource: String) -> Self {
+        self.resource = Some(resource);
+        self
+    }
+
+    /// The MCP endpoint URL the caller's token is bound to; `None` when it is not an OAuth
+    /// access token
+    pub fn resource(&self) -> Option<&str> {
+        self.resource.as_deref()
     }
 
     /// The owning user; `None` for a config `[[tokens]]` principal

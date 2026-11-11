@@ -39,6 +39,7 @@ use uuid::Uuid;
 use super::AppState;
 use super::auth::{ClientIp, authenticate};
 use super::mcp_sessions::{PgSessionStore, SessionOwners, session_owner};
+use super::oauth;
 use crate::audit::{CallOutcome, ToolCallEvent};
 use crate::auth::AuthManager;
 use crate::gateway::{Caller, DescribeTool, HandleRequest, HandleToolsetRequest};
@@ -119,10 +120,16 @@ pub(super) async fn authenticate_mcp(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_owned();
     let caller = match authenticate(request.headers(), &state, client_ip.as_deref()).await {
+        // A 401 tells an OAuth client where to find the authorization server
         Ok(caller) => caller,
-        Err(response) => return *response,
+        Err(response) => return oauth::with_challenge(*response, &state, &path),
     };
+    // An OAuth access token is for the endpoint it was issued for
+    if let Some(response) = oauth::refuse_wrong_audience(&caller, &state, &path) {
+        return response;
+    }
     let mcp_method = request
         .headers()
         .get("mcp-method")

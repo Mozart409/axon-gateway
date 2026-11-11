@@ -34,13 +34,13 @@ pub const MAX_SERVICE_TOKEN_LIFETIME: Duration = Duration::from_hours(365 * 24);
 /// A user's tokens stop working when they have not logged in for this long
 pub const INACTIVE_OWNER_SUSPEND: Duration = Duration::from_hours(90 * 24);
 /// `last_used_at` is updated at most this often
-const TOKEN_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+pub(super) const TOKEN_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 /// The `issuer` of every service account
 const SERVICE_ISSUER: &str = "axon:service-account";
 /// Characters in the public id (8 random bytes, hex encoded)
-const PUBLIC_ID_LEN: usize = 16;
+pub(super) const PUBLIC_ID_LEN: usize = 16;
 /// Characters in the secret (32 random bytes, hex encoded)
-const SECRET_LEN: usize = 64;
+pub(super) const SECRET_LEN: usize = 64;
 /// Longest accepted token name, in characters
 const MAX_NAME_CHARS: usize = 100;
 
@@ -173,7 +173,7 @@ fn parse_pat(plaintext: &str) -> Option<(&str, &str)> {
     .then_some((public_id, secret))
 }
 
-fn is_lower_hex(text: &str) -> bool {
+pub(super) fn is_lower_hex(text: &str) -> bool {
     text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -183,7 +183,7 @@ pub(super) fn hash_secret(secret: &str) -> Vec<u8> {
 }
 
 /// `N` random bytes, hex encoded
-fn random_hex<const N: usize>() -> Result<String, StoreError> {
+pub(super) fn random_hex<const N: usize>() -> Result<String, StoreError> {
     let mut raw = [0_u8; N];
     getrandom::fill(&mut raw).map_err(|error| StoreError::Random(error.to_string()))?;
     Ok(hex::encode(raw))

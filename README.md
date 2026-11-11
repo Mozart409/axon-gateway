@@ -696,6 +696,102 @@ Creating the link (`break_glass.link_created`) and using it
 on `/ui/admin/users`. `--config` defaults to `AXON_GATEWAY_CONFIG`, then
 `config.toml`.
 
+### Resource-server mode (IdP access tokens)
+
+An agent that already holds a JWT access token from the identity provider (a
+client-credentials token, or a user's token from another app) can call `/mcp`
+with it as a bearer token, so it needs no PAT. Turn it on per provider:
+
+```toml
+[[auth.oidc]]
+id = "pocket"
+issuer = "https://id.example.com"
+client_id = "axon"
+accept_access_tokens = true          # default false
+# access_token_audience = "api://axon"   # default: client_id
+```
+
+The gateway verifies the signature against the provider's JWKS (asymmetric
+algorithms the provider advertises only, keys fetched again on an unknown
+`kid`), then `iss` (exactly the configured issuer), `aud` (a string or an array
+that holds the audience), `exp` (required) and `nbf`/`iat`, with 60 seconds of
+clock leeway. A token with a `nonce` claim or the type `ID` is an ID token and
+is refused, so the token of a dashboard login cannot be replayed as a bearer
+token. Any failure answers 401. The `[database]` every provider needs also
+stores the users and bindings below.
+
+The default audience is the provider's `client_id`. Entra ID v2 access tokens
+carry the application id of the API as `aud`, so use the same app registration
+as the dashboard login, and under "Expose an API" give it an application ID URI
+and a scope; clients then request that scope. Other providers need a client
+or resource whose tokens name `client_id` (or whatever
+`access_token_audience` says) in `aud`.
+
+Who the token acts as is decided by its `iss` and `sub`:
+
+1. a **service account** bound to that issuer and subject, with the policy of
+   the account (its group memberships); else
+2. the **user** with that issuer and subject, who must have logged in to the
+   dashboard once, with the policy of that user. The groups claim of the token
+   (`groups_claim`) replaces the groups stored at the last login when the token
+   has one; without it the stored groups apply.
+
+Nothing else matches: an unknown subject, a disabled user or service account,
+or a user who has not logged in for 90 days answers 401. The token is not
+narrowed by a scope; the principal gets everything its groups grant, minus a
+user's hidden tools.
+
+A service account is bound on `/ui/admin/service-accounts` (the "JWT bindings"
+list under each account: pick one of the issuers that accept access tokens,
+enter the `sub` of the client and press "Bind subject"), or through the API
+with `service_accounts.manage`:
+
+```sh
+# the client-credentials app "ci-bot-app" has sub = its client id at most IdPs
+curl -X POST https://axon.homelab.internal/api/v1/service-accounts/$ID/jwt-bindings \
+  -H "Cookie: $SESSION" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
+  -d '{"issuer": "https://id.example.com", "subject": "ci-bot-app"}'
+```
+
+`GET` on the same path lists the bindings and `DELETE
+/api/v1/service-accounts/{id}/jwt-bindings/{binding_id}` removes one. The
+issuer must be a configured provider with `accept_access_tokens` (else 400), and
+a subject can be bound once per issuer (else 409). Creating and deleting a
+binding is audited (`service_account.jwt_binding.create` and `.delete`).
+Metrics count these requests as `axon_authn_total{method="jwt"}`.
+
+### MCP OAuth (for MCP clients)
+
+With multi-user mode on, the gateway is also an OAuth 2.1 authorization server
+for MCP clients (Claude Code, Claude Desktop, editors), so a user signs in
+through the browser instead of pasting a PAT. An unauthenticated `/mcp` request
+gets a 401 whose `WWW-Authenticate` names `resource_metadata`; the client
+discovers the rest from there. `base_url` must be the gateway's public URL,
+since it is the issuer and the resource.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/.well-known/oauth-protected-resource[/<path>]` | RFC 9728 resource metadata |
+| `/.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
+| `/oauth/register` | RFC 7591 dynamic client registration |
+| `/oauth/authorize` | consent page after the dashboard login (PKCE S256; `resource` defaults to `<base_url>/mcp`) |
+| `/oauth/token` | code and refresh-token grants |
+| `/oauth/revoke` | RFC 7009 revocation |
+
+- Access tokens (`axon_oat_`) last 1 hour; refresh tokens (`axon_ort_`) last
+  30 days and rotate on every use, and a reused refresh token ends the grant.
+  Codes last 60 seconds and are single use. Tokens are stored hashed.
+- Clients are public (no secret). They register by DCR, or use an `https://`
+  client-id metadata document (CIMD). Redirect URIs must be `https`, or `http`
+  to `127.0.0.1`, `[::1]` or `localhost`. Registrations unused for 30 days
+  expire.
+- A token is bound to the resource it was issued for and acts as the user who
+  approved it, with that user's roles. It is accepted on `/mcp` only, not on
+  `/api/v1`.
+- Users see and end their grants on **Connected apps** (`/ui/me/apps`) or via
+  `GET`/`DELETE /api/v1/me/oauth-grants[/{id}]`; admins use
+  `/api/v1/admin/oauth-grants[/{id}]`.
+
 ## Tool-call audit
 
 In multi-user mode every `tools/call` made by a user or service account

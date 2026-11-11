@@ -17,14 +17,15 @@ use super::admin_views::{
 };
 use crate::rbac::{TokenState, lifetime_days};
 use crate::store::{
-    ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, MAX_SERVICE_TOKEN_LIFETIME,
+    ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, JwtBinding, MAX_SERVICE_TOKEN_LIFETIME,
     MAX_USER_TOKEN_LIFETIME, PAT_PREFIX, ServiceAccount, SessionUser, Toolset,
 };
 
-/// A service account with its tokens
+/// A service account with its tokens and the `IdP` subjects bound to it
 pub(super) struct AccountRow {
     pub account: ServiceAccount,
     pub tokens: Vec<ApiToken>,
+    pub bindings: Vec<JwtBinding>,
 }
 
 /// Everything `/ui/admin/service-accounts` shows
@@ -32,6 +33,8 @@ pub(super) struct ServiceAccountsOverview {
     pub accounts: Vec<AccountRow>,
     /// Configured backends a token may be narrowed to
     pub backends: Vec<String>,
+    /// Issuers of the providers that accept access tokens, which a subject can be bound under
+    pub issuers: Vec<String>,
 }
 
 /// The token that was just created, for the one-time display: the name of the
@@ -314,8 +317,83 @@ fn account_state_badge(account: &ServiceAccount) -> Markup {
     }
 }
 
-/// One service account: its buttons, tokens and the issue form
-fn render_account(row: &AccountRow, backends: &[String]) -> Markup {
+/// The `IdP` subjects bound to a service account, so a JWT access token for one
+/// acts as the account, and the form to bind another. Nothing when no provider
+/// accepts access tokens and nothing is bound.
+fn render_jwt_bindings(bindings: &[JwtBinding], issuers: &[String], base: &str) -> Markup {
+    html! {
+        @if !bindings.is_empty() || !issuers.is_empty() {
+            h4 class="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100" {
+                "JWT bindings"
+            }
+            p class=(format!("mt-1 {MUTED}")) {
+                "An access token from the IdP with a bound subject acts as this account."
+            }
+            @if bindings.is_empty() {
+                p class=(format!("mt-2 text-sm {FAINT}")) { "No bindings yet." }
+            } @else {
+                div class=(TABLE_WRAP) {
+                    table class=(TABLE) {
+                        thead class=(THEAD) {
+                            tr {
+                                th class=(TH) { "Issuer" }
+                                th class=(TH) { "Subject" }
+                                th class=(TH) { "Created" }
+                                th class=(TH) { "Actions" }
+                            }
+                        }
+                        tbody class=(TBODY) {
+                            @for binding in bindings {
+                                tr {
+                                    td class=(TD) { (binding.issuer) }
+                                    td class=(TD) { code class=(CODE) { (binding.subject) } }
+                                    td class=(TD) { (when(binding.created_at)) }
+                                    td class=(TD) {
+                                        button
+                                            class=(BUTTON_DANGER)
+                                            type="button"
+                                            hx-post=(format!("{base}/jwt-bindings/{}/delete", binding.id))
+                                            hx-target="#service-accounts"
+                                            hx-swap="outerHTML"
+                                            hx-confirm="Remove this binding? Tokens for the subject stop acting as this account."
+                                        {
+                                            "Delete"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if !issuers.is_empty() {
+                form
+                    class=(FORM_ROW)
+                    hx-post=(format!("{base}/jwt-bindings"))
+                    hx-target="#service-accounts"
+                    hx-swap="outerHTML"
+                {
+                    label class=(LABEL) {
+                        "Issuer"
+                        select class=(INPUT) name="issuer" {
+                            @for issuer in issuers {
+                                option value=(issuer) { (issuer) }
+                            }
+                        }
+                    }
+                    label class=(LABEL) {
+                        "Subject (sub claim)"
+                        input class=(format!("{INPUT} w-72")) type="text" name="subject" maxlength="255" required;
+                    }
+                    button class=(BUTTON) type="submit" { "Bind subject" }
+                }
+            }
+        }
+    }
+}
+
+/// One service account: its buttons, tokens, the issue form and its JWT bindings
+fn render_account(row: &AccountRow, backends: &[String], issuers: &[String]) -> Markup {
     let account = &row.account;
     let base = format!("/ui/actions/admin/service-accounts/{}", account.id);
 
@@ -364,6 +442,7 @@ fn render_account(row: &AccountRow, backends: &[String]) -> Markup {
                 backends,
                 &[],
             ))
+            (render_jwt_bindings(&row.bindings, issuers, &base))
         }
     }
 }
@@ -390,7 +469,7 @@ pub(super) fn render_service_accounts_section(
                 p class=(format!("mt-4 text-sm {FAINT}")) { "No service accounts yet." }
             }
             @for row in &overview.accounts {
-                (render_account(row, &overview.backends))
+                (render_account(row, &overview.backends, &overview.issuers))
             }
             form
                 class=(FORM_ROW)
@@ -535,8 +614,17 @@ mod tests {
                     created_at: Utc::now(),
                 },
                 tokens: vec![issued.token.clone()],
+                bindings: vec![JwtBinding {
+                    id: Uuid::from_u128(11),
+                    service_account_id: Uuid::from_u128(9),
+                    issuer: String::from("https://idp.example"),
+                    subject: String::from("<u>client</u>"),
+                    created_at: Utc::now(),
+                    created_by: None,
+                }],
             }],
             backends: vec![String::from("files")],
+            issuers: vec![String::from("https://idp.example")],
         };
         let html = render_service_accounts_section(
             &overview,
@@ -552,10 +640,47 @@ mod tests {
         assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"));
         assert!(!html.contains("<script>alert"));
         assert!(!html.contains("<i>bot</i>"));
+        assert!(html.contains("&lt;u&gt;client&lt;/u&gt;"));
+        assert!(!html.contains("<u>client"));
+        assert!(html.contains(
+            "/ui/actions/admin/service-accounts/00000000-0000-0000-0000-000000000009/jwt-bindings/00000000-0000-0000-0000-00000000000b/delete"
+        ));
+        assert!(html.contains("Bind subject"));
         assert!(html.contains("hx-confirm="));
         assert!(html.contains(">Enable<"));
         assert!(html.contains(
             "/ui/actions/admin/service-accounts/00000000-0000-0000-0000-000000000009/disabled"
         ));
+    }
+
+    #[tokio::test]
+    async fn jwt_bindings_show_only_when_a_provider_accepts_access_tokens() {
+        let overview = ServiceAccountsOverview {
+            accounts: vec![AccountRow {
+                account: ServiceAccount {
+                    id: Uuid::from_u128(9),
+                    name: String::from("bot"),
+                    description: None,
+                    disabled: false,
+                    created_at: Utc::now(),
+                },
+                tokens: Vec::new(),
+                bindings: Vec::new(),
+            }],
+            backends: Vec::new(),
+            issuers: Vec::new(),
+        };
+        let html = render_service_accounts_section(&overview, None).into_string();
+        assert!(!html.contains("JWT bindings"));
+
+        let overview = ServiceAccountsOverview {
+            issuers: vec![String::from("https://idp.example")],
+            ..overview
+        };
+        let html = render_service_accounts_section(&overview, None).into_string();
+        assert!(html.contains("JWT bindings"));
+        assert!(html.contains("No bindings yet."));
+        assert!(html.contains("name=\"issuer\""));
+        assert!(html.contains("name=\"subject\""));
     }
 }

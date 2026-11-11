@@ -197,6 +197,7 @@ struct PersonalScope<'a> {
 }
 
 /// The authenticated caller of an MCP request.
+#[allow(clippy::large_enum_variant)] // built once per request and passed by reference
 #[derive(Debug, Clone)]
 pub enum Caller {
     /// No authentication configured (standalone): everything is allowed.

@@ -66,6 +66,7 @@ struct ProviderState {
     end_session: bool,
     codes: HashMap<String, Grant>,
     last_logout: Option<HashMap<String, String>>,
+    last_id_token: Option<String>,
 }
 
 type Shared = Arc<Mutex<ProviderState>>;
@@ -105,6 +106,7 @@ impl MockOidc {
             end_session: true,
             codes: HashMap::new(),
             last_logout: None,
+            last_id_token: None,
         }));
 
         let app = Router::new()
@@ -143,6 +145,34 @@ impl MockOidc {
     /// `post_logout_redirect_uri`, ...).
     pub fn last_logout(&self) -> Option<HashMap<String, String>> {
         self.state.lock().unwrap().last_logout.clone()
+    }
+
+    /// The ID token the token endpoint answered last.
+    pub fn last_id_token(&self) -> Option<String> {
+        self.state.lock().unwrap().last_id_token.clone()
+    }
+
+    /// A JWT access token signed by this provider, for resource-server mode:
+    /// `iss`, `aud` (the client id), `sub` (`alice`), `iat` and `exp` are set,
+    /// then `claims` is merged on top (a `null` removes a claim).
+    pub fn mint_access_token(&self, claims: &Value) -> String {
+        let state = self.state.lock().unwrap();
+        let now = unix_now();
+        let mut token_claims = json!({
+            "iss": state.issuer,
+            "aud": state.client_id,
+            "sub": "alice",
+            "iat": now,
+            "exp": now + TOKEN_LIFETIME,
+        });
+        for (name, value) in claims.as_object().expect("claims is an object") {
+            if value.is_null() {
+                token_claims.as_object_mut().unwrap().remove(name);
+            } else {
+                token_claims[name] = value.clone();
+            }
+        }
+        sign(&state, &token_claims)
     }
 }
 
@@ -211,6 +241,21 @@ async fn authorize(
     (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
 }
 
+/// A JWT of `claims` signed with the provider's key.
+fn sign(state: &ProviderState, claims: &Value) -> String {
+    let header = json!({"alg": "ES256", "kid": KID, "typ": "JWT"});
+    let input = format!(
+        "{}.{}",
+        b64(header.to_string().as_bytes()),
+        b64(claims.to_string().as_bytes())
+    );
+    let signature = state
+        .key
+        .sign(&SystemRandom::new(), input.as_bytes())
+        .expect("sign token");
+    format!("{input}.{}", b64(signature.as_ref()))
+}
+
 async fn token(State(state): State<Shared>, Form(form): Form<HashMap<String, String>>) -> Response {
     let get = |name: &str| form.get(name).map_or("", String::as_str);
     let mut state = state.lock().unwrap();
@@ -234,17 +279,8 @@ async fn token(State(state): State<Shared>, Form(form): Form<HashMap<String, Str
     claims["iat"] = json!(now);
     claims["exp"] = json!(now + TOKEN_LIFETIME);
 
-    let header = json!({"alg": "ES256", "kid": KID, "typ": "JWT"});
-    let input = format!(
-        "{}.{}",
-        b64(header.to_string().as_bytes()),
-        b64(claims.to_string().as_bytes())
-    );
-    let signature = state
-        .key
-        .sign(&SystemRandom::new(), input.as_bytes())
-        .expect("sign id token");
-    let id_token = format!("{input}.{}", b64(signature.as_ref()));
+    let id_token = sign(&state, &claims);
+    state.last_id_token = Some(id_token.clone());
 
     Json(json!({
         "access_token": b64(&Sha256::digest(id_token.as_bytes())),

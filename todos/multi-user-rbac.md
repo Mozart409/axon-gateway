@@ -821,8 +821,31 @@ Decisions (2026-11-11):
 
 ### Phase 7 - Enterprise auth
 
-- [ ] Resource-server JWT mode.
-- [ ] MCP OAuth authorization server (RFC 9728, RFC 7591, PKCE, refresh).
+Decided 2026-11-11, built in three commits (7a: the first two items, 7b: the
+next two, 7c: the rest):
+
+- JWT mapping: a delegated token whose issuer + `sub` match an axon user acts
+  as that user; a client-credentials token acts as the service account an
+  admin bound to its issuer + subject; an unknown subject gets 401.
+- Authorization server tokens are opaque and stored hashed: access 1 h,
+  refresh 30 days, rotating, reuse revokes the grant. Open DCR plus CIMD,
+  public clients only, redirect URIs `https` or loopback `http`; clients unused
+  for 30 days expire. No CORS on the OAuth routes (native clients only).
+- Upstream OAuth discovers the AS (RFC 9728, then RFC 8414), uses the catalog
+  entry's static client if it has one, else DCR/CIMD, and keeps each user's
+  refresh token under envelope encryption.
+- Passthrough: `grant = "token_exchange" | "entra_obo"` (RFC 8693 or Entra
+  OBO). The subject token is the caller's resource-server JWT, or one refreshed
+  from the IdP refresh token stored encrypted at login.
+- SCIM: one bearer token per provider (shown once, hashed). SCIM groups feed
+  the same `group_map` and override the claim snapshot; `active=false`
+  disables the user and suspends their tokens.
+- Graph overage: opt-in `graph_overage = true`, app client credentials against
+  `/users/{oid}/transitiveMemberOf` (application permission
+  `GroupMember.Read.All`).
+
+- [x] Resource-server JWT mode.
+- [x] MCP OAuth authorization server (RFC 9728, RFC 7591, PKCE, refresh).
 - [ ] Upstream OAuth for backends ("Connect" button).
 - [ ] Token-exchange passthrough (RFC 8693).
 - [ ] SCIM 2.0.

@@ -385,6 +385,12 @@ fn spawn_purges(store: &store::Store) {
             }
         },
     );
+    jobs::spawn_singleton(store.clone(), "oauth", PURGE_INTERVAL, |store| async move {
+        match store.purge_oauth().await {
+            Ok(purged) => tracing::debug!(purged, "Purged expired OAuth state"),
+            Err(error) => tracing::warn!(%error, "Failed to purge expired OAuth state"),
+        }
+    });
 }
 
 /// Spawns the task that refreshes this replica's sampled gauges: sessions,
