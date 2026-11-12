@@ -2,6 +2,11 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.5.3 - 2026-11-12
+#### Features
+- (**axon**) drop the gateway status button from the landing page and show the user's groups as pills in the user bar - (2491ddf) - Amadeus Mader
+
+- - -
 ## v0.5.2 - 2026-11-12
 #### Features
 - (**axon**) add AXON_OIDC_SCOPES so the bootstrap provider can request the groups scope that admin groups need - (8d86f84) - Amadeus Mader
