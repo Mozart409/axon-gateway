@@ -2,6 +2,11 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.5.2 - 2026-11-12
+#### Features
+- (**axon**) add AXON_OIDC_SCOPES so the bootstrap provider can request the groups scope that admin groups need - (8d86f84) - Amadeus Mader
+
+- - -
 ## v0.5.1 - 2026-11-12
 #### Bug Fixes
 - (**axon**) copy the vendored static scripts into the image build stage that embeds them - (2f50d66) - Amadeus Mader
