@@ -11,6 +11,7 @@
 //! | `AXON_OIDC_CLIENT_ID` | its client id (required with the issuer) |
 //! | `AXON_OIDC_CLIENT_SECRET_FILE` | file holding its client secret (optional) |
 //! | `AXON_OIDC_ADMIN_GROUPS` | comma separated groups whose members are admins |
+//! | `AXON_OIDC_SCOPES` | comma separated scopes to request, default `openid,profile,email`; `openid` is always included |
 //! | `AXON_OIDC_ID` | its id, default `sso` |
 //! | `AXON_OIDC_DISPLAY_NAME` | its button label (optional) |
 //!
@@ -33,6 +34,7 @@ const ENV_OIDC_ISSUER: &str = "AXON_OIDC_ISSUER";
 const ENV_OIDC_CLIENT_ID: &str = "AXON_OIDC_CLIENT_ID";
 const ENV_OIDC_CLIENT_SECRET_FILE: &str = "AXON_OIDC_CLIENT_SECRET_FILE";
 const ENV_OIDC_ADMIN_GROUPS: &str = "AXON_OIDC_ADMIN_GROUPS";
+const ENV_OIDC_SCOPES: &str = "AXON_OIDC_SCOPES";
 const ENV_OIDC_ID: &str = "AXON_OIDC_ID";
 const ENV_OIDC_DISPLAY_NAME: &str = "AXON_OIDC_DISPLAY_NAME";
 
@@ -112,6 +114,12 @@ impl Bootstrap {
         let oidc = match get(ENV_OIDC_ISSUER) {
             Some(issuer) => {
                 let client_id = get(ENV_OIDC_CLIENT_ID).ok_or(BootstrapError::MissingClientId)?;
+                let defaults = OidcProviderConfig::default();
+                let scopes = get(ENV_OIDC_SCOPES)
+                    .map(split_list)
+                    .filter(|scopes| !scopes.is_empty())
+                    .map(with_openid)
+                    .unwrap_or(defaults.scopes);
                 Some(OidcProviderConfig {
                     id: get(ENV_OIDC_ID).unwrap_or(DEFAULT_OIDC_ID).to_owned(),
                     display_name: get(ENV_OIDC_DISPLAY_NAME).map(str::to_owned),
@@ -120,7 +128,8 @@ impl Bootstrap {
                     admin_groups: get(ENV_OIDC_ADMIN_GROUPS)
                         .map(split_list)
                         .unwrap_or_default(),
-                    ..OidcProviderConfig::default()
+                    scopes,
+                    ..defaults
                 })
             }
             None => None,
@@ -144,6 +153,14 @@ fn split_list(text: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// The scopes with `openid` first: an OIDC login cannot work without it
+fn with_openid(mut scopes: Vec<String>) -> Vec<String> {
+    if !scopes.iter().any(|scope| scope == "openid") {
+        scopes.insert(0, "openid".to_owned());
+    }
+    scopes
 }
 
 #[cfg(test)]
@@ -284,5 +301,29 @@ mod tests {
         .unwrap();
         let oidc = bootstrap.oidc.expect("a provider");
         assert_eq!(oidc.admin_groups, ["ops", "admins", "platform"]);
+    }
+
+    #[test]
+    fn scopes_are_split_and_trimmed() {
+        let bootstrap = Bootstrap::from_vars(&vars(&[
+            ("AXON_OIDC_ISSUER", "https://idp.example.com"),
+            ("AXON_OIDC_CLIENT_ID", "axon"),
+            ("AXON_OIDC_SCOPES", " openid, profile ,email,groups "),
+        ]))
+        .unwrap();
+        let oidc = bootstrap.oidc.expect("a provider");
+        assert_eq!(oidc.scopes, ["openid", "profile", "email", "groups"]);
+    }
+
+    #[test]
+    fn scopes_without_openid_get_it_first() {
+        let bootstrap = Bootstrap::from_vars(&vars(&[
+            ("AXON_OIDC_ISSUER", "https://idp.example.com"),
+            ("AXON_OIDC_CLIENT_ID", "axon"),
+            ("AXON_OIDC_SCOPES", "profile,groups"),
+        ]))
+        .unwrap();
+        let oidc = bootstrap.oidc.expect("a provider");
+        assert_eq!(oidc.scopes, ["openid", "profile", "groups"]);
     }
 }

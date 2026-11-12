@@ -46,6 +46,7 @@ oidc:
   id: ""                # default "sso"
   displayName: ""
   adminGroups: []       # members of these groups are admins
+  scopes: []            # default openid,profile,email; add groups for Pocket ID
   # The client secret is mounted from a Secret as a file
   # (AXON_OIDC_CLIENT_SECRET_FILE). Leave empty for a public PKCE client.
   clientSecret:

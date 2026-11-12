@@ -459,6 +459,7 @@ reach it), so they are environment variables:
 | `AXON_OIDC_CLIENT_ID` | none | its client id; required with the issuer |
 | `AXON_OIDC_CLIENT_SECRET_FILE` | none | file with its client secret (content trimmed); leave it out for a public PKCE client |
 | `AXON_OIDC_ADMIN_GROUPS` | none | comma separated groups whose members are admins |
+| `AXON_OIDC_SCOPES` | `openid,profile,email` | comma separated scopes to request; `openid` is always included |
 | `AXON_OIDC_ID` | `sso` | its id (used in URLs) |
 | `AXON_OIDC_DISPLAY_NAME` | the id | its login button label |
 
@@ -483,11 +484,13 @@ export AXON_OIDC_ISSUER=https://id.example.com
 export AXON_OIDC_CLIENT_ID=axon
 export AXON_OIDC_CLIENT_SECRET_FILE=/run/secrets/axon-oidc-secret
 export AXON_OIDC_ADMIN_GROUPS=axon-admins
+export AXON_OIDC_SCOPES=openid,profile,email,groups
 axon-gateway
 ```
 
 With a bootstrap provider, members of `AXON_OIDC_ADMIN_GROUPS` log in and are
-admins. Without any provider, the way in is the break-glass link: run
+admins. The IdP must send the groups claim for that, which Pocket ID does only
+for the `groups` scope. Without any provider, the way in is the break-glass link: run
 `axon-gateway admin login-link` (same environment, see
 Break-glass login under [RBAC](#rbac)), open the printed URL and add a provider and
 backends on the admin pages. The gateway starts with no backends, and a

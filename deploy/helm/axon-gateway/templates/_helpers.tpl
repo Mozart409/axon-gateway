@@ -67,6 +67,10 @@ Rendered as list items; indent with nindent.
 - name: AXON_OIDC_ADMIN_GROUPS
   value: {{ join "," .Values.oidc.adminGroups | quote }}
 {{- end }}
+{{- if .Values.oidc.scopes }}
+- name: AXON_OIDC_SCOPES
+  value: {{ join "," .Values.oidc.scopes | quote }}
+{{- end }}
 {{- if .Values.oidc.id }}
 - name: AXON_OIDC_ID
   value: {{ .Values.oidc.id | quote }}

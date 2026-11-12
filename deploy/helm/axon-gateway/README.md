@@ -28,7 +28,8 @@ helm install axon ./rust/axon-gateway/deploy/helm/axon-gateway \
   --set baseUrl=https://axon.example.com \
   --set oidc.issuer=https://id.example.com \
   --set oidc.clientId=axon \
-  --set 'oidc.adminGroups={axon-admins}'
+  --set 'oidc.adminGroups={axon-admins}' \
+  --set 'oidc.scopes={openid,profile,email,groups}'
 ```
 
 Without `oidc.issuer` there is no provider yet: log in with
@@ -152,6 +153,7 @@ The dashboard has a `DS_PROMETHEUS` data source variable plus `job` and
 | `allowStdio` | `false` | `AXON_ALLOW_STDIO` |
 | `oidc.issuer`, `oidc.clientId` | `""` | Bootstrap OIDC provider (`AXON_OIDC_ISSUER`, `AXON_OIDC_CLIENT_ID`); database mode |
 | `oidc.id`, `oidc.displayName`, `oidc.adminGroups` | `""`, `""`, `[]` | `AXON_OIDC_ID` (default `sso`), `AXON_OIDC_DISPLAY_NAME`, `AXON_OIDC_ADMIN_GROUPS` |
+| `oidc.scopes` | `[]` | `AXON_OIDC_SCOPES` (default `openid,profile,email`; `openid` is always included) |
 | `oidc.clientSecret.existingSecret`, `.key` | `""`, `client-secret` | Secret mounted as a file for `AXON_OIDC_CLIENT_SECRET_FILE` |
 | `import.enabled` | `false` | Hook Job running `admin import-config` on `import.config` (database mode) |
 | `import.dryRun` | `false` | Report only |
