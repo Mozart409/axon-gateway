@@ -18,6 +18,9 @@ use crate::types::{
     BackendInfo, BackendState, NamespacedTool, PromptDefinition, ResourceDefinition,
 };
 
+/// htmx under the page CSP: no injected indicator `<style>` and no `eval`.
+const HTMX_CONFIG: &str = r#"{"includeIndicatorStyles":false,"allowEval":false}"#;
+
 /// One "Sign in with ..." choice on the login page.
 pub(super) struct LoginOption {
     pub display_name: String,
@@ -101,34 +104,7 @@ pub(super) fn render_landing_page(state: &AppState) -> Markup {
                         }
                     }
                 }
-                script {
-                    (PreEscaped(
-                        r#"
-                        (() => {
-                            const copyButton = document.getElementById("copy-mcp-url");
-                            if (!copyButton) {
-                                return;
-                            }
-
-                            const feedback = document.getElementById("copy-mcp-url-feedback");
-                            copyButton.addEventListener("click", async () => {
-                                const mcpUrl = copyButton.dataset.url ?? "";
-
-                                try {
-                                    await navigator.clipboard.writeText(mcpUrl);
-                                    if (feedback) {
-                                        feedback.textContent = "Copied MCP server URL.";
-                                    }
-                                } catch (_error) {
-                                    if (feedback) {
-                                        feedback.textContent = "Copy failed. Copy the URL manually.";
-                                    }
-                                }
-                            });
-                        })();
-                        "#,
-                    ))
-                }
+                script src="/static/copy-url.js" defer {}
             }
         }
     }
@@ -380,8 +356,9 @@ pub(super) fn render_ui_page(
                 @if let Some(user) = user {
                     meta name="csrf-token" content=(user.csrf_token);
                 }
-                script src="https://unpkg.com/htmx.org@2.0.4" defer {};
-                script src="https://unpkg.com/htmx-ext-sse@2.2.2" defer {};
+                meta name="htmx-config" content=(HTMX_CONFIG);
+                script src="/static/htmx-2.0.4.min.js" defer {};
+                script src="/static/htmx-ext-sse-2.2.2.js" defer {};
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=[hx_headers.as_deref()] {
@@ -775,7 +752,8 @@ pub(super) fn render_my_tools_page(
                 title { "My tools - Axon Gateway" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 meta name="csrf-token" content=(user.csrf_token);
-                script src="https://unpkg.com/htmx.org@2.0.4" defer {};
+                meta name="htmx-config" content=(HTMX_CONFIG);
+                script src="/static/htmx-2.0.4.min.js" defer {};
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=(hx_headers) {

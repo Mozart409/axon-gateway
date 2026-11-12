@@ -17,7 +17,7 @@ use super::admin_api::{ApiPath, ApiResult};
 use super::oauth::cimd_host;
 use crate::policy::Permission;
 use crate::rbac::{AdminError, resolve};
-use crate::store::{OauthGrant, SessionUser, Store};
+use crate::store::{Actor, OauthGrant, SessionUser, Store};
 
 /// The grant routes, without guards: `admin_api::router` adds them.
 pub(super) fn routes() -> Router<AppState> {
@@ -108,8 +108,20 @@ async fn handle_revoke_any(
     Extension(session): Extension<SessionUser>,
     ApiPath(id): ApiPath<Uuid>,
 ) -> ApiResult<StatusCode> {
+    let actor = Actor {
+        user_id: Some(session.user.id),
+        label: [
+            session.user.email.as_deref(),
+            session.user.display_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|label| !label.trim().is_empty())
+        .unwrap_or(&session.user.subject)
+        .to_owned(),
+    };
     let revoked = admin_store(&state, &session)?
-        .revoke_oauth_grant(id, None)
+        .admin_revoke_oauth_grant(&actor, id)
         .await
         .map_err(AdminError::Store)?;
     if revoked {

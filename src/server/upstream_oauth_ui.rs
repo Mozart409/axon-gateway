@@ -30,7 +30,8 @@ use oauth2::url::form_urlencoded;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
-use super::admin_ui::not_found;
+use super::admin_ui::{flash_response, not_found};
+use super::auth::within_limit;
 use super::oauth::{base, error_page};
 use super::personal_api::{
     PersonalApiError, begin_connection, clean_return_to, connect_failure, delete_connection,
@@ -48,6 +49,8 @@ const CSRF_HEADER: &str = "x-csrf-token";
 const CATALOG_PAGE: &str = "/ui/catalog";
 /// Longest piece of the authorization server's error shown on the error page
 const MAX_SHOWN_CHARS: usize = 300;
+/// Connects and callbacks per user and minute, counted together
+const CONNECT_LIMIT_PER_MINUTE: u32 = 20;
 
 /// The metadata document, and the connect, disconnect and callback routes
 /// behind the session guard (and, for the posts, the same-site check).
@@ -147,6 +150,26 @@ fn action_failure(
     error_page(state, status, title, &message)
 }
 
+/// Counts a connect or callback of `session`'s user; the 429 to answer when the limit is used up
+async fn connect_limited(state: &AppState, session: &SessionUser, htmx: bool) -> Option<Response> {
+    let store = state.store.as_ref()?;
+    let key = format!("upstream_connect:{}", session.user.id);
+    if within_limit(store, &key, CONNECT_LIMIT_PER_MINUTE).await {
+        return None;
+    }
+    let message = "Too many connection attempts in a short time. Try again in a minute.";
+    Some(if htmx {
+        flash_response(StatusCode::TOO_MANY_REQUESTS, message.to_owned())
+    } else {
+        error_page(
+            state,
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            message,
+        )
+    })
+}
+
 /// The session and the form of a post whose CSRF token checked out, or the
 /// refusal
 fn checked_post(
@@ -182,6 +205,9 @@ async fn handle_connect(
         Ok(checked) => checked,
         Err(response) => return *response,
     };
+    if let Some(response) = connect_limited(&state, &session, is_htmx(&headers)).await {
+        return response;
+    }
     let return_to = clean_return_to(fields.get("return_to").map(String::as_str));
     match begin_connection(&state, &session, &name, return_to).await {
         Ok(url) if is_htmx(&headers) => (StatusCode::OK, [("hx-redirect", url)]).into_response(),
@@ -244,6 +270,9 @@ async fn handle_callback(
     let Some(Extension(session)) = user else {
         return not_found(&state);
     };
+    if let Some(response) = connect_limited(&state, &session, false).await {
+        return response;
+    }
     if let Some(error) = query.error.as_deref() {
         let message = match query.error_description.as_deref() {
             Some(description) if !description.is_empty() => {

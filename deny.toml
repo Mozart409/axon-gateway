@@ -7,6 +7,8 @@ no-default-features = false
 feature-depth = 1
 
 [advisories]
+yanked = "deny"
+unmaintained = "all"
 ignore = [
 ]
 
@@ -37,7 +39,7 @@ registries = []
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
@@ -57,8 +59,8 @@ skip = [
 skip-tree = []
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
 

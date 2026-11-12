@@ -11,6 +11,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::authz::{Resource, Scope};
@@ -270,15 +271,13 @@ impl SharedAuth {
     }
 }
 
-/// Constant-time string comparison to prevent timing attacks
+/// Constant-time string comparison to prevent timing attacks.
+///
+/// Compares the SHA-256 digests, so the length of either input does not leak.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        // Even checking length can leak info, but subtle requires equal
-        // lengths. Do a dummy comparison to avoid short-circuit.
-        let _ = a.as_bytes().ct_eq(a.as_bytes());
-        return false;
-    }
-    a.as_bytes().ct_eq(b.as_bytes()).into()
+    let a = Sha256::digest(a.as_bytes());
+    let b = Sha256::digest(b.as_bytes());
+    a.as_slice().ct_eq(b.as_slice()).into()
 }
 
 /// Authentication errors

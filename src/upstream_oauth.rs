@@ -7,9 +7,10 @@
 //! is in `store::upstream_oauth`; sealing is here, with an AAD that binds each
 //! secret to its row.
 //!
-//! Every request goes through [`Fetcher`]: a URL on the backend's own origin is
-//! trusted, any other (the issuer and endpoints the backend names) is checked by
-//! the [`EgressPolicy`] and DNS-pinned, or refused without one. No redirects,
+//! Every request goes through [`Fetcher`]: with an [`EgressPolicy`] (personal
+//! backends) every URL, the backend's own origin included, is checked and
+//! DNS-pinned; without one (catalog backends) the backend's own origin is
+//! trusted and any other (the issuer and endpoints the backend names) refused. No redirects,
 //! 10 s, response bodies capped at 64 KiB. Errors carry the server's `error` and
 //! a truncated `error_description`, never other body content or a token.
 
@@ -163,7 +164,8 @@ impl fmt::Debug for TokenResponse {
 enum Scope<'a> {
     /// Every http(s) URL; for endpoints that come from admin configuration
     Unrestricted,
-    /// URLs on the backend's origin; any other origin goes through the policy
+    /// With a policy every URL, the backend's origin included, is checked and
+    /// pinned; without one only the backend's origin is reachable
     Backend {
         origin: String,
         policy: Option<&'a EgressPolicy>,
@@ -184,9 +186,10 @@ struct Reply {
 impl<'a> Fetcher<'a> {
     /// For the upstream OAuth flow of a catalog backend. The URLs it discovers
     /// (issuer, metadata, token and registration endpoints) are named by the
-    /// backend, so only the backend's own origin (scheme, host and port) is
-    /// trusted. Any other origin is checked by `policy` and the connection
-    /// pinned to the checked address; without a policy it is refused.
+    /// backend. With a `policy` every URL, the backend's own origin included,
+    /// is checked by it and the connection pinned to the checked address.
+    /// Without a policy only the backend's own origin (scheme, host and port)
+    /// is trusted and any other is refused.
     ///
     /// # Errors
     /// [`UpstreamOauthError::Url`] when `backend_url` is not an http(s) URL.
@@ -215,18 +218,19 @@ impl<'a> Fetcher<'a> {
 
     async fn client(&self, url: &str) -> Result<reqwest::Client, UpstreamOauthError> {
         let parsed = parse_http_url(url)?;
-        let foreign = match &self.scope {
-            Scope::Unrestricted => None,
-            Scope::Backend { origin, policy } => (origin_of(&parsed) != *origin).then_some(*policy),
-        };
-        if let Some(policy) = foreign {
-            let Some(policy) = policy else {
+        if let Scope::Backend { origin, policy } = &self.scope {
+            // With a policy even the backend's own origin is checked and
+            // pinned on every request: its DNS answer can change after the
+            // backend was created.
+            if let Some(policy) = policy {
+                return Ok(policy.check_url(url).await?.client(HTTP_TIMEOUT)?);
+            }
+            if origin_of(&parsed) != *origin {
                 return Err(UpstreamOauthError::Metadata(format!(
                     "the authorization server at {} is not on the backend's host and no egress policy allows it",
                     origin_of(&parsed)
                 )));
-            };
-            return Ok(policy.check_url(url).await?.client(HTTP_TIMEOUT)?);
+            }
         }
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -1850,6 +1854,22 @@ mod tests {
         let fetcher = Fetcher::for_backend(BACKEND, Some(&allow)).unwrap();
         assert!(fetcher.client("http://127.0.0.1:9/token").await.is_ok());
         assert!(fetcher.client("http://169.254.169.254/").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn same_origin_goes_through_the_policy_too() {
+        let deny = EgressPolicy::new(&[], &[]).unwrap();
+        let fetcher = Fetcher::for_backend("http://localhost:9/mcp", Some(&deny)).unwrap();
+        for url in ["http://localhost:9/token", "http://127.0.0.1:9/token"] {
+            let error = fetcher.client(url).await.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    UpstreamOauthError::Egress(EgressError::Denied { .. })
+                ),
+                "{url}: {error}"
+            );
+        }
     }
 
     #[tokio::test]

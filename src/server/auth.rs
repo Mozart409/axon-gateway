@@ -196,6 +196,34 @@ async fn within_rate_limit(
     }
 }
 
+/// Counts a request in the shared Postgres window under `key`: `false` when the
+/// `limit` per minute is used up (counted in `axon_authz_denied_total`). A store error lets
+/// the request through, as for the limits above.
+pub(super) async fn within_limit(store: &Store, key: &str, limit: u32) -> bool {
+    match store.hit_rate_limit(key, limit).await {
+        Ok(true) => true,
+        Ok(false) => {
+            crate::metrics::record_authz_denied("rate_limit");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, key, "Rate limit check failed, letting the request through");
+            true
+        }
+    }
+}
+
+/// [`within_limit`] per client IP, under `{scope}:{ip}`.
+pub(super) async fn within_ip_limit(
+    store: &Store,
+    scope: &str,
+    client_ip: Option<&str>,
+    limit: u32,
+) -> bool {
+    let key = format!("{scope}:{}", client_ip.unwrap_or("unknown"));
+    within_limit(store, &key, limit).await
+}
+
 /// A personal access token or a service account's token.
 async fn authenticate_pat(
     token: &str,

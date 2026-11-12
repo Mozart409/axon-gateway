@@ -532,7 +532,6 @@ mod tests {
             },
             provider_id: String::from("pocket"),
             csrf_token: String::from("tok-123"),
-            id_token: None,
         }
     }
 

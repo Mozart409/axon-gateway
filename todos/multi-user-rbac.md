@@ -559,23 +559,25 @@ The work deployment is Kubernetes with 3 replicas.
 
 ## 9. Security checklist
 
-- [ ] Threat model written down (malicious user, compromised PAT, hostile
+The threat model is in `docs/threat-model.md`.
+
+- [x] Threat model written down (malicious user, compromised PAT, hostile
       personal backend, compromised IdP claim, insider admin).
-- [ ] Rate-limit login, callback and token-mint endpoints.
-- [ ] No secrets, tokens or tool arguments in logs or spans.
-- [ ] Audit arguments: redaction denylist, `audit.read_sensitive` gate, works
+- [x] Rate-limit login, callback and token-mint endpoints.
+- [x] No secrets, tokens or tool arguments in logs or spans.
+- [x] Audit arguments: redaction denylist, `audit.read_sensitive` gate, works
       council and GDPR review before enabling `full`.
-- [ ] CSP header on the UI (no inline script beyond what is hashed/nonced).
-- [ ] Cookie flags (`__Host-`, Secure, HttpOnly, SameSite=Lax); session rotation.
-- [ ] CSRF tokens plus Sec-Fetch-Site/Origin check.
-- [ ] SSRF guard for personal backends and upstream OAuth endpoints.
-- [ ] stdio backends admin-only; arguments of stdio backends not user-editable.
-- [ ] Secrets encrypted at rest; KEK never in the database.
-- [ ] PATs hashed; constant-time comparisons everywhere tokens are checked.
-- [ ] Admin actions audited; audit table append-only (no UPDATE/DELETE grant to
+- [x] CSP header on the UI (no inline script beyond what is hashed/nonced).
+- [x] Cookie flags (`__Host-`, Secure, HttpOnly, SameSite=Lax); session rotation.
+- [x] CSRF tokens plus Sec-Fetch-Site/Origin check.
+- [x] SSRF guard for personal backends and upstream OAuth endpoints.
+- [x] stdio backends admin-only; arguments of stdio backends not user-editable.
+- [x] Secrets encrypted at rest; KEK never in the database.
+- [x] PATs hashed; constant-time comparisons everywhere tokens are checked.
+- [x] Admin actions audited; audit table append-only (no UPDATE/DELETE grant to
       the app role where practical).
-- [ ] OIDC: validate `iss`, `aud`, `exp`, `nonce`; pin allowed algorithms.
-- [ ] Dependency policy via `deny.toml`; new crates reviewed against it.
+- [x] OIDC: validate `iss`, `aud`, `exp`, `nonce`; pin allowed algorithms.
+- [x] Dependency policy via `deny.toml`; new crates reviewed against it.
 
 ## 10. Testing
 

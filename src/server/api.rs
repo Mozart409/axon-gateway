@@ -5,14 +5,19 @@ use std::time::Duration;
 
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Json, Response},
 };
+use axum_extra::extract::CookieJar;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use super::AppState;
-use crate::gateway::{GetDetailedStatus, GetStatus};
+use super::auth::{ClientIp, authenticate};
+use super::session::SESSION_COOKIE;
+use crate::gateway::{Caller, GetDetailedStatus, GetStatus};
+use crate::policy::Permission;
+use crate::rbac::resolve;
 
 /// Health check endpoint
 pub(super) async fn health_check() -> impl IntoResponse {
@@ -84,28 +89,114 @@ pub(super) async fn get_build_info(State(state): State<AppState>) -> impl IntoRe
     }))
 }
 
+/// Guard of the `/status*` endpoints: in database mode the caller needs the
+/// `gateway.admin` permission, as a bearer token (PAT, service account token, JWT) or,
+/// without an `Authorization` header, as a dashboard session cookie (GET only, so no CSRF
+/// token). 401 with the `Bearer` challenge when nobody is authenticated, 403 without the
+/// permission. Standalone mode lets everyone through.
+pub(super) async fn require_status_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    client_ip: Option<&str>,
+) -> Result<(), Box<Response>> {
+    let Some((store, oidc)) = state.multi_user() else {
+        return Ok(());
+    };
+    let policy = state.policy.current();
+
+    if !headers.contains_key(header::AUTHORIZATION)
+        && let Some(cookie) = CookieJar::from_headers(headers).get(SESSION_COOKIE)
+    {
+        match store.session_user(cookie.value()).await {
+            Ok(Some(session)) => {
+                let permissions = resolve(&policy, &session).1;
+                return admin_or_forbidden(permissions.has(Permission::GatewayAdmin));
+            }
+            // An unknown or expired session: the bearer path below answers the 401
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not look up a dashboard session");
+                return Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()));
+            }
+        }
+    }
+
+    let principal = match authenticate(headers, state, client_ip).await {
+        Ok(Caller::Principal(principal)) => principal,
+        Ok(Caller::Open | Caller::Token(_)) => {
+            return Err(Box::new(StatusCode::FORBIDDEN.into_response()));
+        }
+        Err(response) => return Err(response),
+    };
+    let Some(owner_id) = principal.owner_id() else {
+        return Err(Box::new(StatusCode::FORBIDDEN.into_response()));
+    };
+    let owner = match store.user_state(owner_id).await {
+        Ok(Some(owner)) => owner.user,
+        Ok(None) => return Err(Box::new(StatusCode::FORBIDDEN.into_response())),
+        Err(error) => {
+            tracing::warn!(%error, "could not look up the owner of a token");
+            return Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()));
+        }
+    };
+    let (groups, is_admin) = if principal.is_service_account() {
+        (policy.groups_for_service_account(owner.id), false)
+    } else {
+        let provider_id = oidc.id_for_issuer(&owner.issuer).unwrap_or_default();
+        (
+            policy.groups_for(owner.id, &provider_id, &owner.groups),
+            owner.is_admin,
+        )
+    };
+    admin_or_forbidden(
+        policy
+            .permissions_for(owner.id, &groups, is_admin)
+            .has(Permission::GatewayAdmin),
+    )
+}
+
+fn admin_or_forbidden(is_admin: bool) -> Result<(), Box<Response>> {
+    if is_admin {
+        Ok(())
+    } else {
+        Err(Box::new(StatusCode::FORBIDDEN.into_response()))
+    }
+}
+
 /// Gateway status endpoint
 pub(super) async fn get_status(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let status = state.gateway.ask(GetStatus).await.map_err(|e| {
-        tracing::error!("Failed to get status: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    Ok(Json(status))
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_status_access(&state, &headers, client_ip.as_deref()).await {
+        return *response;
+    }
+    match state.gateway.ask(GetStatus).await {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get status: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Detailed gateway status endpoint
 pub(super) async fn get_detailed_status(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let status = state.gateway.ask(GetDetailedStatus).await.map_err(|e| {
-        tracing::error!("Failed to get detailed status: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    Ok(Json(status))
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_status_access(&state, &headers, client_ip.as_deref()).await {
+        return *response;
+    }
+    match state.gateway.ask(GetDetailedStatus).await {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get detailed status: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Prometheus metrics endpoint

@@ -20,7 +20,7 @@ use crate::store::{AuditRecord, ServiceAccount, SessionUser, User};
 
 /// Admin actions answer errors with 4xx/5xx and a flash fragment; htmx drops
 /// those responses unless told to swap them.
-const HTMX_CONFIG: &str = r#"{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}"#;
+const HTMX_CONFIG: &str = r#"{"includeIndicatorStyles":false,"allowEval":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}"#;
 
 pub(super) const CARD: &str = "mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900";
 pub(super) const HEADING: &str = "text-lg font-semibold text-slate-900 dark:text-slate-100";
@@ -205,7 +205,7 @@ pub(super) fn render_layout(
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 meta name="csrf-token" content=(user.csrf_token);
                 meta name="htmx-config" content=(HTMX_CONFIG);
-                script src="https://unpkg.com/htmx.org@2.0.4" defer {};
+                script src="/static/htmx-2.0.4.min.js" defer {};
                 link rel="stylesheet" href="/styles/output.css?v=1";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=(hx_headers) {
@@ -1192,7 +1192,6 @@ mod tests {
             },
             provider_id: String::from("pocket"),
             csrf_token: String::from("tok-123"),
-            id_token: None,
         }
     }
 

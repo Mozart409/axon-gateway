@@ -70,6 +70,21 @@ const SENSITIVE_KEYS: &[&str] = &[
     "private_key",
 ];
 
+/// Prefixes of string values that are credentials whatever their key is called,
+/// masked in redacted mode (matched case-sensitively).
+const SECRET_VALUE_PREFIXES: &[&str] = &[
+    "axon_pat_",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "-----BEGIN",
+];
+
 /// What to keep of a call's arguments
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -347,6 +362,45 @@ fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_KEYS.iter().any(|part| key.contains(part))
 }
 
+/// Whether `text` starts with `prefix`, ignoring ASCII case.
+fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// Three non-empty base64url segments separated by dots, the first one a JSON
+/// header (`eyJ` is `{"`).
+fn looks_like_jwt(text: &str) -> bool {
+    let mut segments = text.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    header.starts_with("eyJ")
+        && [header, payload, signature].iter().all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+}
+
+/// Whether a string value looks like a credential, whatever key it sits under.
+fn is_secret_value(text: &str) -> bool {
+    let text = text.trim_start();
+    starts_with_ignore_case(text, "Bearer ")
+        || starts_with_ignore_case(text, "Basic ")
+        || looks_like_jwt(text.trim_end())
+        || SECRET_VALUE_PREFIXES
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+}
+
 /// `text`, cut at `max_bytes` on a char boundary with a marker when longer.
 fn truncate_string(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
@@ -384,6 +438,9 @@ fn clean(value: &Value, redact: bool, drop_keys: &[String]) -> Value {
                 .map(|item| clean(item, redact, drop_keys))
                 .collect(),
         ),
+        Value::String(text) if redact && is_secret_value(text) => {
+            Value::String(REDACTED.to_owned())
+        }
         Value::String(text) => Value::String(truncate_string(text, MAX_STRING_BYTES)),
         other => other.clone(),
     }
@@ -393,8 +450,10 @@ fn clean(value: &Value, redact: bool, drop_keys: &[String]) -> Value {
 ///
 /// Keys in `drop_keys` (compared case-insensitively) are removed at any depth.
 /// In [`CaptureMode::Redacted`] the value under a key that contains
-/// `password`, `secret`, `token` and the like is replaced by `[redacted]`. In
-/// both modes strings over 2 KiB are truncated.
+/// `password`, `secret`, `token` and the like is replaced by `[redacted]`, and
+/// so is any string value, under any key, that looks like a credential (a
+/// `Bearer`/`Basic` header value, a JWT, a known token prefix, a private key).
+/// In both modes strings over 2 KiB are truncated.
 #[must_use]
 pub fn prepare_arguments(args: &Value, mode: CaptureMode, drop_keys: &[String]) -> Option<Value> {
     match mode {
@@ -758,6 +817,65 @@ mod tests {
             prepared,
             json!({"token": "[redacted]", "secret": "[redacted]", "passwords": "[redacted]"})
         );
+    }
+
+    #[test]
+    fn redacted_masks_credential_looking_values_under_any_key() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln-_x";
+        let args = json!({
+            "header": "bearer abc",
+            "basic": "BASIC dXNlcjpwYXNz",
+            "jwt": jwt,
+            "pat": "axon_pat_abc123",
+            "openai": "sk-abc",
+            "gh": ["ghp_x", {"deep": "gho_x"}],
+            "gh2": "github_pat_x",
+            "gl": "glpat-x",
+            "slack": "xoxb-1",
+            "slack2": "xoxp-1",
+            "aws": "AKIAABCDEFGH",
+            "pem": "-----BEGIN PRIVATE KEY-----\nabc",
+        });
+        let prepared = prepare_arguments(&args, CaptureMode::Redacted, &[]).unwrap();
+        assert_eq!(
+            prepared,
+            json!({
+                "header": "[redacted]",
+                "basic": "[redacted]",
+                "jwt": "[redacted]",
+                "pat": "[redacted]",
+                "openai": "[redacted]",
+                "gh": ["[redacted]", {"deep": "[redacted]"}],
+                "gh2": "[redacted]",
+                "gl": "[redacted]",
+                "slack": "[redacted]",
+                "slack2": "[redacted]",
+                "aws": "[redacted]",
+                "pem": "[redacted]",
+            })
+        );
+    }
+
+    #[test]
+    fn redacted_keeps_ordinary_values_that_resemble_credentials() {
+        let args = json!({
+            "a": "Bearer",
+            "b": "the bearer of news",
+            "c": "eyJ.only.two.dots.here",
+            "d": "eyJabc.def",
+            "e": "task-list",
+            "f": "see sk-abc",
+            "g": "/etc/hosts",
+        });
+        let prepared = prepare_arguments(&args, CaptureMode::Redacted, &[]).unwrap();
+        assert_eq!(prepared, args);
+    }
+
+    #[test]
+    fn full_keeps_credential_looking_values() {
+        let args = json!({"a": "Bearer abc", "b": "ghp_x"});
+        let prepared = prepare_arguments(&args, CaptureMode::Full, &[]).unwrap();
+        assert_eq!(prepared, args);
     }
 
     #[test]

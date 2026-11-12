@@ -208,10 +208,10 @@ has the same dashboard JSON and Prometheus rules.
 | `/health`                               | GET    | Health check                                        |
 | `/livez`                                | GET    | Liveness probe (200 while the process is up)        |
 | `/readyz`                               | GET    | Readiness probe (503 if the gateway actor stopped)  |
-| `/status`                               | GET    | Gateway status (backend list, counts)               |
-| `/status/detailed`                      | GET    | Detailed status with tool/resource/prompt lists     |
-| `/status/toolsets`                      | GET    | List configured toolsets                            |
-| `/status/groups`                        | GET    | Deprecated alias of `/status/toolsets`              |
+| `/status`                               | GET    | Gateway status (backend list, counts); in multi-user mode needs `gateway.admin` |
+| `/status/detailed`                      | GET    | Detailed status with tool/resource/prompt lists; in multi-user mode needs `gateway.admin` |
+| `/status/toolsets`                      | GET    | List configured toolsets; in multi-user mode needs `gateway.admin` |
+| `/status/groups`                        | GET    | Deprecated alias of `/status/toolsets` (same `gateway.admin` rule) |
 | `/metrics`                              | GET    | Prometheus metrics endpoint                         |
 
 ## MCP Endpoint

@@ -11,7 +11,7 @@
 //! `no-store`.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
@@ -20,9 +20,10 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::admin_ui::{
-    AdminForm, admin_for, backend_names, error_response, fragment, not_found, page_error,
-    split_globs,
+    AdminForm, admin_for, backend_names, error_response, flash_response, fragment, not_found,
+    page_error, split_globs,
 };
+use super::auth::within_limit;
 use super::tokens_views::{
     AccountRow, Issued, ServiceAccountsOverview, render_service_accounts_page,
     render_service_accounts_section, render_tokens_page, render_tokens_section,
@@ -148,6 +149,28 @@ pub(super) fn granted_backends(state: &AppState, session: &SessionUser) -> Vec<S
     policy.effective(&groups).backends()
 }
 
+/// Tokens a user may mint per minute, personal and service-account tokens together
+const MINT_LIMIT_PER_MINUTE: u32 = 10;
+
+/// Counts a token mint for `user` in the shared window: `false` when the limit is used up.
+/// Without a store there is nothing to count in.
+pub(super) async fn mint_allowed(state: &AppState, user: Uuid) -> bool {
+    match state.store.as_ref() {
+        Some(store) => {
+            within_limit(store, &format!("token_mint:{user}"), MINT_LIMIT_PER_MINUTE).await
+        }
+        None => true,
+    }
+}
+
+/// The action error of a mint over the limit
+fn mint_limited() -> Response {
+    flash_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many tokens created, try again in a minute".to_owned(),
+    )
+}
+
 /// The session and the token service, or the 404 outside multi-user mode
 /// (boxed: a `Response` is large for an error type).
 pub(super) fn tokens_for(
@@ -214,6 +237,9 @@ pub(super) async fn handle_token_create(
         Ok(pair) => pair,
         Err(response) => return *response,
     };
+    if !mint_allowed(&state, session.user.id).await {
+        return mint_limited();
+    }
     let form = match TokenForm::parse(&pairs) {
         Ok(form) => form,
         Err(error) => return error_response(&error),
@@ -394,10 +420,13 @@ pub(super) async fn handle_account_token_create(
     Path(id): Path<Uuid>,
     AdminForm(pairs): AdminForm<FormPairs>,
 ) -> Response {
-    let (_, admin) = match admin_for(&state, user).await {
+    let (session, admin) = match admin_for(&state, user).await {
         Ok(pair) => pair,
         Err(response) => return *response,
     };
+    if !mint_allowed(&state, session.user.id).await {
+        return mint_limited();
+    }
     let form = match TokenForm::parse(&pairs) {
         Ok(form) => form,
         Err(error) => return error_response(&error),

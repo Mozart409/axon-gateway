@@ -875,6 +875,20 @@ async fn active_false_disables_the_user_and_active_true_enables_them_again() {
         .scim(Method::GET, &format!("/Users/{id}"), &token, None)
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The patches, the disable/enable they caused and the delete are audited
+    let actions = audit_actions(&h, &admin).await;
+    for action in [
+        "scim.user.update",
+        "scim.user.delete",
+        "user.disable",
+        "user.enable",
+    ] {
+        assert!(
+            actions.contains(&(action.to_string(), "scim:mock".to_string())),
+            "{action} in {actions:?}"
+        );
+    }
 }
 
 #[tokio::test]

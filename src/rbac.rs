@@ -1427,7 +1427,6 @@ mod tests {
             user: store.upsert_user_on_login(&login).await.unwrap(),
             provider_id: "mock".to_owned(),
             csrf_token: "token".to_owned(),
-            id_token: None,
         }
     }
 

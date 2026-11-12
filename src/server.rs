@@ -43,7 +43,7 @@ use std::time::SystemTime;
 use axum::{
     Router,
     extract::State,
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -272,6 +272,19 @@ pub fn create_router(state: AppState) -> Router {
         .merge(mcp_routes(&state))
         .route_service("/styles/output.css", ServeFile::new("styles/output.css"))
         .route_service("/favicon.svg", ServeFile::new("static/favicon.svg"))
+        // Scripts are served from the binary, so the pages need no third-party origin
+        .route(
+            "/static/htmx-2.0.4.min.js",
+            get(|| async { script(HTMX_JS, CACHE_IMMUTABLE) }),
+        )
+        .route(
+            "/static/htmx-ext-sse-2.2.2.js",
+            get(|| async { script(HTMX_SSE_JS, CACHE_IMMUTABLE) }),
+        )
+        .route(
+            "/static/copy-url.js",
+            get(|| async { script(COPY_URL_JS, CACHE_ONE_HOUR) }),
+        )
         // UI endpoints
         .merge(ui_routes)
         // Dashboard login
@@ -325,7 +338,84 @@ pub fn create_router(state: AppState) -> Router {
         // Outermost, so the request id exists before TraceLayer opens its span
         .layer(middleware::from_fn(request_id_middleware))
         .fallback(ui::handle_not_found)
+        // After the fallback, so the 404 page gets the headers too
+        .layer(middleware::map_response_with_state(
+            state.clone(),
+            security_headers_middleware,
+        ))
         .with_state(state)
+}
+
+const HTMX_JS: &str = include_str!("../static/htmx-2.0.4.min.js");
+const HTMX_SSE_JS: &str = include_str!("../static/htmx-ext-sse-2.2.2.js");
+const COPY_URL_JS: &str = include_str!("../static/copy-url.js");
+/// The htmx files carry their version in the path, so they never change.
+const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+const CACHE_ONE_HOUR: &str = "public, max-age=3600";
+
+/// Every script the pages load comes from `'self'`: no inline script, no `eval`, no
+/// inline style, no other origin. No `form-action`: the logout and OAuth consent
+/// POSTs redirect to other origins.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+    img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; \
+    frame-ancestors 'none'";
+
+/// A JavaScript file served from memory.
+fn script(body: &'static str, cache_control: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        body,
+    )
+}
+
+/// Add the security headers a handler did not set itself (the OAuth consent page
+/// sets its own CSP).
+async fn security_headers_middleware(
+    State(state): State<AppState>,
+    response: Response,
+) -> Response {
+    let https = state
+        .base_url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    with_security_headers(response, https)
+}
+
+fn with_security_headers(mut response: Response, https: bool) -> Response {
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    let headers = response.headers_mut();
+    headers
+        .entry(header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(header::REFERRER_POLICY)
+        .or_insert(HeaderValue::from_static("same-origin"));
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    if https {
+        headers
+            .entry(header::STRICT_TRANSPORT_SECURITY)
+            .or_insert(HeaderValue::from_static(
+                "max-age=63072000; includeSubDomains",
+            ));
+    }
+    if is_html {
+        headers
+            .entry(header::CONTENT_SECURITY_POLICY)
+            .or_insert(HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+        headers
+            .entry(header::CACHE_CONTROL)
+            .or_insert(HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 /// Request ID for tracing
@@ -538,6 +628,136 @@ mod tests {
             mcp_allowed_hosts: Arc::new(std::sync::RwLock::new(Vec::new())),
             personal: None,
             db_config: None,
+        }
+    }
+
+    async fn get_path(path: &str) -> (Response, String) {
+        let response = create_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .method(http::Method::GET)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("body should be readable");
+        let html = String::from_utf8_lossy(&body).into_owned();
+        (Response::from_parts(parts, Body::empty()), html)
+    }
+
+    /// A response from a one-route router wrapped in the security headers layer.
+    async fn through_layer(
+        response: impl IntoResponse + Clone + Send + Sync + 'static,
+    ) -> Response {
+        Router::new()
+            .route("/", get(move || async move { response.clone() }))
+            .layer(middleware::map_response_with_state(
+                test_state(),
+                security_headers_middleware,
+            ))
+            .oneshot(Request::new(Body::empty()))
+            .await
+            .expect("router should respond")
+    }
+
+    fn header_of<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+        response.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn html_response_gets_csp_and_nosniff() {
+        let response = through_layer(axum::response::Html("<p>hi</p>")).await;
+        let csp = header_of(&response, "content-security-policy").expect("csp should be set");
+        assert!(csp.starts_with("default-src 'none'; script-src 'self'"));
+        assert!(!csp.contains("form-action"));
+        assert_eq!(
+            header_of(&response, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(header_of(&response, "x-frame-options"), Some("DENY"));
+        assert_eq!(header_of(&response, "referrer-policy"), Some("same-origin"));
+        assert_eq!(header_of(&response, "cache-control"), Some("no-store"));
+        // test_state() has an http base URL
+        assert_eq!(header_of(&response, "strict-transport-security"), None);
+    }
+
+    #[tokio::test]
+    async fn handler_set_csp_is_preserved() {
+        let response = through_layer((
+            [(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")],
+            axum::response::Html("<p>consent</p>"),
+        ))
+        .await;
+        assert_eq!(
+            header_of(&response, "content-security-policy"),
+            Some("frame-ancestors 'none'")
+        );
+        assert_eq!(
+            header_of(&response, "x-content-type-options"),
+            Some("nosniff")
+        );
+    }
+
+    #[tokio::test]
+    async fn json_response_gets_nosniff_but_no_csp() {
+        let response = through_layer(axum::Json(serde_json::json!({"ok": true}))).await;
+        assert_eq!(
+            header_of(&response, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(header_of(&response, "content-security-policy"), None);
+        assert_eq!(header_of(&response, "cache-control"), None);
+    }
+
+    #[test]
+    fn hsts_is_set_only_for_https() {
+        let plain = with_security_headers(Response::new(Body::empty()), false);
+        assert!(plain.headers().get("strict-transport-security").is_none());
+        let secure = with_security_headers(Response::new(Body::empty()), true);
+        assert_eq!(
+            header_of(&secure, "strict-transport-security"),
+            Some("max-age=63072000; includeSubDomains")
+        );
+    }
+
+    #[tokio::test]
+    async fn vendored_scripts_are_served_from_memory() {
+        let (response, body) = get_path("/static/htmx-2.0.4.min.js").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&response, "content-type"),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert!(header_of(&response, "cache-control").is_some_and(|v| v.contains("immutable")));
+        assert_eq!(
+            body.len(),
+            include_str!("../static/htmx-2.0.4.min.js").len()
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_pages_load_no_inline_or_third_party_script() {
+        for path in ["/", "/ui", "/no-such-page"] {
+            let (response, html) = get_path(path).await;
+            assert!(
+                header_of(&response, "content-security-policy").is_some(),
+                "{path} should carry a CSP"
+            );
+            assert!(!html.contains("unpkg.com"), "{path} loads from unpkg");
+            for (index, _) in html.match_indices("<script") {
+                let rest = &html[index..];
+                let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
+                assert!(
+                    tag.contains(" src=\"/static/"),
+                    "{path} has an inline script: {tag}"
+                );
+            }
+            assert!(!html.contains(" style="), "{path} has a style attribute");
         }
     }
 

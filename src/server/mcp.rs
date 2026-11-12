@@ -15,7 +15,7 @@ use std::time::Instant;
 use axum::{
     body::Body,
     extract::{RawPathParams, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
@@ -756,17 +756,21 @@ async fn own_toolset(
 /// List available toolsets
 pub(super) async fn list_toolsets(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let toolsets = state
-        .gateway
-        .ask(crate::gateway::GetToolsets)
-        .await
-        .map_err(|e| {
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) =
+        super::api::require_status_access(&state, &headers, client_ip.as_deref()).await
+    {
+        return *response;
+    }
+    match state.gateway.ask(crate::gateway::GetToolsets).await {
+        Ok(toolsets) => Json(json!({ "toolsets": toolsets })).into_response(),
+        Err(e) => {
             tracing::error!("Failed to list toolsets: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(Json(json!({ "toolsets": toolsets })))
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[cfg(test)]

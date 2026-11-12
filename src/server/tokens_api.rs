@@ -8,6 +8,7 @@
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
@@ -16,6 +17,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use super::admin_api::{ApiJson, ApiPath, ApiResult, admin};
+use super::tokens_ui::mint_allowed;
 use crate::principal::TokenScope;
 use crate::rbac::{AdminError, MyTokens, TokenState};
 use crate::store::{ApiToken, IssuedToken, JwtBinding, PAT_PREFIX, ServiceAccount, SessionUser};
@@ -128,6 +130,15 @@ impl CreateTokenBody {
     }
 }
 
+/// The 429 of a token mint over the per-user limit
+fn mint_limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({ "error": "too many tokens created, try again in a minute" })),
+    )
+        .into_response()
+}
+
 fn my_tokens<'a>(state: &'a AppState, session: &SessionUser) -> ApiResult<MyTokens<'a>> {
     MyTokens::from_state(state, session).ok_or_else(|| AdminError::NotFound.into())
 }
@@ -147,7 +158,10 @@ async fn handle_create_token(
     State(state): State<AppState>,
     Extension(session): Extension<SessionUser>,
     ApiJson(body): ApiJson<CreateTokenBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> ApiResult<Response> {
+    if !mint_allowed(&state, session.user.id).await {
+        return Ok(mint_limited());
+    }
     let issued = my_tokens(&state, &session)?
         .create(
             &body.name,
@@ -156,7 +170,7 @@ async fn handle_create_token(
             body.toolset_id,
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(issued_json(&issued))))
+    Ok((StatusCode::CREATED, Json(issued_json(&issued))).into_response())
 }
 
 /// `DELETE /api/v1/tokens/{id}`: revokes one of the caller's tokens
@@ -253,7 +267,10 @@ async fn handle_create_account_token(
     Extension(session): Extension<SessionUser>,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(body): ApiJson<CreateTokenBody>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
+) -> ApiResult<Response> {
+    if !mint_allowed(&state, session.user.id).await {
+        return Ok(mint_limited());
+    }
     if body.toolset_id.is_some() {
         return Err(AdminError::Invalid(
             "a service account token cannot be pinned to a toolset".to_owned(),
@@ -264,7 +281,7 @@ async fn handle_create_account_token(
         .await?
         .issue_service_account_token(id, &body.name, body.expires_in_days, &body.scope())
         .await?;
-    Ok((StatusCode::CREATED, Json(issued_json(&issued))))
+    Ok((StatusCode::CREATED, Json(issued_json(&issued))).into_response())
 }
 
 /// `DELETE /api/v1/service-accounts/{id}/tokens/{token_id}`

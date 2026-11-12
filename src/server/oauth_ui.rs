@@ -23,6 +23,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use super::admin_ui::{error_response, fragment, not_found, page_error};
+use super::auth::within_limit;
 use super::oauth::{consent_client_host, error_page, redirect_to_client};
 use super::oauth_views::{Consent, render_apps_page, render_apps_section, render_consent_page};
 use super::{AppState, reject_cross_site_middleware, session};
@@ -129,6 +130,9 @@ async fn handle_continue(
     unframeable(Html(page.into_string()).into_response())
 }
 
+/// Consent decisions per user and minute
+const DECISION_LIMIT_PER_MINUTE: u32 = 30;
+
 /// `POST /oauth/authorize/decision`: Approve issues a code and sends the browser back to
 /// the client, Deny sends it back with `access_denied`.
 async fn handle_decision(
@@ -148,6 +152,16 @@ async fn handle_decision(
     if !csrf_ok {
         tracing::warn!("Rejected an OAuth decision without a valid CSRF token");
         return (StatusCode::FORBIDDEN, "missing or invalid CSRF token\n").into_response();
+    }
+    // Per user, counted before the request is taken (a refused one stays valid)
+    let key = format!("oauth_decision:{}", session.user.id);
+    if !within_limit(store, &key, DECISION_LIMIT_PER_MINUTE).await {
+        return error_page(
+            &state,
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            "Too many decisions in a short time. Try again in a minute.",
+        );
     }
     let approve = match fields.get("decision").map(String::as_str) {
         Some("approve") => true,

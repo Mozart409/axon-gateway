@@ -16,7 +16,7 @@
 //! again. Redirects are off for the same reason: a redirect target would
 //! bypass the check.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -57,6 +57,7 @@ const DEFAULT_DENY: &[&str] = &[
     // IPv6 multicast.
     "ff00::/8",
     // 64:ff9b::/96 (NAT64) is deliberately absent: it maps public addresses.
+    // `allows` checks the IPv4 address embedded in it (and in 6to4 and Teredo).
 ];
 
 /// One allow or deny entry
@@ -234,19 +235,42 @@ impl EgressPolicy {
     /// The decision for one host and one of its addresses: a deny rule
     /// matching either refuses, then an allow rule matching either allows,
     /// then the built-in default-deny ranges refuse, otherwise allowed.
-    /// IPv4-mapped IPv6 addresses are matched as the IPv4 address.
+    /// IPv4-mapped IPv6 addresses are matched as the IPv4 address, and an
+    /// IPv4 address embedded in a NAT64, 6to4 or Teredo address is checked as
+    /// well as the IPv6 address itself: every one of them must be allowed.
+    ///
+    /// A host rule (exact or wildcard) relaxes only the host name test: an
+    /// address that is loopback, unspecified or link-local (cloud metadata
+    /// included) stays refused unless a CIDR or IP rule covers that address.
     #[must_use]
     pub fn allows(&self, host: &str, ip: IpAddr) -> bool {
         let host = host.to_ascii_lowercase();
         let host = host.strip_suffix('.').unwrap_or(&host);
         let ip = normalise(ip);
+        self.allows_one(host, ip) && embedded_ipv4(ip).is_none_or(|v4| self.allows_one(host, v4))
+    }
+
+    fn allows_one(&self, host: &str, ip: IpAddr) -> bool {
         if self.deny.iter().any(|r| r.matches(host, ip)) {
             return false;
         }
-        if self.allow.iter().any(|r| r.matches(host, ip)) {
+        if self.allow.iter().any(|r| match r {
+            Rule::Net(net) => net.contains(&ip),
+            Rule::Host(_) | Rule::Wildcard(_) => !always_refused(ip) && r.matches(host, ip),
+        }) {
             return true;
         }
         !self.default_deny.iter().any(|net| net.contains(&ip))
+    }
+}
+
+/// Loopback, unspecified and link-local addresses: a host rule never opens them.
+fn always_refused(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.to_bits() >> 24 == 0,
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.to_bits() >> 118 == 0xfe80 >> 6
+        }
     }
 }
 
@@ -256,6 +280,29 @@ fn normalise(ip: IpAddr) -> IpAddr {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         IpAddr::V4(_) => ip,
     }
+}
+
+/// The IPv4 address a transition-mechanism IPv6 address carries: NAT64
+/// `64:ff9b::/96` (last 32 bits), 6to4 `2002::/16` (bits 16 to 48) and Teredo
+/// `2001:0::/32` (the client address, last 32 bits inverted).
+fn embedded_ipv4(ip: IpAddr) -> Option<IpAddr> {
+    let IpAddr::V6(v6) = ip else {
+        return None;
+    };
+    let bits = v6.to_bits();
+    // The low 32 bits, or the 32 bits after the first 16.
+    let low = u32::try_from(bits & 0xffff_ffff).ok()?;
+    let mid = u32::try_from((bits >> 80) & 0xffff_ffff).ok()?;
+    let v4 = if bits >> 32 == 0x64_ff9b_0000_0000_0000_0000 {
+        Ipv4Addr::from_bits(low)
+    } else if bits >> 112 == 0x2002 {
+        Ipv4Addr::from_bits(mid)
+    } else if bits >> 96 == 0x2001_0000 {
+        Ipv4Addr::from_bits(!low)
+    } else {
+        return None;
+    };
+    Some(IpAddr::V4(v4))
 }
 
 impl PinnedTarget {
@@ -352,6 +399,47 @@ mod tests {
         // An allowed host opens its addresses too, even private ones.
         assert!(p.allows("MCP.Example.com.", ip("10.0.0.1")));
         assert!(!p.allows("other.example.com", ip("10.0.0.1")));
+    }
+
+    #[test]
+    fn embedded_ipv4_is_checked() {
+        let p = policy(&[], &[]);
+        // NAT64 of 10.0.0.1, 6to4 of 192.168.1.1, Teredo client 127.0.0.1.
+        assert!(!p.allows("example.com", ip("64:ff9b::a00:1")));
+        assert!(p.allows("example.com", ip("64:ff9b::808:808")));
+        assert!(!p.allows("example.com", ip("2002:c0a8:101::1")));
+        assert!(!p.allows("example.com", ip("2001:0:4136:e378:8000:63bf:80ff:fffe")));
+        assert!(p.allows("example.com", ip("2002:808:808::1")));
+    }
+
+    #[test]
+    fn host_rule_never_opens_loopback_unspecified_or_link_local() {
+        let p = policy(&["mcp.example.com", "*.homelab.internal"], &[]);
+        for denied in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!p.allows("mcp.example.com", ip(denied)), "{denied} allowed");
+            assert!(
+                !p.allows("a.homelab.internal", ip(denied)),
+                "{denied} allowed"
+            );
+        }
+        assert!(p.allows("mcp.example.com", ip("10.1.2.3")));
+        assert!(p.allows("a.homelab.internal", ip("fd00::1")));
+        assert!(p.allows("a.homelab.internal", ip("100.64.0.1")));
+    }
+
+    #[test]
+    fn cidr_rule_opens_loopback_for_a_host_rule() {
+        let p = policy(&["127.0.0.1/32", "mcp.example.com"], &[]);
+        assert!(p.allows("mcp.example.com", ip("127.0.0.1")));
+        assert!(!p.allows("mcp.example.com", ip("127.0.0.2")));
     }
 
     #[test]

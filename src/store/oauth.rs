@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use oauth2::{PkceCodeChallenge, PkceCodeVerifier};
+use serde_json::json;
 use sqlx::FromRow;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use super::auth::User;
+use super::rbac::{Actor, audit};
 use super::tokens::{
     INACTIVE_OWNER_SUSPEND, PUBLIC_ID_LEN, SECRET_LEN, TOKEN_TOUCH_INTERVAL, hash_secret,
     is_lower_hex, random_hex,
@@ -694,25 +696,80 @@ impl Store {
         .await?)
     }
 
-    /// Revokes a grant, only one of `owner` when given. `false` when there is no such live
-    /// grant.
+    /// Revokes a grant of `owner` (a user revoking their own), audited as that user.
+    /// `false` when there is no such live grant.
     ///
     /// # Errors
-    /// Fails when the query fails.
+    /// Fails when a query fails.
     pub async fn revoke_oauth_grant(
         &self,
         id: Uuid,
         owner: Option<Uuid>,
     ) -> Result<bool, StoreError> {
-        let result = sqlx::query(
+        let actor = match owner {
+            Some(owner) => {
+                let label: Option<String> = sqlx::query_scalar(
+                    "select coalesce(nullif(btrim(email), ''), subject) from users where id = $1",
+                )
+                .bind(owner)
+                .fetch_optional(&self.pool)
+                .await?;
+                Actor {
+                    user_id: Some(owner),
+                    label: label.unwrap_or_else(|| owner.to_string()),
+                }
+            }
+            None => Actor {
+                user_id: None,
+                label: "system".to_owned(),
+            },
+        };
+        self.revoke_grant_as(&actor, id, owner).await
+    }
+
+    /// Revokes anyone's grant on behalf of the admin `actor`. `false` when there is no such
+    /// live grant.
+    ///
+    /// # Errors
+    /// Fails when a query fails.
+    pub async fn admin_revoke_oauth_grant(
+        &self,
+        actor: &Actor,
+        id: Uuid,
+    ) -> Result<bool, StoreError> {
+        self.revoke_grant_as(actor, id, None).await
+    }
+
+    /// Revokes a grant, only one of `owner` when given, with its audit row
+    async fn revoke_grant_as(
+        &self,
+        actor: &Actor,
+        id: Uuid,
+        owner: Option<Uuid>,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let revoked: Option<(Uuid, String)> = sqlx::query_as(
             "update oauth_grants set revoked_at = now() \
-             where id = $1 and revoked_at is null and ($2::uuid is null or user_id = $2)",
+             where id = $1 and revoked_at is null and ($2::uuid is null or user_id = $2) \
+             returning user_id, client_id",
         )
         .bind(id)
         .bind(owner)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let Some((user_id, client_id)) = revoked else {
+            return Ok(false);
+        };
+        audit(
+            &mut tx,
+            actor,
+            "oauth_grant.revoke",
+            &format!("oauth_grant:{id}"),
+            json!({ "user_id": user_id, "client_id": client_id }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Deletes what can no longer matter: expired requests, codes and tokens, grants revoked
@@ -1105,5 +1162,60 @@ mod tests {
             .await
             .unwrap();
         assert!(!again);
+    }
+
+    #[tokio::test]
+    async fn revoking_a_grant_is_audited_with_the_actor() {
+        let Some(store) = test_store("oauth_revocation_audit").await else {
+            return;
+        };
+        let alice = user(&store, "alice").await;
+        let mine = issue(&store, alice).await;
+        let theirs = issue(&store, alice).await;
+        let admin = Actor {
+            user_id: None,
+            label: "root".to_owned(),
+        };
+
+        assert!(
+            store
+                .revoke_oauth_grant(mine.grant_id, Some(alice))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .admin_revoke_oauth_grant(&admin, theirs.grant_id)
+                .await
+                .unwrap()
+        );
+        // Nothing live is left: no new row for a repeat
+        assert!(
+            !store
+                .admin_revoke_oauth_grant(&admin, theirs.grant_id)
+                .await
+                .unwrap()
+        );
+
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("select action, actor, target from audit_log order by id")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "oauth_grant.revoke".to_owned(),
+                    "alice".to_owned(),
+                    format!("oauth_grant:{}", mine.grant_id)
+                ),
+                (
+                    "oauth_grant.revoke".to_owned(),
+                    "root".to_owned(),
+                    format!("oauth_grant:{}", theirs.grant_id)
+                ),
+            ]
+        );
     }
 }

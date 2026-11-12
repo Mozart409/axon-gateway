@@ -530,7 +530,7 @@ impl BackendActor {
                 let url = self.config.url.as_ref().ok_or("Missing URL for backend")?;
                 tracing::info!(
                     "Connecting via streamable HTTP to: {} (transport: {:?})",
-                    url,
+                    redact_url(url),
                     self.config.transport
                 );
 
@@ -566,7 +566,7 @@ impl BackendActor {
                 let service = timeout(connect_timeout, self.client_handler(probe).serve(transport))
                     .await
                     .map_err(|_| format!("Connection timeout after {}s", self.config.timeout_secs))?
-                    .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+                    .map_err(|e| format!("Failed to connect to {}: {e}", redact_url(url)))?;
 
                 tracing::info!(
                     "Connected to backend '{}', server info: {:?}",
@@ -584,7 +584,7 @@ impl BackendActor {
                     .ok_or("Missing command for stdio backend")?;
                 let args = self.config.args.as_deref().unwrap_or(&[]);
 
-                tracing::info!("Spawning stdio process: {} {:?}", cmd, args);
+                tracing::info!("Spawning stdio process: {} ({} args)", cmd, args.len());
 
                 let mut command = Command::new(cmd);
                 command.args(args);
@@ -753,7 +753,7 @@ impl BackendActor {
         );
 
         for resource in &resource_defs {
-            tracing::debug!("  - {}: {:?}", resource.uri, resource.name);
+            tracing::debug!("  - {}: {:?}", redact_url(&resource.uri), resource.name);
         }
 
         Ok(resource_defs)
@@ -1296,12 +1296,15 @@ impl Message<CallTool> for BackendActor {
         };
         let dispatcher = self.progress.clone();
         self.spawn_call(ctx, labels, move |peer| {
-            tracing::info!(
-                "Backend '{}' executing tool '{}' with args: {}",
-                backend,
-                msg.tool_name,
-                msg.arguments
-            );
+            tracing::info!("Backend '{}' executing tool '{}'", backend, msg.tool_name);
+            if let Some(args) = msg.arguments.as_object() {
+                tracing::debug!(
+                    "Backend '{}' tool '{}' argument names: {:?}",
+                    backend,
+                    msg.tool_name,
+                    sorted_keys(args.keys())
+                );
+            }
 
             // Convert arguments to JsonObject if it's an object, otherwise use empty
             let mut params = CallToolRequestParams::new(msg.tool_name);
@@ -1322,6 +1325,24 @@ impl Message<CallTool> for BackendActor {
         })
         .await
     }
+}
+
+/// The argument names of a call in sorted order, for logs: names only, never values
+fn sorted_keys<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<&'a str> {
+    let mut names: Vec<&str> = keys.map(String::as_str).collect();
+    names.sort_unstable();
+    names
+}
+
+/// A URL for logs: without userinfo, query and fragment, which can carry credentials
+fn redact_url(url: &str) -> String {
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return base.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{host}{path}")
 }
 
 /// Read a resource from this backend
@@ -1347,7 +1368,11 @@ impl Message<ReadResource> for BackendActor {
             serialize_failed: "Failed to serialize resource result",
         };
         self.spawn_call(ctx, labels, move |peer| {
-            tracing::info!("Backend '{}' reading resource '{}'", backend, msg.uri);
+            tracing::info!(
+                "Backend '{}' reading resource '{}'",
+                backend,
+                redact_url(&msg.uri)
+            );
 
             let mut params = ReadResourceRequestParams::new(msg.uri);
             inject_trace_context(&mut params, msg.trace.as_ref());
@@ -1382,12 +1407,15 @@ impl Message<GetPrompt> for BackendActor {
             serialize_failed: "Failed to serialize prompt result",
         };
         self.spawn_call(ctx, labels, move |peer| {
-            tracing::info!(
-                "Backend '{}' getting prompt '{}' with args: {:?}",
-                backend,
-                msg.name,
-                msg.arguments
-            );
+            tracing::info!("Backend '{}' getting prompt '{}'", backend, msg.name);
+            if let Some(args) = &msg.arguments {
+                tracing::debug!(
+                    "Backend '{}' prompt '{}' argument names: {:?}",
+                    backend,
+                    msg.name,
+                    sorted_keys(args.keys())
+                );
+            }
 
             // Convert HashMap<String, String> to serde_json::Map<String, Value>
             let args_map = msg.arguments.map(|args| {

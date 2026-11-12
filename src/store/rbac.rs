@@ -1338,6 +1338,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_audit_log_refuses_updates_and_deletes() {
+        let Some(store) = test_store("axon_store_audit_append_only").await else {
+            return;
+        };
+        store.create_group(&cli(), "ops", None).await.unwrap();
+
+        let update = sqlx::query("update audit_log set action = 'tampered'")
+            .execute(&store.pool)
+            .await;
+        assert!(update.is_err());
+        let delete = sqlx::query("delete from audit_log")
+            .execute(&store.pool)
+            .await;
+        assert!(delete.is_err());
+
+        let log = store.audit_log(10, None).await.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].action, "group.create");
+    }
+
+    #[tokio::test]
     async fn users_are_listed_by_email_then_name_then_subject() {
         let Some(store) = test_store("axon_store_rbac_users").await else {
             return;

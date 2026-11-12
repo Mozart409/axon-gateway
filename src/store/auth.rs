@@ -14,7 +14,8 @@ use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
 use super::rbac::{Actor, audit};
-use super::{Store, StoreError};
+use super::{SealedColumns, Store, StoreError};
+use crate::crypto::{Keyring, Sealed};
 
 /// A session that has not been used for this long is gone
 pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_hours(12);
@@ -79,7 +80,6 @@ pub struct SessionUser {
     pub user: User,
     pub provider_id: String,
     pub csrf_token: String,
-    pub id_token: Option<String>,
 }
 
 impl fmt::Debug for SessionUser {
@@ -88,7 +88,6 @@ impl fmt::Debug for SessionUser {
             .field("user", &self.user)
             .field("provider_id", &self.provider_id)
             .field("csrf_token", &"<redacted>")
-            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -124,7 +123,6 @@ struct SessionRow {
     is_admin: bool,
     provider_id: String,
     csrf_token: String,
-    id_token: Option<String>,
 }
 
 impl From<SessionRow> for SessionUser {
@@ -141,7 +139,6 @@ impl From<SessionRow> for SessionUser {
             },
             provider_id: row.provider_id,
             csrf_token: row.csrf_token,
-            id_token: row.id_token,
         }
     }
 }
@@ -149,6 +146,11 @@ impl From<SessionRow> for SessionUser {
 /// The SHA-256 of a secret, hex encoded: the only form that is stored
 pub(super) fn hash_secret(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
+}
+
+/// What the sealed ID token of a session is bound to: its token hash
+fn id_token_aad(token_hash: &str) -> String {
+    format!("session-id-token:{token_hash}")
 }
 
 /// 32 random bytes, hex encoded
@@ -198,6 +200,9 @@ pub(super) async fn set_user_disabled_in(
     .await?;
     Ok(true)
 }
+
+/// A session's sealed ID token: `kek_id`, `dek` and `data`, all set or all null.
+type SealedIdToken = (Option<String>, Option<Vec<u8>>, Option<Vec<u8>>);
 
 impl Store {
     /// Creates the user or updates the existing one by `(issuer, subject)`,
@@ -297,7 +302,9 @@ impl Store {
         Ok(true)
     }
 
-    /// Opens a session for `user_id` and returns its plaintext secrets.
+    /// Opens a session for `user_id` and returns its plaintext secrets. An
+    /// `id_token` is kept sealed with the keyring (for the logout hint); a
+    /// session without one just logs out without a hint.
     ///
     /// # Errors
     /// Fails when the system cannot supply randomness or the insert fails.
@@ -305,19 +312,32 @@ impl Store {
         &self,
         user_id: Uuid,
         provider_id: &str,
-        id_token: Option<&str>,
+        id_token: Option<(&Keyring, &str)>,
     ) -> Result<NewSession, StoreError> {
         let token = random_secret()?;
         let csrf_token = random_secret()?;
+        let token_hash = hash_secret(&token);
+        // A token that cannot be sealed is not kept: the login still works, the
+        // logout just has no hint
+        let sealed = id_token.and_then(|(keyring, id_token)| {
+            keyring
+                .seal(id_token.as_bytes(), id_token_aad(&token_hash).as_bytes())
+                .map(SealedColumns::from)
+                .inspect_err(|error| tracing::warn!(%error, "could not seal an ID token"))
+                .ok()
+        });
         sqlx::query(
-            "insert into sessions (token_hash, user_id, provider_id, csrf_token, id_token, expires_at) \
-             values ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
+            "insert into sessions (token_hash, user_id, provider_id, csrf_token, \
+                                   id_token_kek_id, id_token_dek, id_token_data, expires_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))",
         )
-        .bind(hash_secret(&token))
+        .bind(&token_hash)
         .bind(user_id)
         .bind(provider_id)
         .bind(&csrf_token)
-        .bind(id_token)
+        .bind(sealed.as_ref().map(|sealed| sealed.kek_id.as_str()))
+        .bind(sealed.as_ref().map(|sealed| sealed.dek.as_slice()))
+        .bind(sealed.as_ref().map(|sealed| sealed.data.as_slice()))
         .bind(SESSION_MAX_AGE.as_secs_f64())
         .execute(&self.pool)
         .await?;
@@ -335,7 +355,7 @@ impl Store {
         let row: Option<SessionRow> = sqlx::query_as(
             "with session as ( \
                  select s.id as session_id, u.id, u.issuer, u.subject, u.email, u.display_name, \
-                        u.groups, u.is_admin, s.provider_id, s.csrf_token, s.id_token \
+                        u.groups, u.is_admin, s.provider_id, s.csrf_token \
                  from sessions s join users u on u.id = s.user_id \
                  where s.token_hash = $1 \
                    and u.disabled_at is null \
@@ -347,7 +367,7 @@ impl Store {
                    and last_seen_at < now() - make_interval(secs => $3) \
              ) \
              select id, issuer, subject, email, display_name, groups, is_admin, \
-                    provider_id, csrf_token, id_token \
+                    provider_id, csrf_token \
              from session",
         )
         .bind(hash_secret(token))
@@ -356,6 +376,38 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(SessionUser::from))
+    }
+
+    /// The ID token a session was opened with, for the logout hint. `None`
+    /// when there is none, and, after a warning that never carries the value,
+    /// when the lookup or the unsealing fails: the logout then has no hint.
+    pub async fn session_id_token(&self, token: &str, keyring: &Keyring) -> Option<String> {
+        let token_hash = hash_secret(token);
+        let row: Result<Option<SealedIdToken>, _> = sqlx::query_as(
+            "select id_token_kek_id, id_token_dek, id_token_data from sessions \
+                 where token_hash = $1",
+        )
+        .bind(&token_hash)
+        .fetch_optional(&self.pool)
+        .await;
+        let (Some(kek_id), Some(dek), Some(data)) = (match row {
+            Ok(Some(columns)) => columns,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the ID token of a session");
+                return None;
+            }
+        }) else {
+            return None;
+        };
+        let sealed = Sealed::from(&SealedColumns { kek_id, dek, data });
+        match keyring.open(&sealed, id_token_aad(&token_hash).as_bytes()) {
+            Ok(plaintext) => String::from_utf8(plaintext).ok(),
+            Err(error) => {
+                tracing::warn!(%error, "could not open the ID token of a session");
+                None
+            }
+        }
     }
 
     /// Ends a session. `false` when there was none.
@@ -480,11 +532,9 @@ mod tests {
             },
             provider_id: "main".to_string(),
             csrf_token: "csrf-secret".to_string(),
-            id_token: Some("id-token-secret".to_string()),
         };
         let rendered = format!("{session:?}");
         assert!(!rendered.contains("csrf-secret"));
-        assert!(!rendered.contains("id-token-secret"));
 
         let rendered = format!("{:?}", flow());
         assert!(!rendered.contains("verifier-secret"));
@@ -539,17 +589,13 @@ mod tests {
             .await
             .unwrap();
 
-        let new = store
-            .create_session(user.id, "main", Some("id-token"))
-            .await
-            .unwrap();
+        let new = store.create_session(user.id, "main", None).await.unwrap();
 
         let found = store.session_user(&new.token).await.unwrap().unwrap();
         assert_eq!(found.user, user);
         assert_eq!(found.provider_id, "main");
         assert_eq!(found.csrf_token.len(), 64);
         assert_ne!(found.csrf_token, new.token);
-        assert_eq!(found.id_token.as_deref(), Some("id-token"));
 
         let stored: String = sqlx::query_scalar("select token_hash from sessions")
             .fetch_one(&store.pool)
@@ -559,6 +605,67 @@ mod tests {
         assert_eq!(stored, hash_secret(&new.token));
 
         assert!(store.session_user("unknown-token").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_id_token_is_sealed_at_rest() {
+        let Some(store) = test_store("axon_store_session_id_token").await else {
+            return;
+        };
+        let keyring = Keyring::from_text("k1:0123456789abcdef0123456789abcdef-secret").unwrap();
+        let user = store
+            .upsert_user_on_login(&login(&[], false))
+            .await
+            .unwrap();
+        let id_token = "header.payload.signature-secret";
+        let new = store
+            .create_session(user.id, "main", Some((&keyring, id_token)))
+            .await
+            .unwrap();
+
+        let plaintext_column: i64 = sqlx::query_scalar(
+            "select count(*) from information_schema.columns \
+             where table_schema = current_schema() and table_name = 'sessions' \
+             and column_name = 'id_token'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(plaintext_column, 0);
+        let data: Vec<u8> = sqlx::query_scalar("select id_token_data from sessions")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            !data
+                .windows(id_token.len())
+                .any(|window| window == id_token.as_bytes())
+        );
+
+        assert_eq!(
+            store
+                .session_id_token(&new.token, &keyring)
+                .await
+                .as_deref(),
+            Some(id_token)
+        );
+        // Moved to another session row, the sealed token no longer opens
+        let other = store.create_session(user.id, "main", None).await.unwrap();
+        sqlx::query(
+            "update sessions set id_token_kek_id = o.id_token_kek_id, id_token_dek = o.id_token_dek, \
+                    id_token_data = o.id_token_data \
+             from sessions o where o.token_hash = $1 and sessions.token_hash = $2",
+        )
+        .bind(hash_secret(&new.token))
+        .bind(hash_secret(&other.token))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(store.session_id_token(&other.token, &keyring).await, None);
+        assert_eq!(
+            store.session_id_token("unknown-token", &keyring).await,
+            None
+        );
     }
 
     #[tokio::test]

@@ -218,7 +218,7 @@ pub fn http_request_span<B>(request: &Request<B>, request_id: &str) -> Span {
         "http_request",
         request_id = %request_id,
         method = %method,
-        uri = %request.uri(),
+        uri = %request.uri().path(),
         otel.kind = "server",
         otel.name = %otel_span_name(method.as_str(), route),
         http.response.status_code = tracing::field::Empty,

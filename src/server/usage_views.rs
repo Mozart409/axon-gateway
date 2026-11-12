@@ -22,7 +22,8 @@ const STATS: &str = "mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4";
 const STAT: &str = "rounded-lg border border-slate-200 px-4 py-3 dark:border-slate-800";
 const STAT_VALUE: &str = "text-2xl font-semibold text-slate-900 dark:text-slate-100";
 const BAR_TRACK: &str = "h-2 w-full min-w-24 rounded bg-slate-100 dark:bg-slate-800";
-const BAR: &str = "h-2 rounded bg-orange-500 dark:bg-orange-400";
+/// The bar is an SVG rect: a `style` attribute would need `unsafe-inline` in the CSP.
+const BAR: &str = "block h-2 w-full fill-orange-500 dark:fill-orange-400";
 const NUMBER: &str = "whitespace-nowrap text-right tabular-nums";
 /// The windows offered as links, in days
 const WINDOWS: [i32; 3] = [7, 30, 90];
@@ -127,7 +128,9 @@ fn daily_section(daily: &[DailyUsage]) -> Markup {
                                 td class=(format!("{TD} whitespace-nowrap")) { (day.day.to_string()) }
                                 td class=(format!("{TD} w-full")) {
                                     div class=(BAR_TRACK) {
-                                        div class=(BAR) style=(format!("width: {}%", bar_percent(day.calls, most))) {}
+                                        svg class=(BAR) aria-hidden="true" {
+                                            rect width=(format!("{}%", bar_percent(day.calls, most))) height="100%" rx="4" {}
+                                        }
                                     }
                                 }
                                 td class=(format!("{TD} {NUMBER}")) { (thousands(day.calls)) }
@@ -438,9 +441,9 @@ mod tests {
         assert!(html.contains("12 ms"));
         assert!(html.contains("251 ms"));
         assert!(html.contains("2026-03-02"));
-        assert!(html.contains("width: 50%"));
-        assert!(html.contains("width: 100%"));
-        assert!(html.contains("width: 0%"));
+        assert!(html.contains(r#"width="50%""#));
+        assert!(html.contains(r#"width="100%""#));
+        assert!(html.contains(r#"width="0%""#));
         assert!(html.contains("Top tools"));
     }
 

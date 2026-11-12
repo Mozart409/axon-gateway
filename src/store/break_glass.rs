@@ -128,8 +128,8 @@ impl Store {
         };
 
         sqlx::query(
-            "insert into sessions (token_hash, user_id, provider_id, csrf_token, id_token, expires_at) \
-             values ($1, $2, $3, $4, null, now() + make_interval(secs => $5))",
+            "insert into sessions (token_hash, user_id, provider_id, csrf_token, expires_at) \
+             values ($1, $2, $3, $4, now() + make_interval(secs => $5))",
         )
         .bind(hash_secret(&token))
         .bind(user_id)
@@ -190,7 +190,6 @@ mod tests {
         assert_eq!(resolved.user.id, session.user_id);
         assert_eq!(resolved.user.issuer, BREAK_GLASS_ISSUER);
         assert_eq!(resolved.provider_id, BREAK_GLASS_PROVIDER);
-        assert_eq!(resolved.id_token, None);
 
         assert!(
             store

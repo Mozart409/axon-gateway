@@ -946,3 +946,64 @@ async fn tokens_are_not_found_in_standalone_mode() {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
     }
 }
+
+#[tokio::test]
+async fn status_endpoints_need_gateway_admin_in_database_mode() {
+    let Some(h) = Harness::start("axon_tokens_status").await else {
+        return;
+    };
+    let admin = h.login_as("root", "root@example.com", &["admins"]).await;
+    let alice = h
+        .login_as("alice", "alice@example.com", &["it-claim"])
+        .await;
+    let (_, admin_pat) = h.create_pat(&admin, json!({ "name": "admin" })).await;
+    let (_, alice_pat) = h.create_pat(&alice, json!({ "name": "alice" })).await;
+
+    let get = |path: &'static str, bearer: Option<&str>| {
+        let request = h.client.get(h.url(path));
+        let request = match bearer {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        async move { request.send().await.unwrap() }
+    };
+
+    for path in [
+        "/status",
+        "/status/detailed",
+        "/status/toolsets",
+        "/status/groups",
+    ] {
+        let resp = get(path, None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer", "{path}");
+        let resp = get(path, Some("axon_pat_garbage")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let resp = get(path, Some(&alice_pat)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        let resp = get(path, Some(&admin_pat)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    let detailed: Value = get("/status/detailed", Some(&admin_pat))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detailed["backends"][0]["name"], "files");
+
+    // A dashboard session works the same way
+    for (session, expected) in [(&admin, StatusCode::OK), (&alice, StatusCode::FORBIDDEN)] {
+        let resp = h
+            .api(Method::GET, "/status/detailed", session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected);
+    }
+
+    // Probes and metrics stay open
+    for path in ["/health", "/livez", "/readyz", "/build", "/metrics"] {
+        let resp = get(path, None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+}

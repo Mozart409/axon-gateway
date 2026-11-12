@@ -291,6 +291,19 @@ async fn write_user(
     id: Uuid,
     attrs: &UserAttrs,
 ) -> Result<ScimUser, ScimStoreError> {
+    let before: Option<ScimUser> = sqlx::query_as(concat!(
+        "select ",
+        user_columns!(),
+        " from scim_users where provider = $1 and id = $2 for no key update"
+    ))
+    .bind(provider)
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(before) = before else {
+        return Err(ScimStoreError::NotFound);
+    };
+    let changed = changed_attributes(&before.attrs(), attrs);
     let user: Option<ScimUser> = sqlx::query_as(concat!(
         "update scim_users set user_name = $3, external_id = $4, display_name = $5, \
              given_name = $6, family_name = $7, name_formatted = $8, emails = $9, \
@@ -314,7 +327,24 @@ async fn write_user(
     let Some(user) = user else {
         return Err(ScimStoreError::NotFound);
     };
-    Ok(finish_user(conn, rule, user, "scim.user.update").await?)
+    Ok(finish_user(conn, rule, user, "scim.user.update", &changed).await?)
+}
+
+/// The names of the attributes that differ, for the audit row (never values)
+fn changed_attributes(before: &UserAttrs, after: &UserAttrs) -> Vec<&'static str> {
+    [
+        ("userName", before.user_name != after.user_name),
+        ("externalId", before.external_id != after.external_id),
+        ("displayName", before.display_name != after.display_name),
+        ("givenName", before.given_name != after.given_name),
+        ("familyName", before.family_name != after.family_name),
+        ("formatted", before.name_formatted != after.name_formatted),
+        ("emails", before.emails != after.emails),
+        ("active", before.active != after.active),
+    ]
+    .into_iter()
+    .filter_map(|(name, differs)| differs.then_some(name))
+    .collect()
 }
 
 /// Rewrites `users.groups` of the logins linked to these SCIM users from their
@@ -469,6 +499,7 @@ async fn finish_user(
     rule: &LinkRule,
     user: ScimUser,
     action: &str,
+    changed: &[&str],
 ) -> Result<ScimUser, StoreError> {
     if try_link(conn, rule, &user).await? {
         refresh_groups(conn, &[user.id]).await?;
@@ -479,7 +510,7 @@ async fn finish_user(
         &user.provider,
         action,
         &format!("scim-user:{}", user.user_name),
-        json!({ "id": user.id, "active": user.active }),
+        json!({ "id": user.id, "active": user.active, "changed": changed }),
     )
     .await?;
     fetch_user(conn, user.id).await
@@ -492,6 +523,12 @@ async fn members_of(conn: &mut PgConnection, group_id: Uuid) -> Result<HashSet<U
             .fetch_all(conn)
             .await?;
     Ok(ids.into_iter().collect())
+}
+
+fn sorted_ids<'a>(ids: impl Iterator<Item = &'a Uuid>) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = ids.copied().collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Fails unless every id is a SCIM user of the provider
@@ -615,7 +652,13 @@ async fn apply_group_changes(
         provider,
         "scim.group.update",
         &format!("scim-group:{}", group.display_name),
-        json!({ "id": id, "members": after.len() }),
+        json!({
+            "id": id,
+            "members": after.len(),
+            "added": sorted_ids(after.difference(&before)),
+            "removed": sorted_ids(before.difference(&after)),
+            "renamed": renamed,
+        }),
     )
     .await?;
     Ok(group)
@@ -775,7 +818,7 @@ impl Store {
         .fetch_one(&mut *tx)
         .await
         .map_err(|error| conflict_or(error, user_name_taken(&attrs.user_name)))?;
-        let user = finish_user(&mut tx, rule, user, "scim.user.create").await?;
+        let user = finish_user(&mut tx, rule, user, "scim.user.create", &[]).await?;
         tx.commit().await?;
         Ok(user)
     }

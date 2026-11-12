@@ -7,6 +7,7 @@
 //! every call and never notify other replicas, configuration columns do.
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use sqlx::FromRow;
 use sqlx::types::Json;
 use thiserror::Error;
@@ -14,7 +15,8 @@ use uuid::Uuid;
 
 use crate::config::CredentialField;
 
-use super::{Store, StoreError};
+use super::rbac::audit;
+use super::{Actor, Store, StoreError};
 
 /// Longest stored error text, in characters
 const MAX_ERROR_CHARS: usize = 500;
@@ -348,7 +350,27 @@ impl From<CredentialRow> for UserCredential {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretRef {
     Personal(Uuid),
-    Credential { user_id: Uuid, backend: String },
+    Credential {
+        user_id: Uuid,
+        backend: String,
+    },
+    /// The client secret registered at a backend's authorization server
+    UpstreamClient {
+        backend: String,
+        issuer: String,
+    },
+    /// One user's tokens for a backend that runs its own authorization server
+    UpstreamToken {
+        user_id: Uuid,
+        backend: String,
+    },
+    /// The refresh token an identity provider gave at login
+    IdpRefresh {
+        user_id: Uuid,
+        provider: String,
+    },
+    /// The OAuth client secret of a catalog entry
+    CatalogOauth(String),
 }
 
 #[derive(FromRow)]
@@ -362,6 +384,9 @@ struct SealedPersonalRow {
 fn truncated(error: &str) -> String {
     error.chars().take(MAX_ERROR_CHARS).collect()
 }
+
+/// Two key columns and a sealed secret's `kek_id`, `dek` and `data`.
+type KeyedSealedRow<A> = (A, String, String, Vec<u8>, Vec<u8>);
 
 impl Store {
     /// The personal backends of one user, by prefix.
@@ -560,15 +585,17 @@ impl Store {
         Ok(row.map(Into::into))
     }
 
-    /// Creates a catalog entry.
+    /// Creates a catalog entry and audits it as `actor`.
     ///
     /// # Errors
     /// Fails with [`PersonalError::Exists`] when the name is taken, or when the query
     /// fails.
     pub async fn create_catalog_entry(
         &self,
+        actor: &Actor,
         new: &NewCatalogEntry,
     ) -> Result<CatalogEntry, PersonalError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
         let row: CatalogRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "insert into catalog_entries \
              (name, description, url, credential_fields, created_by, auth, oauth_client_id, \
@@ -586,22 +613,37 @@ impl Store {
         .bind(new.oauth_secret.as_ref().map(|s| s.kek_id.as_str()))
         .bind(new.oauth_secret.as_ref().map(|s| s.dek.as_slice()))
         .bind(new.oauth_secret.as_ref().map(|s| s.data.as_slice()))
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_unique)?;
+        audit(
+            &mut tx,
+            actor,
+            "catalog.create",
+            &format!("catalog:{}", new.name),
+            json!({
+                "auth": new.auth.as_str(),
+                "oauth_secret": if new.oauth_secret.is_some() { "set" } else { "none" },
+            }),
+        )
+        .await?;
+        tx.commit().await.map_err(StoreError::from)?;
         Ok(row.into())
     }
 
-    /// Changes the given fields of a catalog entry and bumps `updated_at`. `None`
-    /// when there is no such entry.
+    /// Changes the given fields of a catalog entry and bumps `updated_at`, and
+    /// audits it as `actor` with the names of the fields, never their values.
+    /// `None` when there is no such entry.
     ///
     /// # Errors
     /// Fails when the query fails.
     pub async fn update_catalog_entry(
         &self,
+        actor: &Actor,
         name: &str,
         update: &CatalogEntryUpdate,
     ) -> Result<Option<CatalogEntry>, StoreError> {
+        let mut tx = self.pool.begin().await?;
         let row: Option<CatalogRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "update catalog_entries set \
              description = case when $2 then nullif($3, '') else description end, \
@@ -631,17 +673,51 @@ impl Store {
         .bind(secret_part(&update.oauth_secret, |s| s.kek_id.as_str()))
         .bind(secret_part(&update.oauth_secret, |s| s.dek.as_slice()))
         .bind(secret_part(&update.oauth_secret, |s| s.data.as_slice()))
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(row.map(Into::into))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let fields: Vec<&str> = [
+            ("description", update.description.is_some()),
+            ("url", update.url.is_some()),
+            ("credential_fields", update.credential_fields.is_some()),
+            ("enabled", update.enabled.is_some()),
+            ("auth", update.auth.is_some()),
+            ("oauth_client_id", update.oauth_client_id.is_some()),
+            ("oauth_scopes", update.oauth_scopes.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, changed)| changed.then_some(field))
+        .collect();
+        let oauth_secret = match update.oauth_secret {
+            SecretUpdate::Keep => "unchanged",
+            SecretUpdate::Set(_) => "set",
+            SecretUpdate::Clear => "cleared",
+        };
+        audit(
+            &mut tx,
+            actor,
+            "catalog.update",
+            &format!("catalog:{name}"),
+            json!({ "fields": fields, "oauth_secret": oauth_secret }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(row.into()))
     }
 
     /// Deletes a catalog entry together with every user's credentials for it, in
-    /// one transaction. `false` when there is no such entry.
+    /// one transaction, and audits it as `actor`. `false` when there is no such
+    /// entry.
     ///
     /// # Errors
     /// Fails when the transaction fails.
-    pub async fn delete_catalog_entry(&self, name: &str) -> Result<bool, StoreError> {
+    pub async fn delete_catalog_entry(
+        &self,
+        actor: &Actor,
+        name: &str,
+    ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("delete from catalog_entries where name = $1")
             .bind(name)
@@ -650,10 +726,18 @@ impl Store {
         if result.rows_affected() == 0 {
             return Ok(false);
         }
-        sqlx::query("delete from user_credentials where backend = $1")
+        let credentials = sqlx::query("delete from user_credentials where backend = $1")
             .bind(name)
             .execute(&mut *tx)
             .await?;
+        audit(
+            &mut tx,
+            actor,
+            "catalog.delete",
+            &format!("catalog:{name}"),
+            json!({ "credentials_removed": credentials.rows_affected() }),
+        )
+        .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -771,7 +855,8 @@ impl Store {
         .await?)
     }
 
-    /// Every sealed secret in both tables, for key rotation.
+    /// Every sealed secret in the personal tables, the upstream OAuth tables and
+    /// the catalog, for key rotation.
     ///
     /// # Errors
     /// Fails when a query fails.
@@ -811,6 +896,77 @@ impl Store {
                 credential.secret,
             )
         }));
+        secrets.extend(self.upstream_sealed_secrets().await?);
+        Ok(secrets)
+    }
+
+    /// The sealed secrets of the OAuth client side and of the catalog.
+    async fn upstream_sealed_secrets(&self) -> Result<Vec<(SecretRef, SealedColumns)>, StoreError> {
+        let sealed = |kek_id, dek, data| SealedColumns { kek_id, dek, data };
+        let mut secrets = Vec::new();
+
+        let clients: Vec<KeyedSealedRow<String>> = sqlx::query_as(
+            "select backend, issuer, secret_kek_id, secret_dek, secret_data \
+             from upstream_oauth_clients where secret_kek_id is not null",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        secrets.extend(
+            clients
+                .into_iter()
+                .map(|(backend, issuer, kek, dek, data)| {
+                    (
+                        SecretRef::UpstreamClient { backend, issuer },
+                        sealed(kek, dek, data),
+                    )
+                }),
+        );
+
+        let tokens: Vec<KeyedSealedRow<Uuid>> = sqlx::query_as(
+            "select user_id, backend, secret_kek_id, secret_dek, secret_data \
+             from upstream_oauth_tokens",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        secrets.extend(
+            tokens
+                .into_iter()
+                .map(|(user_id, backend, kek, dek, data)| {
+                    (
+                        SecretRef::UpstreamToken { user_id, backend },
+                        sealed(kek, dek, data),
+                    )
+                }),
+        );
+
+        let refresh: Vec<KeyedSealedRow<Uuid>> = sqlx::query_as(
+            "select user_id, provider, secret_kek_id, secret_dek, secret_data \
+             from idp_refresh_tokens",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        secrets.extend(
+            refresh
+                .into_iter()
+                .map(|(user_id, provider, kek, dek, data)| {
+                    (
+                        SecretRef::IdpRefresh { user_id, provider },
+                        sealed(kek, dek, data),
+                    )
+                }),
+        );
+
+        let catalog: Vec<(String, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "select name, oauth_secret_kek_id, oauth_secret_dek, oauth_secret_data \
+             from catalog_entries where oauth_secret_kek_id is not null",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        secrets.extend(
+            catalog.into_iter().map(|(name, kek, dek, data)| {
+                (SecretRef::CatalogOauth(name), sealed(kek, dek, data))
+            }),
+        );
         Ok(secrets)
     }
 
@@ -851,6 +1007,62 @@ impl Store {
                 .execute(&self.pool)
                 .await?
             }
+            SecretRef::UpstreamClient { backend, issuer } => {
+                sqlx::query(
+                    "update upstream_oauth_clients \
+                     set secret_kek_id = $3, secret_dek = $4, secret_data = $5 \
+                     where backend = $1 and issuer = $2 and secret_kek_id is not null",
+                )
+                .bind(backend)
+                .bind(issuer)
+                .bind(&sealed.kek_id)
+                .bind(&sealed.dek)
+                .bind(&sealed.data)
+                .execute(&self.pool)
+                .await?
+            }
+            // Not `updated_at`: that is when the tokens were last refreshed.
+            SecretRef::UpstreamToken { user_id, backend } => {
+                sqlx::query(
+                    "update upstream_oauth_tokens \
+                     set secret_kek_id = $3, secret_dek = $4, secret_data = $5 \
+                     where user_id = $1 and backend = $2",
+                )
+                .bind(user_id)
+                .bind(backend)
+                .bind(&sealed.kek_id)
+                .bind(&sealed.dek)
+                .bind(&sealed.data)
+                .execute(&self.pool)
+                .await?
+            }
+            SecretRef::IdpRefresh { user_id, provider } => {
+                sqlx::query(
+                    "update idp_refresh_tokens \
+                     set secret_kek_id = $3, secret_dek = $4, secret_data = $5 \
+                     where user_id = $1 and provider = $2",
+                )
+                .bind(user_id)
+                .bind(provider)
+                .bind(&sealed.kek_id)
+                .bind(&sealed.dek)
+                .bind(&sealed.data)
+                .execute(&self.pool)
+                .await?
+            }
+            SecretRef::CatalogOauth(name) => {
+                sqlx::query(
+                    "update catalog_entries \
+                     set oauth_secret_kek_id = $2, oauth_secret_dek = $3, oauth_secret_data = $4 \
+                     where name = $1 and oauth_secret_kek_id is not null",
+                )
+                .bind(name)
+                .bind(&sealed.kek_id)
+                .bind(&sealed.dek)
+                .bind(&sealed.data)
+                .execute(&self.pool)
+                .await?
+            }
         };
         Ok(result.rows_affected() > 0)
     }
@@ -864,6 +1076,7 @@ mod tests {
 
     use super::super::auth::LoginUser;
     use super::super::test_support::{database_url, isolated_url};
+    use super::super::upstream_oauth::NewUpstreamToken;
     use super::*;
 
     /// A connected store on its own schema, or `None` without a test database.
@@ -917,6 +1130,13 @@ mod tests {
             label: None,
             header: "Authorization".to_string(),
             prefix: Some("Bearer ".to_string()),
+        }
+    }
+
+    fn admin() -> Actor {
+        Actor {
+            user_id: None,
+            label: "admin".to_owned(),
         }
     }
 
@@ -1201,6 +1421,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn catalog_round_trip_and_delete_drops_credentials() {
         let Some(store) = test_store("axon_personal_catalog").await else {
             return;
@@ -1210,7 +1431,7 @@ mod tests {
         let schema = store.current_schema().await.unwrap();
 
         let created = store
-            .create_catalog_entry(&new_entry("zulip"))
+            .create_catalog_entry(&admin(), &new_entry("zulip"))
             .await
             .unwrap();
         assert_eq!(created.credential_fields.len(), 1);
@@ -1221,11 +1442,13 @@ mod tests {
         assert_eq!(change["kind"], "catalog");
         assert!(change.get("user").is_none());
         store
-            .create_catalog_entry(&new_entry("atlas"))
+            .create_catalog_entry(&admin(), &new_entry("atlas"))
             .await
             .unwrap();
         assert!(matches!(
-            store.create_catalog_entry(&new_entry("zulip")).await,
+            store
+                .create_catalog_entry(&admin(), &new_entry("zulip"))
+                .await,
             Err(PersonalError::Exists)
         ));
 
@@ -1241,6 +1464,7 @@ mod tests {
         // unspecified fields stay, a description can be cleared
         let updated = store
             .update_catalog_entry(
+                &admin(),
                 "zulip",
                 &CatalogEntryUpdate {
                     enabled: Some(false),
@@ -1257,6 +1481,7 @@ mod tests {
         assert_eq!(updated.description.as_deref(), Some("a catalog backend"));
         let cleared = store
             .update_catalog_entry(
+                &admin(),
                 "zulip",
                 &CatalogEntryUpdate {
                     description: Some(String::new()),
@@ -1270,7 +1495,7 @@ mod tests {
         assert_eq!(cleared.credential_fields.len(), 2);
         assert!(
             store
-                .update_catalog_entry("missing", &CatalogEntryUpdate::default())
+                .update_catalog_entry(&admin(), "missing", &CatalogEntryUpdate::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -1284,12 +1509,131 @@ mod tests {
             .set_user_credential(alice, "atlas", &sealed(2))
             .await
             .unwrap();
-        assert!(store.delete_catalog_entry("zulip").await.unwrap());
-        assert!(!store.delete_catalog_entry("zulip").await.unwrap());
+        assert!(store.delete_catalog_entry(&admin(), "zulip").await.unwrap());
+        assert!(!store.delete_catalog_entry(&admin(), "zulip").await.unwrap());
         assert!(store.catalog_entry("zulip").await.unwrap().is_none());
         let left = store.list_user_credentials(alice).await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].backend, "atlas");
+
+        // every mutation is audited, newest first, without secret values
+        let audit: Vec<_> = store
+            .audit_log(10, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.action.starts_with("catalog."))
+            .collect();
+        let actions: Vec<_> = audit
+            .iter()
+            .map(|record| (record.action.as_str(), record.target.as_str()))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("catalog.delete", "catalog:zulip"),
+                ("catalog.update", "catalog:zulip"),
+                ("catalog.update", "catalog:zulip"),
+                ("catalog.create", "catalog:atlas"),
+                ("catalog.create", "catalog:zulip"),
+            ]
+        );
+        assert!(audit.iter().all(|record| record.actor == "admin"));
+        assert_eq!(audit[0].details["credentials_removed"], 1);
+        assert_eq!(
+            audit[2].details["fields"],
+            json!(["credential_fields", "enabled"])
+        );
+        assert_eq!(audit[2].details["oauth_secret"], "unchanged");
+    }
+
+    #[tokio::test]
+    async fn rewrap_covers_every_sealed_secret() {
+        use crate::crypto::{Keyring, Sealed};
+
+        let Some(store) = test_store("axon_personal_rewrap").await else {
+            return;
+        };
+        let key_a = "a".repeat(32);
+        let key_b = "b".repeat(32);
+        let before = Keyring::from_text(&format!("a:{key_a}")).unwrap();
+        let rotating = Keyring::from_text(&format!("b:{key_b}\na:{key_a}")).unwrap();
+        let after = Keyring::from_text(&format!("b:{key_b}")).unwrap();
+        let seal = |aad: &str| SealedColumns::from(before.seal(b"secret", aad.as_bytes()).unwrap());
+
+        let alice = user(&store, "alice").await;
+        let expires_at = Utc::now() + Duration::from_secs(3600);
+        let client_aad = "upstream-client:atlas:https://idp.example";
+        let tokens_aad = format!("upstream-oauth:{alice}:atlas");
+        let refresh_aad = format!("idp-refresh:{alice}:corp");
+        let catalog_aad = "catalog-oauth:atlas";
+        store
+            .upsert_upstream_client(
+                "atlas",
+                "https://idp.example",
+                "client",
+                Some(&seal(client_aad)),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_upstream_token(&NewUpstreamToken {
+                user_id: alice,
+                backend: "atlas",
+                issuer: "https://idp.example",
+                client_id: "client",
+                token_endpoint: "https://idp.example/token",
+                scope: None,
+                token_auth_method: "none",
+                secret: &seal(&tokens_aad),
+                expires_at,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_idp_refresh_token(alice, "corp", &seal(&refresh_aad))
+            .await
+            .unwrap();
+        store
+            .create_catalog_entry(
+                &admin(),
+                &NewCatalogEntry {
+                    auth: CatalogAuthMode::OAuth,
+                    oauth_client_id: Some("client".to_owned()),
+                    oauth_secret: Some(seal(catalog_aad)),
+                    ..new_entry("atlas")
+                },
+            )
+            .await
+            .unwrap();
+
+        let secrets = store.sealed_secrets().await.unwrap();
+        assert_eq!(secrets.len(), 4);
+        for (target, columns) in secrets {
+            let fresh = rotating.rewrap(&Sealed::from(&columns)).unwrap().unwrap();
+            assert!(
+                store
+                    .replace_sealed(&target, &SealedColumns::from(fresh))
+                    .await
+                    .unwrap()
+            );
+        }
+
+        // the old key is gone: everything still opens, under the right AAD
+        let rewrapped = store.sealed_secrets().await.unwrap();
+        assert_eq!(rewrapped.len(), 4);
+        for (target, columns) in rewrapped {
+            let aad = match &target {
+                SecretRef::UpstreamClient { .. } => client_aad.to_owned(),
+                SecretRef::UpstreamToken { .. } => tokens_aad.clone(),
+                SecretRef::IdpRefresh { .. } => refresh_aad.clone(),
+                SecretRef::CatalogOauth(_) => catalog_aad.to_owned(),
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(columns.kek_id, "b");
+            let opened = after.open(&Sealed::from(&columns), aad.as_bytes()).unwrap();
+            assert_eq!(opened, b"secret");
+        }
     }
 
     #[tokio::test]

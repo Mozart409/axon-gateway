@@ -19,7 +19,7 @@
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
+use super::auth::{ClientIp, within_ip_limit};
 use super::views::{self, LoginOption};
 use super::{AppState, ui};
 use crate::oidc::OidcError;
@@ -42,6 +43,10 @@ pub(super) const LOGIN_COOKIE: &str = "__Host-axon_login";
 const LOGIN_TTL_SECS: i64 = 600;
 /// Header htmx sends the CSRF token in (set through `hx-headers`).
 const CSRF_HEADER: &str = "x-csrf-token";
+/// Logins started per client IP and minute
+const LOGIN_LIMIT_PER_MINUTE: u32 = 20;
+/// Login callbacks per client IP and minute
+const CALLBACK_LIMIT_PER_MINUTE: u32 = 20;
 
 /// Where a login may send the browser afterwards: a same-site absolute path
 /// only, so `?return_to=` cannot be turned into an open redirect. Defaults to
@@ -140,6 +145,20 @@ fn login_expired(state: &AppState) -> Response {
         "This login has expired",
         "It took too long, was already used, or was started in another browser. Try again.",
     )
+}
+
+/// 429 for a dashboard route that counted too many requests in a minute
+pub(super) fn too_many_requests(state: &AppState) -> Response {
+    let mut response = error_page(
+        state,
+        StatusCode::TOO_MANY_REQUESTS,
+        "Too many requests",
+        "Too many attempts in a short time. Try again in a minute.",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+    response
 }
 
 async fn not_found(state: &AppState) -> Response {
@@ -260,6 +279,7 @@ pub(super) async fn login_index(
 pub(super) async fn login_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    ClientIp(client_ip): ClientIp,
     Query(query): Query<LoginQuery>,
     jar: CookieJar,
 ) -> Response {
@@ -269,6 +289,10 @@ pub(super) async fn login_provider(
     let Some(provider) = providers.get(&id) else {
         return not_found(&state).await;
     };
+    // Counted before the flow row is inserted
+    if !within_ip_limit(store, "login", client_ip.as_deref(), LOGIN_LIMIT_PER_MINUTE).await {
+        return too_many_requests(&state);
+    }
 
     let redirect = match provider.authorize().await {
         Ok(redirect) => redirect,
@@ -313,15 +337,30 @@ pub(super) struct CallbackQuery {
 /// Finishes a login: checks the state, exchanges the code, opens a session.
 pub(super) async fn callback(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     jar: CookieJar,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
     let Some((store, providers)) = state.multi_user() else {
         return not_found(&state).await;
     };
+    if !within_ip_limit(
+        store,
+        "login_callback",
+        client_ip.as_deref(),
+        CALLBACK_LIMIT_PER_MINUTE,
+    )
+    .await
+    {
+        return too_many_requests(&state);
+    }
 
     let login_state = jar
         .get(LOGIN_COOKIE)
+        .map(|cookie| cookie.value().to_owned());
+    // A browser that logs in again leaves its old session behind
+    let previous_session = jar
+        .get(SESSION_COOKIE)
         .map(|cookie| cookie.value().to_owned());
     // Whatever happens next, this login attempt is over.
     let jar = jar.add(expired_cookie(LOGIN_COOKIE));
@@ -360,6 +399,12 @@ pub(super) async fn callback(
 
     match finish_login(&state, store, providers, &code, &returned_state).await {
         Ok((token, return_to)) => {
+            // Rotate: the session this browser had before is no longer valid
+            if let Some(previous) = previous_session
+                && let Err(error) = store.delete_session(&previous).await
+            {
+                tracing::warn!(%error, "could not delete the previous dashboard session");
+            }
             let jar = jar.add(host_cookie(SESSION_COOKIE, token, session_max_age_secs()));
             (jar, Redirect::to(&return_to)).into_response()
         }
@@ -473,8 +518,14 @@ async fn finish_login(
     {
         tracing::warn!(%error, provider = %flow.provider_id, "could not keep the identity provider's refresh token");
     }
+    // Without a key the ID token is not kept, and the logout has no hint
+    let keyring = state.db_config.as_ref().map(|db| db.keyring.as_ref());
     let session = store
-        .create_session(user.id, &flow.provider_id, Some(&login.id_token))
+        .create_session(
+            user.id,
+            &flow.provider_id,
+            keyring.map(|keyring| (keyring, login.id_token.as_str())),
+        )
         .await
         .map_err(|error| {
             tracing::warn!(%error, "could not open a dashboard session");
@@ -532,6 +583,11 @@ pub(super) async fn logout(
         return (StatusCode::FORBIDDEN, "missing or invalid CSRF token\n").into_response();
     }
 
+    // The hint is read before the session row goes
+    let id_token = match state.db_config.as_ref() {
+        Some(db) => store.session_id_token(&token, &db.keyring).await,
+        None => None,
+    };
     if let Err(error) = store.delete_session(&token).await {
         tracing::warn!(%error, "could not delete a dashboard session");
     }
@@ -540,7 +596,7 @@ pub(super) async fn logout(
     let location = match providers.get(&session.provider_id) {
         Some(provider) => {
             provider
-                .end_session_url(session.id_token.as_deref(), &landing)
+                .end_session_url(id_token.as_deref(), &landing)
                 .await
         }
         None => None,

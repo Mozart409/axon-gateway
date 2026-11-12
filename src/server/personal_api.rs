@@ -1021,7 +1021,7 @@ pub(super) async fn create_catalog_entry(
     };
     let entry = ctx
         .store
-        .create_catalog_entry(&new)
+        .create_catalog_entry(&actor(session), &new)
         .await
         .map_err(|error| {
             exists(
@@ -1148,7 +1148,7 @@ pub(super) async fn update_catalog_entry(
     };
     let entry = ctx
         .store
-        .update_catalog_entry(name, &update)
+        .update_catalog_entry(&actor(session), name, &update)
         .await?
         .ok_or_else(not_found)?;
     ctx.reload_catalog().await;
@@ -1165,7 +1165,11 @@ pub(super) async fn delete_catalog_entry(
     let ctx = Ctx::new(state, session)?;
     ctx.require(Permission::CatalogManage)?;
     ctx.editable_item(name)?;
-    if !ctx.store.delete_catalog_entry(name).await? {
+    if !ctx
+        .store
+        .delete_catalog_entry(&actor(session), name)
+        .await?
+    {
         return Err(not_found());
     }
     tracing::info!(user = %ctx.user(), %name, "Catalog entry deleted");

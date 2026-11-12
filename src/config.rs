@@ -286,7 +286,7 @@ pub struct ToolsetConfig {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct GatewayConfig {
     pub bind: String,
     #[serde(default = "default_base_url")]
@@ -309,6 +309,25 @@ pub struct GatewayConfig {
     /// stdio backends stay connected unless they set one.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for GatewayConfig {
+    // By hand, so the shared auth token can never end up in a log line.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayConfig")
+            .field("bind", &self.bind)
+            .field("base_url", &self.base_url)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("allow_stdio", &self.allow_stdio)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .finish()
+    }
 }
 
 /// Default value for `[gateway] idle_timeout_secs`
@@ -373,7 +392,7 @@ fn default_base_url() -> String {
 }
 
 /// Per-token configuration with permissions
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TokenConfig {
     /// Display name for this token
     pub name: String,
@@ -395,7 +414,22 @@ pub struct TokenConfig {
     pub metadata: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+impl std::fmt::Debug for TokenConfig {
+    // By hand, so the token value can never end up in a log line.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TokenConfig")
+            .field("name", &self.name)
+            .field("token", &"<redacted>")
+            .field("allowed_tools", &self.allowed_tools)
+            .field("allowed_backends", &self.allowed_backends)
+            .field("rate_limit_per_minute", &self.rate_limit_per_minute)
+            .field("metadata", &sorted_map_keys(&self.metadata))
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BackendConfig {
     /// Unique name, used as namespace prefix for tools
     pub name: String,
@@ -471,6 +505,51 @@ pub struct BackendConfig {
     /// For `passthrough` backends: how the user's token is exchanged
     #[serde(default)]
     pub passthrough: Option<PassthroughConfig>,
+}
+
+/// The keys of a secret map in sorted order, for `Debug`: the values stay out
+fn sorted_map_keys(map: &HashMap<String, String>) -> Vec<&str> {
+    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
+}
+
+impl std::fmt::Debug for BackendConfig {
+    // By hand, so the auth token, header values and environment values can
+    // never end up in a log line; the maps show their keys only.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BackendConfig")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("command", &self.command)
+            .field("args", &self.args.as_ref().map(Vec::len))
+            .field("transport", &self.transport)
+            .field("allowed_tools", &self.allowed_tools)
+            .field("enabled", &self.enabled)
+            .field("timeout_secs", &self.timeout_secs)
+            .field(
+                "health_check_interval_secs",
+                &self.health_check_interval_secs,
+            )
+            .field("max_consecutive_failures", &self.max_consecutive_failures)
+            .field(
+                "circuit_breaker_cooldown_secs",
+                &self.circuit_breaker_cooldown_secs,
+            )
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("headers", &sorted_map_keys(&self.headers))
+            .field("env", &sorted_map_keys(&self.env))
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .field("credential_mode", &self.credential_mode)
+            .field("credential_fields", &self.credential_fields)
+            .field("oauth", &self.oauth)
+            .field("passthrough", &self.passthrough)
+            .finish()
+    }
 }
 
 /// Whose credentials a backend connection uses

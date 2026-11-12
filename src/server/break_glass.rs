@@ -16,12 +16,15 @@ use axum_extra::extract::CookieJar;
 use maud::{DOCTYPE, Markup, html};
 use serde::Deserialize;
 
-use super::session::{SESSION_COOKIE, error_page, host_cookie};
+use super::auth::{ClientIp, within_ip_limit};
+use super::session::{SESSION_COOKIE, error_page, host_cookie, too_many_requests};
 use super::{AppState, ui, views};
 use crate::store::BREAK_GLASS_SESSION_MAX_AGE;
 
 /// Where a break-glass login lands
 const LANDING: &str = "/ui/admin";
+/// Page views and logins together, per client IP and minute
+const LIMIT_PER_MINUTE: u32 = 10;
 
 /// `/auth/break-glass`: the confirmation page and the login behind it.
 pub(super) fn routes() -> Router<AppState> {
@@ -100,9 +103,16 @@ fn render_confirm_page(state: &AppState, code: &str) -> Markup {
 }
 
 /// Shows the confirmation page; the code is not consumed here.
-async fn confirm_page(State(state): State<AppState>, Query(query): Query<CodeQuery>) -> Response {
-    if state.multi_user().is_none() {
+async fn confirm_page(
+    State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
+    Query(query): Query<CodeQuery>,
+) -> Response {
+    let Some((store, _)) = state.multi_user() else {
         return not_found(&state).await;
+    };
+    if !within_ip_limit(store, "break_glass", client_ip.as_deref(), LIMIT_PER_MINUTE).await {
+        return too_many_requests(&state);
     }
     let Some(code) = query.code.filter(|code| !code.is_empty()) else {
         return link_expired(&state);
@@ -120,6 +130,7 @@ async fn confirm_page(State(state): State<AppState>, Query(query): Query<CodeQue
 /// Consumes the code, opens the session and sends the browser to the admin UI.
 async fn redeem(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     headers: HeaderMap,
     jar: CookieJar,
     Form(form): Form<CodeForm>,
@@ -127,6 +138,9 @@ async fn redeem(
     let Some((store, _)) = state.multi_user() else {
         return not_found(&state).await;
     };
+    if !within_ip_limit(store, "break_glass", client_ip.as_deref(), LIMIT_PER_MINUTE).await {
+        return too_many_requests(&state);
+    }
     // A login is a state change too: a foreign page must not be able to sign
     // the browser in with a code it knows.
     if super::is_cross_site(&headers, &state.base_url) {
@@ -138,6 +152,14 @@ async fn redeem(
         Ok(Some(session)) => {
             tracing::warn!(user_id = %session.user_id, "break-glass admin login");
             crate::metrics::record_authn("break_glass", "ok");
+            // Rotate: the session this browser had before is no longer valid
+            if let Some(previous) = jar
+                .get(SESSION_COOKIE)
+                .map(|cookie| cookie.value().to_owned())
+                && let Err(error) = store.delete_session(&previous).await
+            {
+                tracing::warn!(%error, "could not delete the previous dashboard session");
+            }
             let max_age = i64::try_from(BREAK_GLASS_SESSION_MAX_AGE.as_secs()).unwrap_or(i64::MAX);
             let jar = jar.add(host_cookie(SESSION_COOKIE, session.token, max_age));
             (jar, Redirect::to(LANDING)).into_response()
