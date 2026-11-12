@@ -88,12 +88,6 @@ pub(super) fn render_landing_page(state: &AppState) -> Markup {
                             }
                             a
                                 class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                                href="/status"
-                            {
-                                "Gateway Status"
-                            }
-                            a
-                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
                                 href="/health"
                             {
                                 "Health"
@@ -245,10 +239,10 @@ pub(super) fn render_auth_error_page(state: &AppState, title: &str, message: &st
     }
 }
 
-/// Header strip for signed-in users: name, admin badge and the logout form.
+/// Header strip for signed-in users: name, group pills, admin badge and the logout form.
 /// The "Admin" link shows for users who may open the admin pages.
 pub(super) fn render_user_bar(state: &AppState, user: &SessionUser) -> Markup {
-    let (_, permissions) = resolve(&state.policy.current(), user);
+    let (groups, permissions) = resolve(&state.policy.current(), user);
     let admin_pages = permissions.has(Permission::GroupsManage)
         || permissions.has(Permission::RolesManage)
         || permissions.has(Permission::AuditRead);
@@ -314,6 +308,11 @@ pub(super) fn render_user_bar(state: &AppState, user: &SessionUser) -> Markup {
                 }
             }
             span class="font-medium text-slate-900 dark:text-slate-100" { (name) }
+            @for group in &groups {
+                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300" title="Group" {
+                    (group)
+                }
+            }
             @if permissions.is_admin() {
                 span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
                     "admin"
