@@ -2,6 +2,11 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.5.1 - 2026-11-12
+#### Bug Fixes
+- (**axon**) copy the vendored static scripts into the image build stage that embeds them - (2f50d66) - Amadeus Mader
+
+- - -
 ## v0.5.0 - 2026-11-12
 #### Features
 - (**axon**) move the configuration into the database with env-only startup, a config admin api and ui, live reload across replicas and admin import-config - (04f3752) - Amadeus Mader
