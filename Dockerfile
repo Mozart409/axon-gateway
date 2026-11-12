@@ -11,6 +11,8 @@ ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+# include_str! embeds the vendored htmx and the UI scripts at compile time.
+COPY static ./static
 
 # The commit the UI footer and /build show (`AXON_GIT_SHA`, read at compile
 # time); without it they say "dev".
