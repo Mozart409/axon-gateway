@@ -12,7 +12,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 
-RUN cargo build --release --locked
+# The commit the UI footer and /build show (`AXON_GIT_SHA`, read at compile
+# time); without it they say "dev".
+ARG REVISION=dev
+RUN AXON_GIT_SHA="$(printf '%.12s' "$REVISION")" cargo build --release --locked
 
 # Stage 2: Runtime (minimal Wolfi image)
 # Pinned by digest (the multi-arch index of `latest` on 2026-10-21) so a build
