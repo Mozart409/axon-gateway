@@ -1,49 +1,5 @@
-# Local development: the gateway in database mode with the MCP OAuth
-# authorization server, against a Postgres and a mock OIDC provider that
-# approves every login automatically. With AXON_DEV_AUTO_CONSENT below the
-# whole OAuth flow runs unattended: an agent or test client completes
-# discovery, authorization code + PKCE, login and consent with plain HTTP
-# redirects - no browser, no human, no script.
-#
-# DEVELOPMENT ONLY: the database password, the KEK and the OIDC client
-# secret are public dev values, and auto-consent removes the human approval
-# step. Never expose this stack beyond your machine.
 services:
-  axon-gateway:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    ports:
-      - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      RUST_LOG: info
-      AXON_DATABASE_URL: postgres://axon:axon-dev@postgres:5432/axon
-      AXON_BASE_URL: http://localhost:8080
-      # Dev-only key that seals stored secrets; any 32+ character value
-      # works locally (the KEK parser refuses shorter ones)
-      AXON_KEK: axon-dev-only-kek-do-not-use-in-prod
-      # The mock OIDC provider below; its issuer path is "default"
-      AXON_OIDC_ISSUER: http://mockoidc:8080/default
-      AXON_OIDC_CLIENT_ID: axon-dev
-      AXON_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc-client-secret
-      # Approve OAuth authorization requests without the consent page
-      AXON_DEV_AUTO_CONSENT: "1"
-    volumes:
-      - ./dev-oidc-client-secret:/run/secrets/oidc-client-secret:ro
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
   postgres:
-    # PostgreSQL 19; GA is due 2026-11-19, until then the newest published
-    # image is the release candidate. Bump to 19-alpine once it exists.
-    # The registry is always spelled out: podman then needs no short-name
-    # resolution.
     image: docker.io/library/postgres:19rc2-alpine
     environment:
       POSTGRES_USER: axon
@@ -56,17 +12,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
-  # ghcr.io/navikt/mock-oauth2-server with interactiveLogin disabled: its
-  # /authorize endpoint answers with a code redirect immediately, no login
-  # page. It accepts any client id and never checks the secret.
   mockoidc:
     image: ghcr.io/navikt/mock-oauth2-server:latest
     environment:
       JSON_CONFIG: '{"interactiveLogin": false}'
-      # The gateway dials the mock over the compose network. Map the port only
-      # if you want to inspect the provider from the host:
-      # ports:
-      #   - "4011:8080"
 volumes:
   axon-dev-pgdata:
