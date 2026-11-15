@@ -218,3 +218,9 @@ Section 4 describes each mitigation in detail.
   short-lived rows.
 - **Host and network security.** Container, database, TLS termination and
   network segmentation are the operator's job.
+
+Development only: setting `AXON_DEV_AUTO_CONSENT` in the environment makes the
+consent page skip itself, so every authorization request is approved
+automatically for the signed-in user. It is meant for the local compose stack
+(`example/compose.local.yml`), logs a startup warning, and must never be set on
+a deployment with real users.

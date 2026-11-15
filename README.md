@@ -93,7 +93,7 @@ Prebuilt images are published to `ghcr.io/mozart409/axon-gateway`. Example
 Compose files live in [`example/`](example/):
 
 - `compose.yml` — runs the published image (`ghcr.io/mozart409/axon-gateway:latest`)
-- `compose.local.yml` — builds the image from this repo
+- `compose.local.yml` — local development stack: database mode, Postgres and a mock OIDC provider; with `AXON_DEV_AUTO_CONSENT` the MCP OAuth flow runs unattended, no browser needed
 
 ```bash
 # from example/, with a config.toml alongside it
