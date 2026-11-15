@@ -93,7 +93,7 @@ Prebuilt images are published to `ghcr.io/mozart409/axon-gateway`. Example
 Compose files live in [`example/`](example/):
 
 - `compose.yml` — runs the published image (`ghcr.io/mozart409/axon-gateway:latest`)
-- `compose.local.yml` — local development stack: database mode, Postgres and a mock OIDC provider; with `AXON_DEV_AUTO_CONSENT` the MCP OAuth flow runs unattended, no browser needed
+- `compose.local.yml` — local development dependencies: Postgres and a mock OIDC provider for a gateway run on the host (see [Local UI Development](#local-ui-development))
 
 ```bash
 # from example/, with a config.toml alongside it
@@ -101,11 +101,7 @@ podman compose -f compose.yml up -d   # or: docker compose
 ```
 
 Mount your config read-only at `/app/config.toml` and pass it as the command
-argument (`compose.yml` does this). The development stack needs no config
-file: `podman compose -f compose.local.yml up -d` starts the gateway in
-[database mode](#database-mode) with Postgres and a mock OIDC provider that
-approves every login, so a client can complete the whole OAuth flow unattended
-(`AXON_DEV_AUTO_CONSENT` is documented in the file's comments).
+argument (`compose.yml` does this).
 
 In [database mode](#database-mode) mount no config: set `AXON_DATABASE_URL`, a KEK
 and the other variables of that section, and start the container without the
@@ -113,10 +109,10 @@ file argument.
 
 > **Healthcheck note:** the runtime image is the minimal Chainguard
 > `wolfi-base`, which ships **no HTTP client** — no `curl`, no `wget`, and its
-> busybox has no `wget` applet. The Compose healthchecks probe `/health` with
-> `wget`, so the Dockerfile installs the tiny Wolfi `wget` package
+> busybox has no `wget` applet. The `compose.yml` healthcheck probes `/health`
+> with `wget`, so the Dockerfile installs the tiny Wolfi `wget` package
 > (`apk add --no-cache wget`) specifically to make that check pass. Drop that
-> line only if you also remove the `healthcheck:` blocks from the Compose files.
+> line only if you also remove the `healthcheck:` block from `compose.yml`.
 
 > **DNS note:** the container's `/etc/resolv.conf` is fixed when it starts:
 > Podman and Docker copy the host's resolver settings at that moment. If a
@@ -280,15 +276,26 @@ UI routes use the same bearer auth logic as MCP/admin routes:
 
 ## Local UI Development
 
-From the repository root:
+Development runs in database mode and needs no config file.
 
 ```bash
-# terminal 1: run gateway
+# Postgres (127.0.0.1:5437) and a mock OIDC provider (127.0.0.1:4011)
+podman compose -f example/compose.local.yml up -d
+
+# terminal 1: run gateway (database mode, env in bacon.toml's run-long job)
 bacon run-long
 
 # terminal 2: rebuild Tailwind on change
 bacon css-watch
 ```
+
+Open http://localhost:8080/ui and sign in. The mock provider logs you in
+without a login page, as `dev`, a member of `axon-admins` and so an admin. No
+seed data is needed: add backends and tokens on the admin pages.
+`AXON_DEV_AUTO_CONSENT` skips the OAuth consent page, so an MCP client
+completes the OAuth flow unattended. All values are public dev values, so keep
+the stack on localhost. `podman compose -f example/compose.local.yml down -v`
+resets the database.
 
 Useful checks:
 

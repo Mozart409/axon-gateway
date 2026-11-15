@@ -107,6 +107,17 @@ allow_warnings = true
 background = false
 on_change_strategy = "kill_then_restart"
 env.RUST_LOG = "info"
+# Database mode against example/compose.local.yml (`just axon-up`); dev-only
+# values, and AXON_DEV_AUTO_CONSENT skips the OAuth consent page
+env.AXON_BIND = "127.0.0.1:8080"
+env.AXON_BASE_URL = "http://localhost:8080"
+env.AXON_DATABASE_URL = "postgres://axon:axon-dev@127.0.0.1:5437/axon"
+env.AXON_KEK = "axon-dev-only-kek-do-not-use-in-prod"
+env.AXON_OIDC_ISSUER = "http://localhost:4011/default"
+env.AXON_OIDC_CLIENT_ID = "axon-dev"
+env.AXON_OIDC_CLIENT_SECRET_FILE = "example/dev-oidc-client-secret"
+env.AXON_OIDC_ADMIN_GROUPS = "axon-admins"
+env.AXON_DEV_AUTO_CONSENT = "1"
 # kill = ["pkill", "-TERM", "-P"]
 
 # Watch and build Tailwind CSS in development

@@ -152,19 +152,26 @@ crates under `tests/` allow them at crate level.
 - SSE and HTTP transports both use rmcp's `StreamableHttpClientTransport`
 - Stdio transport uses rmcp's `TokioChildProcess` to spawn MCP servers
 - `auth_token` in `[gateway]` (standalone mode) only protects the MCP endpoint (`/mcp`), not the `/ui` dashboard. In database mode the UI needs an OIDC (or break-glass) session; every state-changing `/ui/actions/*` and cookie-authenticated `/api/v1/*` route goes through `reject_cross_site_middleware` (403 when `Sec-Fetch-Site` is not `same-origin`/`none` or the `Origin` matches neither `Host` nor `base_url`) and `require_csrf` (the session's `X-CSRF-Token`). There is no CORS layer at all (don't add `CorsLayer::permissive()` back). HTML responses carry a strict CSP (`script-src 'self'`): no inline `<script>` or `style=` attributes, htmx is served from `static/`. See `docs/threat-model.md`.
-- Runtime image is Chainguard `wolfi-base` (minimal): it ships **no** `curl`/`wget` and busybox has no `wget` applet. The Compose healthchecks probe `/health` with `wget`, so the Dockerfile must `apk add --no-cache wget` for them to pass — keep that line in sync with the `healthcheck:` blocks in `example/compose.yml` and `example/compose.local.yml`
+- Runtime image is Chainguard `wolfi-base` (minimal): it ships **no** `curl`/`wget` and busybox has no `wget` applet. The Compose healthchecks probe `/health` with `wget`, so the Dockerfile must `apk add --no-cache wget` for them to pass — keep that line in sync with the `healthcheck:` block in `example/compose.yml`
 - The runtime base is pinned by digest (`wolfi-base:latest@sha256:...`); bump the digest on purpose. The container runs as `USER 65532:65532` (wolfi's `nonroot`), so a mounted `config.toml`/`.env` must be readable by that UID
 - Threat model: `docs/threat-model.md` (assets, trust boundaries, actors, mitigations, residual risks); update it when auth, egress, audit or logging behaviour changes
 ## Tooling (yggdrasil monorepo)
 In yggdrasil the dev shell, justfile, lefthook and cog verify are the root
 ones. Run recipes from the repo root: `just axon-ci`, `axon-clippy`,
-`axon-test`, `axon-oci-build`, `axon-up`/`axon-down`. `flake.nix` (flake-parts +
-fenix) is for the standalone GitHub export; the root flake consumes it as a
-subflake with `nixpkgs`/`fenix`/`flake-parts` following its own, so its
-toolchain is yggdrasil's one stable Rust (`rust/toolchain.nix`), and
+`axon-test`, `axon-oci-build`, `axon-up`/`axon-down`, `axon-dev`. `flake.nix`
+(flake-parts + fenix) is for the standalone GitHub export; the root flake
+consumes it as a subflake with `nixpkgs`/`fenix`/`flake-parts` following its
+own, so its toolchain is yggdrasil's one stable Rust (`rust/toolchain.nix`), and
 `nix eval .#legacyPackages.x86_64-linux.rust-toolchain-sync` fails if the
 component lists drift. `cog.toml` and `release.sh` stay because the exported
 repo releases with them.
+
+Dev stack: `just axon-dev` (or `just axon-up`, then `bacon run-long`) runs the
+gateway on the host in database mode against `example/compose.local.yml`:
+Postgres on 127.0.0.1:5437 and a mock OIDC provider on 127.0.0.1:4011 whose
+`JSON_CONFIG` logs everyone in as `dev` in `axon-admins`. The env lives in
+bacon.toml's `run-long` job. There is no dev config file and no seed script;
+`just axon-down` resets the database.
 
 ## Rust Versions
 - **Toolchain** (dev shell, local builds): fenix stable from `flake.lock`, no

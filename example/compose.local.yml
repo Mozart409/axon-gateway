@@ -1,3 +1,6 @@
+# Dev only: Postgres and a mock OIDC provider for a gateway run on the host
+# (`bacon run-long`). The mock logs every login in as `dev`, a member of
+# `axon-admins`, so no seed data is needed.
 services:
   postgres:
     image: docker.io/library/postgres:19rc2-alpine
@@ -5,6 +8,8 @@ services:
       POSTGRES_USER: axon
       POSTGRES_PASSWORD: axon-dev
       POSTGRES_DB: axon
+    ports:
+      - "127.0.0.1:5437:5432"
     volumes:
       - axon-dev-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -14,7 +19,33 @@ services:
       retries: 10
   mockoidc:
     image: ghcr.io/navikt/mock-oauth2-server:latest
+    ports:
+      - "127.0.0.1:4011:8080"
     environment:
-      JSON_CONFIG: '{"interactiveLogin": false}'
+      JSON_CONFIG: |
+        {
+          "interactiveLogin": false,
+          "tokenCallbacks": [
+            {
+              "issuerId": "default",
+              "tokenExpiry": 3600,
+              "requestMappings": [
+                {
+                  "requestParam": "grant_type",
+                  "match": "*",
+                  "claims": {
+                    "sub": "dev",
+                    "aud": ["axon-dev"],
+                    "name": "Dev User",
+                    "preferred_username": "dev",
+                    "email": "dev@axon.test",
+                    "email_verified": true,
+                    "groups": ["axon-admins"]
+                  }
+                }
+              ]
+            }
+          ]
+        }
 volumes:
   axon-dev-pgdata:
