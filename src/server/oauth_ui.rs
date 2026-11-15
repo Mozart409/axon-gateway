@@ -94,7 +94,8 @@ fn expired_request(state: &AppState) -> Response {
     )
 }
 
-/// `GET /oauth/authorize/continue?request=<id>`: the consent page
+/// `GET /oauth/authorize/continue?request=<id>`: the consent page (with
+/// `AXON_DEV_AUTO_CONSENT` the request is approved here instead)
 #[derive(Debug, Deserialize)]
 struct ContinueQuery {
     request: Option<String>,
@@ -111,6 +112,9 @@ async fn handle_continue(
     let Some(id) = query.request.as_deref() else {
         return expired_request(&state);
     };
+    if state.dev_auto_consent {
+        return approve_request(&state, &session, id).await;
+    }
     let request = match store.auth_request(id).await {
         Ok(Some(request)) => request,
         Ok(None) => return expired_request(&state),
@@ -171,25 +175,39 @@ async fn handle_decision(
     let Some(id) = fields.get("request") else {
         return expired_request(&state);
     };
+    if approve {
+        return approve_request(&state, &session, id).await;
+    }
     let request = match store.take_auth_request(id).await {
         Ok(Some(request)) => request,
         Ok(None) => return expired_request(&state),
         Err(error) => return page_error(&state, &session, &AdminError::Store(error)),
     };
-    let client_state = request.state.as_deref();
 
-    if !approve {
-        tracing::info!(client_id = %request.client_id, "OAuth authorization denied");
-        return redirect_to_client(
-            &state,
-            &request.redirect_uri,
-            client_state,
-            &[
-                ("error", "access_denied"),
-                ("error_description", "the user denied the request"),
-            ],
-        );
-    }
+    tracing::info!(client_id = %request.client_id, "OAuth authorization denied");
+    redirect_to_client(
+        &state,
+        &request.redirect_uri,
+        request.state.as_deref(),
+        &[
+            ("error", "access_denied"),
+            ("error_description", "the user denied the request"),
+        ],
+    )
+}
+
+/// Consumes the pending request, issues a code and sends the browser back to the
+/// client with it
+async fn approve_request(state: &AppState, session: &SessionUser, id: &str) -> Response {
+    let Some((store, _)) = state.multi_user() else {
+        return not_found(state);
+    };
+    let request = match store.take_auth_request(id).await {
+        Ok(Some(request)) => request,
+        Ok(None) => return expired_request(state),
+        Err(error) => return page_error(state, session, &AdminError::Store(error)),
+    };
+    let client_state = request.state.as_deref();
     let code = store
         .create_oauth_code(&NewCode {
             client_id: &request.client_id,
@@ -205,7 +223,7 @@ async fn handle_decision(
         Ok(code) => {
             tracing::info!(client_id = %request.client_id, "OAuth authorization approved");
             redirect_to_client(
-                &state,
+                state,
                 &request.redirect_uri,
                 client_state,
                 &[("code", code.as_str())],
@@ -214,7 +232,7 @@ async fn handle_decision(
         Err(error) => {
             tracing::error!(%error, "Could not issue an OAuth authorization code");
             redirect_to_client(
-                &state,
+                state,
                 &request.redirect_uri,
                 client_state,
                 &[

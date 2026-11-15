@@ -101,7 +101,11 @@ podman compose -f compose.yml up -d   # or: docker compose
 ```
 
 Mount your config read-only at `/app/config.toml` and pass it as the command
-argument (both example files already do this).
+argument (`compose.yml` does this). The development stack needs no config
+file: `podman compose -f compose.local.yml up -d` starts the gateway in
+[database mode](#database-mode) with Postgres and a mock OIDC provider that
+approves every login, so a client can complete the whole OAuth flow unattended
+(`AXON_DEV_AUTO_CONSENT` is documented in the file's comments).
 
 In [database mode](#database-mode) mount no config: set `AXON_DATABASE_URL`, a KEK
 and the other variables of that section, and start the container without the

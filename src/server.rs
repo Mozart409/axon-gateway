@@ -130,6 +130,9 @@ pub struct AppState {
     /// What the configuration admin API needs to write the stored configuration;
     /// `None` in standalone mode
     pub db_config: Option<crate::dbconfig::DbConfigContext>,
+    /// `AXON_DEV_AUTO_CONSENT`: approve OAuth authorization requests without
+    /// the consent page; development only, warned about at startup
+    pub dev_auto_consent: bool,
 }
 
 impl AppState {
@@ -628,6 +631,7 @@ mod tests {
             mcp_allowed_hosts: Arc::new(std::sync::RwLock::new(Vec::new())),
             personal: None,
             db_config: None,
+            dev_auto_consent: false,
         }
     }
 

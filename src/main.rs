@@ -157,6 +157,15 @@ fn database_mode() -> bool {
     env::var(bootstrap::ENV_DATABASE_URL).is_ok_and(|url| !url.trim().is_empty())
 }
 
+/// Whether `AXON_DEV_AUTO_CONSENT` opts a dev deployment into approving
+/// OAuth authorization requests without the consent page
+fn dev_auto_consent() -> bool {
+    env::var("AXON_DEV_AUTO_CONSENT").is_ok_and(|value| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true")
+    })
+}
+
 /// The config file named on the command line or in `AXON_GATEWAY_CONFIG`, if any
 fn explicit_config_path() -> Option<String> {
     env::args()
@@ -255,6 +264,13 @@ async fn main() -> Result<()> {
     let telemetry = telemetry::init(env::var("AXON_LOG_JSON").is_ok());
 
     tracing::info!("Starting Axon Gateway v{}", env!("CARGO_PKG_VERSION"));
+
+    let dev_auto_consent = dev_auto_consent();
+    if dev_auto_consent {
+        tracing::warn!(
+            "AXON_DEV_AUTO_CONSENT is set: OAuth authorization requests are approved without the consent page - development only"
+        );
+    }
 
     let startup = if database_mode() {
         load_database_mode().await?
@@ -374,6 +390,7 @@ async fn main() -> Result<()> {
         mcp_allowed_hosts,
         personal,
         db_config,
+        dev_auto_consent,
     };
 
     // Run server with graceful shutdown

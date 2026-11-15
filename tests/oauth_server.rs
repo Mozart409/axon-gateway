@@ -47,6 +47,11 @@ struct Tokens {
 impl Harness {
     /// `None` (after saying why) without `AXON_TEST_DATABASE_URL`.
     async fn start(schema: &str) -> Option<Self> {
+        Self::start_with_env(schema, &[]).await
+    }
+
+    /// [`Harness::start`], with extra environment variables for the gateway process.
+    async fn start_with_env(schema: &str, extra_env: &[(&str, &str)]) -> Option<Self> {
         let Ok(base) = std::env::var("AXON_TEST_DATABASE_URL") else {
             eprintln!("skipping: AXON_TEST_DATABASE_URL is not set");
             return None;
@@ -59,9 +64,9 @@ impl Harness {
             .database(DATABASE_ENV)
             .oidc_provider("mock", idp.issuer(), "axon-test", "")
             .render();
-        let gateway =
-            Gateway::start_with_env(&config, &format!("http://{bind}"), &[(DATABASE_ENV, &url)])
-                .await;
+        let mut env: Vec<(&str, &str)> = vec![(DATABASE_ENV, url.as_str())];
+        env.extend_from_slice(extra_env);
+        let gateway = Gateway::start_with_env(&config, &format!("http://{bind}"), &env).await;
         Some(Self {
             gateway,
             _idp: idp,
@@ -901,4 +906,61 @@ fn meta_csrf(page: &str) -> String {
     let start = page.find(marker).expect("a csrf-token meta tag") + marker.len();
     let len = page[start..].find('"').expect("a closed attribute");
     page[start..start + len].to_string()
+}
+
+/// Dev auto-consent (`AXON_DEV_AUTO_CONSENT`): the continue GET approves the request
+/// and sends the browser straight back to the client, without the consent page.
+#[tokio::test]
+async fn auto_consent_approves_the_request_without_the_consent_page() {
+    let Some(h) = Harness::start_with_env("auto_consent", &[("AXON_DEV_AUTO_CONSENT", "1")]).await
+    else {
+        return;
+    };
+    let client_id = h.register("Unattended agent").await;
+
+    // The authorize endpoint parks the request and sends the browser to the continue page
+    let resp = h
+        .get(&h.authorize_url(&client_id, &[]), &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let continue_path = location(&resp);
+    assert!(
+        continue_path.starts_with("/oauth/authorize/continue?request="),
+        "{continue_path}"
+    );
+
+    // Without a session the dashboard login comes first, and returns here
+    let resp = h.get(&h.url(&continue_path), &[]).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let login_location = location(&resp);
+    assert!(login_location.starts_with("/auth/login?return_to="));
+    let (session, back_to) = h.login(&login_location).await;
+    assert_eq!(back_to, continue_path);
+
+    // With a session dev auto-consent approves by itself: no consent page, straight
+    // back to the client with a code
+    let resp = h.get(&h.url(&back_to), &[&session]).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let back = Url::parse(&location(&resp)).unwrap();
+    assert!(back.as_str().starts_with(REDIRECT_URI));
+    let params: Vec<(String, String)> = back.query_pairs().into_owned().collect();
+    let code = params
+        .iter()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.clone())
+        .expect("a code");
+
+    // The code is exchanged at the ordinary token endpoint
+    let resp = h
+        .token(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT_URI),
+            ("client_id", &client_id),
+            ("code_verifier", VERIFIER),
+        ])
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }
