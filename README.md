@@ -297,6 +297,46 @@ completes the OAuth flow unattended. All values are public dev values, so keep
 the stack on localhost. `podman compose -f example/compose.local.yml down -v`
 resets the database.
 
+### Demo backends
+
+`cargo run --example oidc_backend` runs a demo MCP backend on 127.0.0.1:3003 that
+only accepts tokens issued by the mock. Register its two endpoints while signed
+in; they are stored in the dev database.
+
+| Backend | URL | Settings |
+| --- | --- | --- |
+| `demo-oauth` | `http://127.0.0.1:3003/oauth/mcp` | catalog entry, auth `oauth`, any client id (the mock accepts any); press **Connect** on `/ui/catalog` |
+| `demo-passthrough` | `http://127.0.0.1:3003/passthrough/mcp` | backend with `credential_mode = "passthrough"`, grant `token_exchange`, provider `sso`, audience `axon-demo`; JSON API only, see below |
+
+The backend form cannot set passthrough, so create `demo-passthrough` from the
+browser console on any signed-in `/ui` page:
+
+```js
+await fetch("/api/v1/admin/config/backends", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-CSRF-Token": document.querySelector('meta[name="csrf-token"]').content,
+  },
+  body: JSON.stringify({
+    name: "demo-passthrough",
+    url: "http://127.0.0.1:3003/passthrough/mcp",
+    transport: "http",
+    credential_mode: "passthrough",
+    passthrough: { grant: "token_exchange", provider: "sso", audience: "axon-demo" },
+  }),
+});
+```
+
+The OAuth connect discovers the mock off the backend's origin, which the egress
+guard refuses for loopback, so add `127.0.0.0/8` and `::1/128` to the personal
+backends `egress_allow` in the gateway settings first.
+
+The `whoami` tool of the demo backend shows the claims of the token that
+reached it (`aud` is the backend's resource URL for oauth, `axon-demo` for
+passthrough). `AXON_OIDC_SCOPES` includes `offline_access` so the login keeps
+the refresh token passthrough exchanges; sign in again after changing it.
+
 Useful checks:
 
 ```bash

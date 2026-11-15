@@ -170,8 +170,11 @@ Dev stack: `just axon-dev` (or `just axon-up`, then `bacon run-long`) runs the
 gateway on the host in database mode against `example/compose.local.yml`:
 Postgres on 127.0.0.1:5437 and a mock OIDC provider on 127.0.0.1:4011 whose
 `JSON_CONFIG` logs everyone in as `dev` in `axon-admins`. The env lives in
-bacon.toml's `run-long` job. There is no dev config file and no seed script;
-`just axon-down` resets the database.
+bacon.toml's `run-long` job. `just axon-oidc-backend` runs
+examples/oidc_backend.rs on 127.0.0.1:3003 (accepts only mock-issued JWTs;
+`/oauth/mcp` and `/passthrough/mcp`); README "Demo backends" lists how to
+register them. There is no dev config file and no seed script; `just axon-down`
+resets the database.
 
 ## Rust Versions
 - **Toolchain** (dev shell, local builds): fenix stable from `flake.lock`, no

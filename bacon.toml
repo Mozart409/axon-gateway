@@ -117,6 +117,8 @@ env.AXON_OIDC_ISSUER = "http://localhost:4011/default"
 env.AXON_OIDC_CLIENT_ID = "axon-dev"
 env.AXON_OIDC_CLIENT_SECRET_FILE = "example/dev-oidc-client-secret"
 env.AXON_OIDC_ADMIN_GROUPS = "axon-admins"
+# offline_access gives the refresh token that passthrough exchanges
+env.AXON_OIDC_SCOPES = "openid,profile,email,offline_access"
 env.AXON_DEV_AUTO_CONSENT = "1"
 # kill = ["pkill", "-TERM", "-P"]
 

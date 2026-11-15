@@ -1,6 +1,8 @@
 # Dev only: Postgres and a mock OIDC provider for a gateway run on the host
 # (`bacon run-long`). The mock logs every login in as `dev`, a member of
-# `axon-admins`, so no seed data is needed.
+# `axon-admins`, so no seed data is needed. It sets each token's `aud` from
+# the token exchange `audience`, else the `resource` indicator, else the
+# client id.
 services:
   postgres:
     image: docker.io/library/postgres:19rc2-alpine
@@ -31,11 +33,37 @@ services:
               "tokenExpiry": 3600,
               "requestMappings": [
                 {
+                  "requestParam": "audience",
+                  "match": "*",
+                  "claims": {
+                    "sub": "dev",
+                    "aud": ["$${audience}"],
+                    "name": "Dev User",
+                    "preferred_username": "dev",
+                    "email": "dev@axon.test",
+                    "email_verified": true,
+                    "groups": ["axon-admins"]
+                  }
+                },
+                {
+                  "requestParam": "resource",
+                  "match": "*",
+                  "claims": {
+                    "sub": "dev",
+                    "aud": ["$${resource}"],
+                    "name": "Dev User",
+                    "preferred_username": "dev",
+                    "email": "dev@axon.test",
+                    "email_verified": true,
+                    "groups": ["axon-admins"]
+                  }
+                },
+                {
                   "requestParam": "grant_type",
                   "match": "*",
                   "claims": {
                     "sub": "dev",
-                    "aud": ["axon-dev"],
+                    "aud": ["$${client_id}"],
                     "name": "Dev User",
                     "preferred_username": "dev",
                     "email": "dev@axon.test",
