@@ -1,5 +1,5 @@
 //! A small MCP server that only accepts JWTs issued by the dev mock OIDC
-//! provider (`http://localhost:4011/default`, see `example/compose.local.yml`),
+//! provider (`http://127.0.0.1:4011/default`, see `example/compose.local.yml`),
 //! to test the gateway's `credential_mode = "oauth"` and `"passthrough"`
 //! (RFC 8693 token exchange) end to end. Dev only, nothing here is configurable.
 //!
@@ -49,8 +49,8 @@ use tracing_subscriber::EnvFilter;
 
 const ADDR: &str = "127.0.0.1:3003";
 const BASE_URL: &str = "http://127.0.0.1:3003";
-const ISSUER: &str = "http://localhost:4011/default";
-const JWKS_URL: &str = "http://localhost:4011/default/jwks";
+const ISSUER: &str = "http://127.0.0.1:4011/default";
+const JWKS_URL: &str = "http://127.0.0.1:4011/default/jwks";
 /// Endpoint path and the audience its tokens need.
 const ENDPOINTS: [(&str, &str); 2] = [
     ("/oauth/mcp", "http://127.0.0.1:3003/oauth/mcp"),
