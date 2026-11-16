@@ -17,6 +17,7 @@ use super::admin_views::{
     BACK_LINK, BUTTON, BUTTON_DANGER, CARD, CODE, FAINT, FORM_ROW, HEADING, INPUT, LABEL, LINK,
     MUTED, TABLE, TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
 };
+use super::shell::Nav;
 use crate::audit::{AuditSettings, CaptureMode, CaptureRule, StoredArguments, ToolCallRecord};
 use crate::audit_admin::MAX_RETENTION_DAYS;
 use crate::store::SessionUser;
@@ -209,7 +210,7 @@ pub(super) fn render_calls_page(state: &AppState, user: &SessionUser, page: &Cal
             }
         }
     };
-    render_layout(state, user, "Tool calls", &content)
+    render_layout(state, user, "Tool calls", Nav::Admin, &content)
 }
 
 fn detail_row(label: &str, value: &Markup) -> Markup {
@@ -268,7 +269,7 @@ pub(super) fn render_call_page(
             (render_arguments_placeholder(call))
         }
     };
-    render_layout(state, user, "Tool call", &content)
+    render_layout(state, user, "Tool call", Nav::Admin, &content)
 }
 
 /// The arguments block before the read: a button, or why there is nothing.
@@ -332,7 +333,7 @@ pub(super) fn render_settings_page(
         (render_retention_section(page, false))
         (render_rules_section(page, false))
     };
-    render_layout(state, user, "Audit settings", &content)
+    render_layout(state, user, "Audit settings", Nav::Admin, &content)
 }
 
 /// The retention form, the swap target of the settings action.

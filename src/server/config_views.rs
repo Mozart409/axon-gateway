@@ -19,6 +19,7 @@ use super::admin_views::{
     TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
 };
 use super::config_api::{BackendView, ProviderSource, ProviderView, ToolsetView};
+use super::shell::Nav;
 use crate::config::{
     BackendConfig, GatewaySettings, OidcProviderConfig, ToolsetConfig, TransportType,
 };
@@ -261,7 +262,7 @@ fn page(
         (render_flash_area(false))
         (body)
     };
-    render_layout(state, user, title, &content)
+    render_layout(state, user, title, Nav::Config, &content)
 }
 
 const JSON_ONLY: &str = "Per-user, OAuth and passthrough backends, credential fields and the \

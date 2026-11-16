@@ -7,12 +7,10 @@
 use chrono::{DateTime, Utc};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use super::shell::{Nav, current_theme, render_shell};
 use super::{AppState, FlashLevel, FlashMessage};
 use crate::gateway::DetailedGatewayStatus;
-use crate::policy::{
-    AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, Permission, ToolRef,
-};
-use crate::rbac::resolve;
+use crate::policy::{AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, ToolRef};
 use crate::store::SessionUser;
 use crate::types::{
     BackendInfo, BackendState, NamespacedTool, PromptDefinition, ResourceDefinition,
@@ -35,13 +33,13 @@ pub(super) fn render_landing_page(state: &AppState) -> Markup {
 
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Axon Gateway" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=1";
+                link rel="stylesheet" href="/styles/output.css?v=2";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
                 main class="mx-auto flex min-h-screen max-w-4xl items-center px-6 py-12" {
@@ -108,13 +106,13 @@ pub(super) fn render_landing_page(state: &AppState) -> Markup {
 pub(super) fn render_not_found_page(state: &AppState) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Page Not Found" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=1";
+                link rel="stylesheet" href="/styles/output.css?v=2";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
                 main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
@@ -152,13 +150,13 @@ pub(super) fn render_not_found_page(state: &AppState) -> Markup {
 pub(super) fn render_login_page(state: &AppState, options: &[LoginOption]) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "Sign in - Axon Gateway" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=1";
+                link rel="stylesheet" href="/styles/output.css?v=2";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
                 main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
@@ -199,13 +197,13 @@ pub(super) fn render_login_page(state: &AppState, options: &[LoginOption]) -> Ma
 pub(super) fn render_auth_error_page(state: &AppState, title: &str, message: &str) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " - Axon Gateway" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=1";
+                link rel="stylesheet" href="/styles/output.css?v=2";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
                 main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
@@ -239,98 +237,6 @@ pub(super) fn render_auth_error_page(state: &AppState, title: &str, message: &st
     }
 }
 
-/// Header strip for signed-in users: name, group pills, admin badge and the logout form.
-/// The "Admin" link shows for users who may open the admin pages.
-pub(super) fn render_user_bar(state: &AppState, user: &SessionUser) -> Markup {
-    let (groups, permissions) = resolve(&state.policy.current(), user);
-    let admin_pages = permissions.has(Permission::GroupsManage)
-        || permissions.has(Permission::RolesManage)
-        || permissions.has(Permission::AuditRead);
-    let name = user
-        .user
-        .display_name
-        .as_deref()
-        .or(user.user.email.as_deref())
-        .unwrap_or(&user.user.subject);
-
-    html! {
-        div class="mb-4 flex flex-wrap items-center justify-end gap-3 text-sm text-slate-600 dark:text-slate-300" {
-            a
-                class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                href="/ui/tools"
-            {
-                "My tools"
-            }
-            a
-                class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                href="/ui/tokens"
-            {
-                "Tokens"
-            }
-            a
-                class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                href="/ui/me/apps"
-            {
-                "Connected apps"
-            }
-            a
-                class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                href="/ui/toolsets"
-            {
-                "Toolsets"
-            }
-            a
-                class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                href="/ui/me/usage"
-            {
-                "My usage"
-            }
-            @if state.personal.is_some() {
-                a
-                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                    href="/ui/me/backends"
-                {
-                    "My MCP servers"
-                }
-                a
-                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                    href="/ui/catalog"
-                {
-                    "Catalog"
-                }
-            }
-            @if admin_pages {
-                a
-                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100"
-                    href="/ui/admin"
-                {
-                    "Admin"
-                }
-            }
-            span class="font-medium text-slate-900 dark:text-slate-100" { (name) }
-            @for group in &groups {
-                span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300" title="Group" {
-                    (group)
-                }
-            }
-            @if permissions.is_admin() {
-                span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
-                    "admin"
-                }
-            }
-            form method="post" action="/auth/logout" {
-                input type="hidden" name="csrf_token" value=(user.csrf_token);
-                button
-                    class="rounded-lg border border-slate-300 bg-white px-3 py-1 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                    type="submit"
-                {
-                    "Log out"
-                }
-            }
-        }
-    }
-}
-
 /// `hx-headers` value that makes every htmx request carry the CSRF token.
 pub(super) fn csrf_hx_headers(user: &SessionUser) -> String {
     serde_json::json!({ "X-CSRF-Token": user.csrf_token }).to_string()
@@ -342,59 +248,62 @@ pub(super) fn render_ui_page(
     state: &AppState,
     user: Option<&SessionUser>,
 ) -> Markup {
-    let hx_headers = user.map(csrf_hx_headers);
+    let content = html! {
+        section class="mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                "Axon Gateway"
+            }
+            p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
+                "Server-rendered dashboard with SSE updates and HTMX actions."
+            }
+            // Database mode has no config file to reload
+            @if state.config_path.is_some() {
+                div class="mt-4 flex flex-wrap gap-3" {
+                    button
+                        class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                        hx-post="/ui/actions/reload"
+                        hx-target="#flash"
+                        hx-swap="innerHTML"
+                    {
+                        "Reload Config"
+                    }
+                }
+            }
+        }
+        div
+            hx-ext="sse"
+            sse-connect="/ui/events"
+        {
+            div id="flash" sse-swap="flash" {}
+            div id="backend-panel" sse-swap="backend_status_changed" {
+                (render_backend_panel(status))
+            }
+        }
+    };
+    match user {
+        Some(user) => render_shell(state, user, "Overview", Nav::Overview, &content),
+        None => render_standalone_page(state, "Axon Gateway Dashboard", &content),
+    }
+}
 
+/// A dashboard page without a session (standalone mode has no users, so no shell).
+fn render_standalone_page(state: &AppState, title: &str, content: &Markup) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Axon Gateway Dashboard" }
+                title { (title) }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                @if let Some(user) = user {
-                    meta name="csrf-token" content=(user.csrf_token);
-                }
                 meta name="htmx-config" content=(HTMX_CONFIG);
                 script src="/static/htmx-2.0.4.min.js" defer {};
                 script src="/static/htmx-ext-sse-2.2.2.js" defer {};
-                link rel="stylesheet" href="/styles/output.css?v=1";
+                link rel="stylesheet" href="/styles/output.css?v=2";
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=[hx_headers.as_deref()] {
+            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
                 main class="mx-auto max-w-6xl p-6" {
-                    @if let Some(user) = user {
-                        (render_user_bar(state, user))
-                    }
-                    section class="mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                            "Axon Gateway"
-                        }
-                        p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
-                            "Server-rendered dashboard with SSE updates and HTMX actions."
-                        }
-                        // Database mode has no config file to reload
-                        @if state.config_path.is_some() {
-                            div class="mt-4 flex flex-wrap gap-3" {
-                                button
-                                    class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
-                                    hx-post="/ui/actions/reload"
-                                    hx-target="#flash"
-                                    hx-swap="innerHTML"
-                                {
-                                    "Reload Config"
-                                }
-                            }
-                        }
-                    }
-                    div
-                        hx-ext="sse"
-                        sse-connect="/ui/events"
-                    {
-                        div id="flash" sse-swap="flash" {}
-                        div id="backend-panel" sse-swap="backend_status_changed" {
-                            (render_backend_panel(status))
-                        }
-                    }
+                    (content)
                     footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
                         (build_fingerprint(state))
                     }
@@ -413,115 +322,94 @@ pub(super) fn render_ui_backend_detail_page(
     state: &AppState,
     user: Option<&SessionUser>,
 ) -> Markup {
-    let hx_headers = user.map(csrf_hx_headers);
     let state_text = backend_state_text(backend.state);
     let state_class = backend_state_class(backend.state);
 
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Axon Gateway Backend Detail" }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                @if let Some(user) = user {
-                    meta name="csrf-token" content=(user.csrf_token);
-                }
-                link rel="stylesheet" href="/styles/output.css?v=1";
+    let content = html! {
+        section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            a
+                href="/ui"
+                class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
+            {
+                (PreEscaped("&larr;")) " Back to dashboard"
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=[hx_headers.as_deref()] {
-                main class="mx-auto max-w-6xl p-6" {
-                    @if let Some(user) = user {
-                        (render_user_bar(state, user))
-                    }
-                    section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        a
-                            href="/ui"
-                            class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
-                        {
-                            (PreEscaped("&larr;")) " Back to dashboard"
-                        }
-                        h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                            code { (&backend.name) }
-                        }
-                        div class="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-600 dark:text-slate-300" {
-                            span { "State:" }
-                            span class=(state_class) { (state_text) }
-                            span { "Tools: " (backend.tool_count) }
-                            span { "Prompts: " (prompts.len()) }
-                            span { "Resources: " (resources.len()) }
-                        }
-                        @if let Some(error) = &backend.last_error {
-                            p class="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300" {
-                                "Last error: " code { (error) }
+            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                code { (&backend.name) }
+            }
+            div class="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-600 dark:text-slate-300" {
+                span { "State:" }
+                span class=(state_class) { (state_text) }
+                span { "Tools: " (backend.tool_count) }
+                span { "Prompts: " (prompts.len()) }
+                span { "Resources: " (resources.len()) }
+            }
+            @if let Some(error) = &backend.last_error {
+                p class="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300" {
+                    "Last error: " code { (error) }
+                }
+            }
+        }
+
+        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Tools" }
+            @if backend.tools.is_empty() {
+                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No tools exposed by this backend." }
+            } @else {
+                ul class="mt-4 space-y-3" {
+                    @for tool in &backend.tools {
+                        li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
+                            p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&tool.original_name) }
+                            @if let Some(description) = &tool.definition.description {
+                                p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
                             }
                         }
-                    }
-
-                    section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Tools" }
-                        @if backend.tools.is_empty() {
-                            p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No tools exposed by this backend." }
-                        } @else {
-                            ul class="mt-4 space-y-3" {
-                                @for tool in &backend.tools {
-                                    li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
-                                        p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&tool.original_name) }
-                                        @if let Some(description) = &tool.definition.description {
-                                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Prompts" }
-                        @if prompts.is_empty() {
-                            p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No prompts exposed by this backend." }
-                        } @else {
-                            ul class="mt-4 space-y-3" {
-                                @for prompt in prompts {
-                                    li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
-                                        p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&prompt.name) }
-                                        @if let Some(description) = &prompt.description {
-                                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Resources" }
-                        @if resources.is_empty() {
-                            p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No resources exposed by this backend." }
-                        } @else {
-                            ul class="mt-4 space-y-3" {
-                                @for resource in resources {
-                                    li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
-                                        p class="font-mono text-xs break-all text-slate-900 dark:text-slate-100" { (&resource.uri) }
-                                        @if let Some(name) = &resource.name {
-                                            p class="mt-1 text-sm text-slate-700 dark:text-slate-200" { (name) }
-                                        }
-                                        @if let Some(description) = &resource.description {
-                                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
-                        (build_fingerprint(state))
                     }
                 }
             }
         }
+
+        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Prompts" }
+            @if prompts.is_empty() {
+                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No prompts exposed by this backend." }
+            } @else {
+                ul class="mt-4 space-y-3" {
+                    @for prompt in prompts {
+                        li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
+                            p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&prompt.name) }
+                            @if let Some(description) = &prompt.description {
+                                p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Resources" }
+            @if resources.is_empty() {
+                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No resources exposed by this backend." }
+            } @else {
+                ul class="mt-4 space-y-3" {
+                    @for resource in resources {
+                        li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
+                            p class="font-mono text-xs break-all text-slate-900 dark:text-slate-100" { (&resource.uri) }
+                            @if let Some(name) = &resource.name {
+                                p class="mt-1 text-sm text-slate-700 dark:text-slate-200" { (name) }
+                            }
+                            @if let Some(description) = &resource.description {
+                                p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    match user {
+        Some(user) => render_shell(state, user, "Backend detail", Nav::Overview, &content),
+        None => render_standalone_page(state, "Axon Gateway Backend Detail", &content),
     }
 }
 
@@ -735,72 +623,51 @@ pub(super) fn render_my_tools_page(
     effective: &EffectivePolicy,
     opt_outs: &OptOuts,
 ) -> Markup {
-    let hx_headers = csrf_hx_headers(user);
     let mut sections: Vec<&BackendInfo> = backends
         .iter()
         .filter(|backend| !backend.tools.is_empty())
         .collect();
     sections.sort_by(|a, b| a.name.cmp(&b.name));
 
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "My tools - Axon Gateway" }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                meta name="csrf-token" content=(user.csrf_token);
-                meta name="htmx-config" content=(HTMX_CONFIG);
-                script src="/static/htmx-2.0.4.min.js" defer {};
-                link rel="stylesheet" href="/styles/output.css?v=1";
+    let content = html! {
+        section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
+            a
+                href="/ui"
+                class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
+            {
+                (PreEscaped("&larr;")) " Back to dashboard"
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=(hx_headers) {
-                main class="mx-auto max-w-6xl p-6" {
-                    (render_user_bar(state, user))
-                    section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        a
-                            href="/ui"
-                            class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
-                        {
-                            (PreEscaped("&larr;")) " Back to dashboard"
+            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
+                "My tools"
+            }
+            p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
+                "Hiding a tool or a backend only removes it from your own tool list. "
+                "Tools your admin marked mandatory stay visible, even when you hide their backend."
+            }
+            h2 class="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100" { "Your groups" }
+            ul class="mt-2 space-y-1 text-sm" {
+                @let policy = state.policy.current();
+                @for group in groups {
+                    li {
+                        code class="text-slate-900 dark:text-slate-100" { (group) }
+                        @if group == AUTHENTICATED_GROUP {
+                            span class="ml-2 text-xs text-slate-500 dark:text-slate-400" { "built in" }
                         }
-                        h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                            "My tools"
+                        @if let Some(description) = policy.group_description(group) {
+                            span class="ml-2 text-slate-600 dark:text-slate-300" { (description) }
                         }
-                        p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
-                            "Hiding a tool or a backend only removes it from your own tool list. "
-                            "Tools your admin marked mandatory stay visible, even when you hide their backend."
-                        }
-                        h2 class="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100" { "Your groups" }
-                        ul class="mt-2 space-y-1 text-sm" {
-                            @let policy = state.policy.current();
-                            @for group in groups {
-                                li {
-                                    code class="text-slate-900 dark:text-slate-100" { (group) }
-                                    @if group == AUTHENTICATED_GROUP {
-                                        span class="ml-2 text-xs text-slate-500 dark:text-slate-400" { "built in" }
-                                    }
-                                    @if let Some(description) = policy.group_description(group) {
-                                        span class="ml-2 text-slate-600 dark:text-slate-300" { (description) }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    @if sections.is_empty() {
-                        p class="mt-6 text-sm text-slate-500 dark:text-slate-400" { "No tools are available yet." }
-                    }
-                    @for backend in sections {
-                        (render_tool_backend_section(backend, effective, opt_outs))
-                    }
-                    footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
-                        (build_fingerprint(state))
                     }
                 }
             }
         }
-    }
+        @if sections.is_empty() {
+            p class="mt-6 text-sm text-slate-500 dark:text-slate-400" { "No tools are available yet." }
+        }
+        @for backend in sections {
+            (render_tool_backend_section(backend, effective, opt_outs))
+        }
+    };
+    render_shell(state, user, "My tools", Nav::MyTools, &content)
 }
 
 /// Build/runtime fingerprint shown in page footers.

@@ -18,6 +18,7 @@ use super::admin_views::{
     LABEL, MUTED, TABLE, TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
 };
 use super::personal_api::{CatalogView, PersonalSaved};
+use super::shell::Nav;
 use crate::config::CredentialField;
 use crate::personal::{CatalogAuth, CatalogItem, CatalogSource};
 use crate::store::{AdminPersonalBackend, PersonalBackend, SessionUser};
@@ -315,7 +316,7 @@ pub(super) fn render_backends_page(
         (render_flash_area(false))
         (render_backends_section(backends, None))
     };
-    render_layout(state, user, "My MCP servers", &content)
+    render_layout(state, user, "My MCP servers", Nav::MyServers, &content)
 }
 
 /// What a credential field is called: its label, else its name
@@ -739,7 +740,7 @@ pub(super) fn render_catalog_page(
         (render_flash_area(false))
         (render_catalog_section(entries, manage))
     };
-    render_layout(state, user, "Catalog", &content)
+    render_layout(state, user, "Catalog", Nav::Catalog, &content)
 }
 
 /// Every user's personal servers, the swap target of the admin actions
@@ -821,7 +822,7 @@ pub(super) fn render_admin_page(
         (render_flash_area(false))
         (render_admin_section(backends))
     };
-    render_layout(state, user, "Personal MCP servers", &content)
+    render_layout(state, user, "Personal MCP servers", Nav::Admin, &content)
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use super::admin_views::{
     BACK_LINK, BUTTON, BUTTON_DANGER, BUTTON_SMALL, CARD, CODE, FAINT, FORM_ROW, HEADING, INPUT,
     LABEL, MUTED, TABLE, TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
 };
+use super::shell::Nav;
 use crate::rbac::{TokenState, lifetime_days};
 use crate::store::{
     ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, JwtBinding, MAX_SERVICE_TOKEN_LIFETIME,
@@ -300,7 +301,7 @@ pub(super) fn render_tokens_page(
         (render_flash_area(false))
         (render_tokens_section(tokens, backends, toolsets, None))
     };
-    render_layout(state, user, "Tokens", &content)
+    render_layout(state, user, "Tokens", Nav::Tokens, &content)
 }
 
 fn account_state_badge(account: &ServiceAccount) -> Markup {
@@ -507,7 +508,7 @@ pub(super) fn render_service_accounts_page(
         (render_flash_area(false))
         (render_service_accounts_section(overview, None))
     };
-    render_layout(state, user, "Service accounts", &content)
+    render_layout(state, user, "Service accounts", Nav::Tokens, &content)
 }
 
 #[cfg(test)]

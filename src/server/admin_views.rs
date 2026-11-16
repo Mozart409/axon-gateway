@@ -7,20 +7,16 @@
 //! Forms and buttons only render for users who hold the permission, the
 //! service layer in `rbac` still decides.
 
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{Markup, PreEscaped, html};
 use uuid::Uuid;
 
 use super::AppState;
-use super::views::{build_fingerprint, csrf_hx_headers, render_user_bar};
+use super::shell::{Nav, render_shell};
 use crate::policy::{
     GrantView, GroupView, Permission, Permissions, RoleBinding, RoleSource, RoleSubject, RoleView,
 };
 use crate::rbac::{ManagedUser, RoleEntry};
 use crate::store::{AuditRecord, ServiceAccount, SessionUser, User};
-
-/// Admin actions answer errors with 4xx/5xx and a flash fragment; htmx drops
-/// those responses unless told to swap them.
-const HTMX_CONFIG: &str = r#"{"includeIndicatorStyles":false,"allowEval":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}"#;
 
 pub(super) const CARD: &str = "mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900";
 pub(super) const HEADING: &str = "text-lg font-semibold text-slate-900 dark:text-slate-100";
@@ -186,39 +182,15 @@ pub(super) fn render_flash_area(oob: bool) -> Markup {
     }
 }
 
-/// Page frame of the admin pages: head, user bar, content and footer.
+/// Page frame of the admin pages: the shell around `content`, with `active` marked in the sidebar.
 pub(super) fn render_layout(
     state: &AppState,
     user: &SessionUser,
     title: &str,
+    active: Nav,
     content: &Markup,
 ) -> Markup {
-    let hx_headers = csrf_hx_headers(user);
-
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " - Axon Gateway" }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                meta name="csrf-token" content=(user.csrf_token);
-                meta name="htmx-config" content=(HTMX_CONFIG);
-                script src="/static/htmx-2.0.4.min.js" defer {};
-                link rel="stylesheet" href="/styles/output.css?v=1";
-            }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" hx-headers=(hx_headers) {
-                main class="mx-auto max-w-6xl p-6" {
-                    (render_user_bar(state, user))
-                    (content)
-                    footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
-                        (build_fingerprint(state))
-                    }
-                }
-            }
-        }
-    }
+    render_shell(state, user, title, active, content)
 }
 
 /// The page for a user who may not see an admin page (answered with 403).
@@ -234,7 +206,7 @@ pub(super) fn render_forbidden_page(state: &AppState, user: &SessionUser) -> Mar
             }
         }
     };
-    render_layout(state, user, "Not allowed", &content)
+    render_layout(state, user, "Not allowed", Nav::None, &content)
 }
 
 /// Admin overview (`GET /ui/admin`).
@@ -306,7 +278,7 @@ pub(super) fn render_admin_page(
         (render_grants_section(overview, false))
         (render_bindings_section(overview, false))
     };
-    render_layout(state, user, "Admin", &content)
+    render_layout(state, user, "Admin", Nav::Admin, &content)
 }
 
 /// Groups table and the create form, the swap target of `groups` actions.
@@ -643,7 +615,7 @@ pub(super) fn render_roles_page(state: &AppState, user: &SessionUser, page: &Rol
         (render_flash_area(false))
         (render_roles_section(page))
     };
-    render_layout(state, user, "Roles", &content)
+    render_layout(state, user, "Roles", Nav::Admin, &content)
 }
 
 /// One checkbox per permission, named `permissions`; the ones in `selected` start checked.
@@ -817,7 +789,7 @@ pub(super) fn render_group_page(
         (render_group_mappings(detail))
         (render_group_members(detail))
     };
-    render_layout(state, user, &detail.group.name, &content)
+    render_layout(state, user, &detail.group.name, Nav::Admin, &content)
 }
 
 /// Description and delete button of a group.
@@ -1002,7 +974,7 @@ pub(super) fn render_users_page(state: &AppState, user: &SessionUser, page: &Use
         (render_flash_area(false))
         (render_users_section(page))
     };
-    render_layout(state, user, "Users", &content)
+    render_layout(state, user, "Users", Nav::Admin, &content)
 }
 
 fn user_state_badge(disabled: bool) -> Markup {
@@ -1165,7 +1137,7 @@ pub(super) fn render_audit_page(
             }
         }
     };
-    render_layout(state, user, "Audit log", &content)
+    render_layout(state, user, "Audit log", Nav::Admin, &content)
 }
 
 #[cfg(test)]
@@ -1302,8 +1274,14 @@ mod tests {
         }
     }
 
+    /// The page body without the shell, whose theme picker posts with htmx
+    fn body(html: &str) -> String {
+        html.split_once("<main class=\"content\">")
+            .map_or_else(|| html.to_owned(), |(_, body)| body.to_owned())
+    }
+
     fn page(overview: &AdminOverview) -> String {
-        render_admin_page(&test_state(), &session(true), overview).into_string()
+        body(&render_admin_page(&test_state(), &session(true), overview).into_string())
     }
 
     #[tokio::test]
@@ -1363,8 +1341,9 @@ mod tests {
         assert!(html.contains("&lt;b&gt;log-reader&lt;/b&gt;"));
         assert!(!html.contains("<b>log-reader</b>"));
 
-        let html =
-            render_roles_page(&test_state(), &session(false), &roles_page(AUDITOR)).into_string();
+        let html = body(
+            &render_roles_page(&test_state(), &session(false), &roles_page(AUDITOR)).into_string(),
+        );
         assert!(html.contains("log-reader"));
         assert!(!html.contains("hx-post"));
         assert!(!html.contains("name=\"permissions\""));
@@ -1380,7 +1359,7 @@ mod tests {
             accounts: Vec::new(),
             providers: vec![String::from("pocket")],
         };
-        let html = render_group_page(&test_state(), &session(true), &detail).into_string();
+        let html = body(&render_group_page(&test_state(), &session(true), &detail).into_string());
 
         assert!(!html.contains("hx-post"));
     }
@@ -1401,7 +1380,7 @@ mod tests {
             }],
             providers: vec![String::from("pocket")],
         };
-        let html = render_group_page(&test_state(), &session(true), &detail).into_string();
+        let html = body(&render_group_page(&test_state(), &session(true), &detail).into_string());
 
         assert!(html.contains("/ui/actions/admin/groups/devs/update"));
         assert!(html.contains("/ui/actions/admin/groups/devs/delete"));

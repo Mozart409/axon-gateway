@@ -15,6 +15,7 @@ use super::admin_views::{
     BACK_LINK, CARD, CODE, FAINT, HEADING, LINK, MUTED, TABLE, TABLE_WRAP, TBODY, TD, TH, THEAD,
     render_layout,
 };
+use super::shell::Nav;
 use crate::store::{DailyUsage, SessionUser, UsageReport, UsageUser, UserUsageRow};
 
 const H1: &str = "mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100";
@@ -242,7 +243,7 @@ pub(super) fn render_my_usage_page(
         }
         (usage_body(report, "/ui/me/usage"))
     };
-    render_layout(state, user, "My usage", &content)
+    render_layout(state, user, "My usage", Nav::Usage, &content)
 }
 
 fn user_href(user_id: Uuid, days: i32) -> String {
@@ -312,7 +313,7 @@ pub(super) fn render_users_usage_page(
         }
         (users_table(days, rows))
     };
-    render_layout(state, user, "Usage", &content)
+    render_layout(state, user, "Usage", Nav::Admin, &content)
 }
 
 /// One user's usage as an audit reader sees it (`GET /ui/admin/usage/{user_id}`).
@@ -336,7 +337,7 @@ pub(super) fn render_user_usage_page(
         }
         (usage_body(report, &format!("/ui/admin/usage/{user_id}")))
     };
-    render_layout(state, user, "Usage", &content)
+    render_layout(state, user, "Usage", Nav::Admin, &content)
 }
 
 #[cfg(test)]

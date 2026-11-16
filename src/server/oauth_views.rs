@@ -10,6 +10,7 @@ use super::admin_views::{
     BACK_LINK, BUTTON, BUTTON_DANGER, CARD, CODE, FAINT, HEADING, MUTED, TABLE, TABLE_WRAP, TBODY,
     TD, TH, THEAD, render_flash_area, render_layout,
 };
+use super::shell::{Nav, current_theme};
 use super::views::build_fingerprint;
 use crate::store::{AuthRequest, OauthGrant, SessionUser};
 
@@ -37,13 +38,13 @@ fn client_label<'a>(name: Option<&'a str>, client_id: &'a str) -> &'a str {
 pub(super) fn render_error_page(state: &AppState, title: &str, message: &str) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " - Axon Gateway" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=1";
+                link rel="stylesheet" href="/styles/output.css?v=2";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
                 main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
@@ -120,7 +121,7 @@ pub(super) fn render_consent_page(
             }
         }
     };
-    render_layout(state, user, "Connect an app", &page)
+    render_layout(state, user, "Connect an app", Nav::ConnectedApps, &page)
 }
 
 /// The grants table with its Revoke buttons, as one swappable section.
@@ -204,7 +205,7 @@ pub(super) fn render_apps_page(
         (render_flash_area(false))
         (render_apps_section(grants))
     };
-    render_layout(state, user, "Connected apps", &content)
+    render_layout(state, user, "Connected apps", Nav::ConnectedApps, &content)
 }
 
 #[cfg(test)]

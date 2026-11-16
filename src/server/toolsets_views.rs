@@ -12,6 +12,7 @@ use super::admin_views::{
     BACK_LINK, BUTTON, BUTTON_DANGER, CARD, FAINT, FORM_ROW, HEADING, INPUT, LABEL, MUTED,
     render_flash_area, render_layout,
 };
+use super::shell::Nav;
 use crate::store::{SessionUser, Toolset};
 
 const SECTION: &str = "#my-toolsets";
@@ -175,7 +176,7 @@ pub(super) fn render_toolsets_page(
         (render_flash_area(false))
         (render_toolsets_section(toolsets, backends))
     };
-    render_layout(state, user, "Toolsets", &content)
+    render_layout(state, user, "Toolsets", Nav::Toolsets, &content)
 }
 
 #[cfg(test)]

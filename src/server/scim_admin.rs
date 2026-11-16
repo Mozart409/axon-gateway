@@ -25,6 +25,7 @@ use super::admin_views::{
     BACK_LINK, BUTTON, BUTTON_DANGER, CARD, CODE, FAINT, HEADING, MUTED, TABLE, TABLE_WRAP, TBODY,
     TD, TH, THEAD, render_layout,
 };
+use super::shell::Nav;
 use super::{AppState, reject_cross_site_middleware, session};
 use crate::policy::Permission;
 use crate::rbac::{AdminError, resolve};
@@ -448,7 +449,7 @@ fn render_scim_page(
         }
         (render_panel(rows, issued))
     };
-    render_layout(state, user, "SCIM provisioning", &content)
+    render_layout(state, user, "SCIM provisioning", Nav::Admin, &content)
 }
 
 #[cfg(test)]

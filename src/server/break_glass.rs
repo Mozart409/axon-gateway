@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use super::auth::{ClientIp, within_ip_limit};
 use super::session::{SESSION_COOKIE, error_page, host_cookie, too_many_requests};
+use super::shell::current_theme;
 use super::{AppState, ui, views};
 use crate::store::BREAK_GLASS_SESSION_MAX_AGE;
 
@@ -62,14 +63,14 @@ async fn not_found(state: &AppState) -> Response {
 fn render_confirm_page(state: &AppState, code: &str) -> Markup {
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="referrer" content="no-referrer";
                 title { "Break-glass sign in - Axon Gateway" }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=1";
+                link rel="stylesheet" href="/styles/output.css?v=2";
             }
             body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
                 main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {

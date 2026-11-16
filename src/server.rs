@@ -84,6 +84,7 @@ mod personal_views;
 mod scim_admin;
 mod scim_api;
 mod session;
+mod shell;
 mod tokens_api;
 mod tokens_ui;
 mod tokens_views;
@@ -188,6 +189,7 @@ fn ui_action_routes(state: &AppState) -> Router<AppState> {
             post(ui::handle_ui_enable_backend),
         )
         .route("/ui/actions/reload", post(ui::handle_ui_reload_config))
+        .route("/ui/actions/theme", post(shell::handle_set_theme))
         .route(
             "/ui/actions/tools/opt-out",
             post(ui::handle_ui_tool_opt_out),
@@ -228,6 +230,7 @@ fn mcp_routes(state: &AppState) -> Router<AppState> {
 }
 
 /// Create the Axum router
+#[allow(clippy::too_many_lines)]
 pub fn create_router(state: AppState) -> Router {
     let ui_actions = ui_action_routes(&state);
 
@@ -288,6 +291,19 @@ pub fn create_router(state: AppState) -> Router {
             "/static/copy-url.js",
             get(|| async { script(COPY_URL_JS, CACHE_ONE_HOUR) }),
         )
+        // Fonts and the icon sprite are embedded too
+        .route(
+            "/static/fonts/Geist-Variable.woff2",
+            get(|| async { asset(GEIST_WOFF2, "font/woff2", CACHE_IMMUTABLE) }),
+        )
+        .route(
+            "/static/fonts/GeistMono-Variable.woff2",
+            get(|| async { asset(GEIST_MONO_WOFF2, "font/woff2", CACHE_IMMUTABLE) }),
+        )
+        .route(
+            "/static/icons.svg",
+            get(|| async { asset(ICONS_SVG, "image/svg+xml", CACHE_ONE_HOUR) }),
+        )
         // UI endpoints
         .merge(ui_routes)
         // Dashboard login
@@ -341,6 +357,8 @@ pub fn create_router(state: AppState) -> Router {
         // Outermost, so the request id exists before TraceLayer opens its span
         .layer(middleware::from_fn(request_id_middleware))
         .fallback(ui::handle_not_found)
+        // After the fallback, so the 404 page reads the theme cookie too
+        .layer(middleware::from_fn(shell::theme_middleware))
         // After the fallback, so the 404 page gets the headers too
         .layer(middleware::map_response_with_state(
             state.clone(),
@@ -352,6 +370,9 @@ pub fn create_router(state: AppState) -> Router {
 const HTMX_JS: &str = include_str!("../static/htmx-2.0.4.min.js");
 const HTMX_SSE_JS: &str = include_str!("../static/htmx-ext-sse-2.2.2.js");
 const COPY_URL_JS: &str = include_str!("../static/copy-url.js");
+const GEIST_WOFF2: &[u8] = include_bytes!("../static/fonts/Geist-Variable.woff2");
+const GEIST_MONO_WOFF2: &[u8] = include_bytes!("../static/fonts/GeistMono-Variable.woff2");
+const ICONS_SVG: &[u8] = include_bytes!("../static/icons.svg");
 /// The htmx files carry their version in the path, so they never change.
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const CACHE_ONE_HOUR: &str = "public, max-age=3600";
@@ -368,6 +389,21 @@ fn script(body: &'static str, cache_control: &'static str) -> impl IntoResponse 
     (
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        body,
+    )
+}
+
+/// A binary or SVG file served from memory.
+fn asset(
+    body: &'static [u8],
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, cache_control),
         ],
         body,
