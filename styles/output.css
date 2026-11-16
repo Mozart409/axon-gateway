@@ -271,6 +271,9 @@
   .h-1\.5 {
     height: calc(var(--spacing) * 1.5);
   }
+  .min-h-6 {
+    min-height: calc(var(--spacing) * 6);
+  }
   .min-h-screen {
     min-height: 100vh;
   }
@@ -943,7 +946,7 @@
     place-items: center;
   }
   .nav-label {
-    font-size: 10.5px;
+    font-size: 11px;
     font-weight: 600;
     letter-spacing: .07em;
     text-transform: uppercase;
@@ -1047,6 +1050,9 @@
     }
     .btn.menu-btn {
       display: inline-flex;
+      min-width: 32px;
+      min-height: 32px;
+      justify-content: center;
     }
     .top {
       padding: 0 12px;
@@ -1207,6 +1213,9 @@
       background: color-mix(in srgb, var(--ok) 15%, transparent);
     }
     color: var(--ok);
+    @supports (color: color-mix(in lab, red, red)) {
+      color: color-mix(in srgb, var(--ok) 70%, var(--text));
+    }
   }
   .pill.warn {
     background: var(--warn);
@@ -1214,6 +1223,9 @@
       background: color-mix(in srgb, var(--warn) 16%, transparent);
     }
     color: var(--warn);
+    @supports (color: color-mix(in lab, red, red)) {
+      color: color-mix(in srgb, var(--warn) 70%, var(--text));
+    }
   }
   .pill.err {
     background: var(--err);
@@ -1221,6 +1233,9 @@
       background: color-mix(in srgb, var(--err) 15%, transparent);
     }
     color: var(--err);
+    @supports (color: color-mix(in lab, red, red)) {
+      color: color-mix(in srgb, var(--err) 70%, var(--text));
+    }
   }
   .pill.accent {
     background: var(--accent);
@@ -1228,6 +1243,9 @@
       background: color-mix(in srgb, var(--accent) 16%, transparent);
     }
     color: var(--accent);
+    @supports (color: color-mix(in lab, red, red)) {
+      color: color-mix(in srgb, var(--accent) 70%, var(--text));
+    }
   }
   .btn {
     height: 30px;
@@ -1406,6 +1424,14 @@
   }
   .tbl-wrap {
     overflow-x: auto;
+  }
+  .tbl-wrap:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  summary {
+    padding-block: 4px;
+    cursor: pointer;
   }
   .tbl {
     width: 100%;
@@ -1741,7 +1767,7 @@
     cursor: pointer;
     color: var(--accent-fg);
     font: inherit;
-    font-size: 10.5px;
+    font-size: 11px;
     font-weight: 600;
     padding: 0;
   }
@@ -1853,6 +1879,8 @@
   }
   .page {
     width: 100%;
+    max-width: 1600px;
+    margin-inline: auto;
   }
   .crumb {
     min-width: 0;

@@ -347,7 +347,7 @@ fn render_panel(rows: &[Row], issued: Option<&Issued<'_>>) -> Markup {
             @if rows.is_empty() {
                 p class=(EMPTY) { "No OIDC provider is configured." }
             } @else {
-                div class="tbl-wrap mt-3 border-t border-border" {
+                div class="tbl-wrap mt-3 border-t border-border" tabindex="0" role="region" aria-label="SCIM provisioning" {
                     table class=(TABLE) {
                         thead {
                             tr {

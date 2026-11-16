@@ -549,7 +549,7 @@ pub(super) fn render_tool_backend_section(
                         "You hid this backend. Its mandatory tools stay visible."
                     }
                 }
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Tools" {
                     table class="tbl" {
                         thead {
                             tr {

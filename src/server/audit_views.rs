@@ -155,7 +155,7 @@ pub(super) fn render_calls_page(state: &AppState, user: &SessionUser, page: &Cal
             @if page.calls.is_empty() {
                 p class=(EMPTY) { "No calls." }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Tool calls" {
                     table class=(TABLE) {
                         thead {
                             tr {
@@ -373,7 +373,7 @@ pub(super) fn render_retention_section(page: &SettingsPage, oob: bool) -> Markup
 /// The table of capture rules, with delete buttons for those who may manage.
 fn rules_table(page: &SettingsPage) -> Markup {
     html! {
-        div class="tbl-wrap mt-3 border-t border-border" {
+        div class="tbl-wrap mt-3 border-t border-border" tabindex="0" role="region" aria-label="Capture rules" {
             table class=(TABLE) {
                 thead {
                     tr {

@@ -330,7 +330,7 @@ pub(super) fn render_backends_section(
             @if backends.is_empty() {
                 div class="card-b muted" { "No servers yet." }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="My MCP servers" {
                     table class="tbl" {
                         thead {
                             tr {
@@ -875,7 +875,7 @@ pub(super) fn render_admin_section(backends: &[AdminPersonalBackend]) -> Markup 
             @if backends.is_empty() {
                 div class="card-b muted" { "No personal servers yet." }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Personal MCP servers" {
                     table class="tbl" {
                         thead {
                             tr {

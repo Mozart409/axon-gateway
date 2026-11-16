@@ -265,7 +265,7 @@ pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Mark
             @if overview.groups.is_empty() {
                 p class=(EMPTY) { "No groups yet." }
             } @else {
-                div class="tbl-wrap mt-3 border-t border-border" {
+                div class="tbl-wrap mt-3 border-t border-border" tabindex="0" role="region" aria-label="Groups" {
                     table class=(TABLE) {
                         thead {
                             tr {
@@ -406,7 +406,7 @@ fn grants_matrix(overview: &AdminOverview) -> Markup {
     html! {
         @if !groups.is_empty() && !backends.is_empty() {
             div class="section-t px-3.5 pt-3" { "Access matrix" }
-            div class="tbl-wrap mt-2 border-t border-border" {
+            div class="tbl-wrap mt-2 border-t border-border" tabindex="0" role="region" aria-label="Access matrix" {
                 table class="tbl matrix" {
                     thead {
                         tr {
@@ -461,7 +461,7 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
             @if overview.grants.is_empty() {
                 p class=(EMPTY) { "No grants yet." }
             } @else {
-                div class="tbl-wrap mt-3 border-t border-border" {
+                div class="tbl-wrap mt-3 border-t border-border" tabindex="0" role="region" aria-label="Grants" {
                     table class=(TABLE) {
                         thead {
                             tr {
@@ -573,7 +573,7 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
             @if overview.bindings.is_empty() {
                 p class=(EMPTY) { "No role bindings yet." }
             } @else {
-                div class="tbl-wrap mt-3 border-t border-border" {
+                div class="tbl-wrap mt-3 border-t border-border" tabindex="0" role="region" aria-label="Role bindings" {
                     table class=(TABLE) {
                         thead {
                             tr {
@@ -715,7 +715,7 @@ pub(super) fn render_roles_section(page: &RolesPage) -> Markup {
     html! {
         section id="admin-roles" class="card" {
             div class="card-h" { h2 { "Roles" } }
-            div class="tbl-wrap" {
+            div class="tbl-wrap" tabindex="0" role="region" aria-label="Roles" {
                 table class=(TABLE) {
                     thead {
                         tr {
@@ -1066,7 +1066,7 @@ pub(super) fn render_users_section(page: &UsersPage) -> Markup {
             @if page.users.is_empty() {
                 p class=(EMPTY) { "No users yet." }
             } @else {
-                div class="tbl-wrap mt-3 border-t border-border" {
+                div class="tbl-wrap mt-3 border-t border-border" tabindex="0" role="region" aria-label="Users" {
                     table class=(TABLE) {
                         thead {
                             tr {
@@ -1160,7 +1160,7 @@ pub(super) fn render_audit_page(
             @if entries.is_empty() {
                 p class=(EMPTY) { "No entries." }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Audit log" {
                     table class=(TABLE) {
                         thead {
                             tr {

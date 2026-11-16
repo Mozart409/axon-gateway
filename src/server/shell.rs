@@ -353,6 +353,7 @@ pub(super) fn render_shell(
                                 select
                                     class="input sm"
                                     name="theme"
+                                    aria-label="Theme"
                                     hx-post="/ui/actions/theme"
                                     hx-trigger="change"
                                     hx-swap="none"
@@ -375,7 +376,7 @@ pub(super) fn render_shell(
                                 }
                                 form method="post" action="/auth/logout" {
                                     input type="hidden" name="csrf_token" value=(user.csrf_token);
-                                    button class="btn sm ghost" type="submit" {
+                                    button class="btn sm ghost" type="submit" aria-label="Log out" {
                                         (icon("log-out"))
                                         span class="hide-sm" { "Log out" }
                                     }

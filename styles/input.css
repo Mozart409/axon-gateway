@@ -156,7 +156,7 @@
   .side { width: 232px; flex: none; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 12px 10px; gap: 2px; }
   .brand { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 8px; margin-bottom: 8px; font-weight: 650; font-size: 14px; letter-spacing: -.01em; }
   .brand-mark { width: 24px; height: 24px; border-radius: 6px; background: var(--accent); color: var(--accent-fg); display: grid; place-items: center; }
-  .nav-label { font-size: 10.5px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); padding: 14px 10px 4px; }
+  .nav-label { font-size: 11px;font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); padding: 14px 10px 4px; }
   .nav-item { display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 10px; border-radius: 6px; color: var(--muted) !important; text-decoration: none; font-weight: 500; }
   .nav-item:hover { background: var(--surface-2); color: var(--text) !important; }
   .nav-item[aria-current="page"] { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--text) !important; }
@@ -177,7 +177,7 @@
   .btn.menu-btn { display: none; }
   @media (max-width: 900px) {
     .side { display: none; }
-    .btn.menu-btn { display: inline-flex; }
+    .btn.menu-btn { display: inline-flex; min-width: 32px; min-height: 32px; justify-content: center; }
     .top { padding: 0 12px; }
     .content { padding: 12px; }
     .hide-sm { display: none !important; }
@@ -211,10 +211,10 @@
   .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
   .dot.err { background: var(--err); box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 20%, transparent); }
   .pill { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px; border-radius: 999px; font-size: 11.5px; font-weight: 500; background: var(--surface-2); color: var(--muted); white-space: nowrap; }
-  .pill.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
-  .pill.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
-  .pill.err { background: color-mix(in srgb, var(--err) 15%, transparent); color: var(--err); }
-  .pill.accent { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+  .pill.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: color-mix(in srgb, var(--ok) 70%, var(--text)); }
+  .pill.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: color-mix(in srgb, var(--warn) 70%, var(--text)); }
+  .pill.err { background: color-mix(in srgb, var(--err) 15%, transparent); color: color-mix(in srgb, var(--err) 70%, var(--text)); }
+  .pill.accent { background: color-mix(in srgb, var(--accent) 16%, transparent); color: color-mix(in srgb, var(--accent) 70%, var(--text)); }
 
   /* ---------- Controls ---------- */
   .btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font: inherit; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; text-decoration: none; }
@@ -251,6 +251,8 @@
 
   /* ---------- Tables, lists ---------- */
   .tbl-wrap { overflow-x: auto; }
+  .tbl-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  summary { padding-block: 4px; cursor: pointer; }
   .tbl { width: 100%; border-collapse: collapse; }
   .tbl th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--border); white-space: nowrap; }
   .tbl td { padding: 7px 14px; border-bottom: 1px solid var(--border); white-space: nowrap; }
@@ -311,7 +313,7 @@
   .wf-track > span { position: absolute; top: 0; bottom: 0; border-radius: 3px; background: var(--accent); min-width: 3px; }
 
   /* ---------- Admin bits ---------- */
-  .cell { width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); display: inline-grid; place-items: center; cursor: pointer; color: var(--accent-fg); font: inherit; font-size: 10.5px; font-weight: 600; padding: 0; }
+  .cell { width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); display: inline-grid; place-items: center; cursor: pointer; color: var(--accent-fg); font: inherit; font-size: 11px; font-weight: 600; padding: 0; }
   .cell[data-state="full"] { background: var(--accent); border-color: var(--accent); }
   .cell[data-state="partial"] { background: color-mix(in srgb, var(--accent) 20%, transparent); border-color: var(--accent); color: var(--text); }
   .cell[aria-current="true"] { outline: 2px solid var(--text); outline-offset: 1px; }
@@ -332,7 +334,7 @@
   .setting:last-child { border-bottom: 0; }
 
   /* ---------- Shell additions ---------- */
-  .page { width: 100%; }
+  .page { width: 100%; max-width: 1600px; margin-inline: auto; }
   .crumb { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .theme-pick { display: flex; align-items: center; gap: 6px; }
   @media (max-width: 600px) {

@@ -144,7 +144,7 @@ pub(super) fn render_toolsets_section(toolsets: &[Toolset], backends: &[String])
                 p class=(format!("mt-1 {MUTED}")) {
                     "A toolset is a named set of tool globs and backends. It only narrows what you may "
                     "use. Pin a token to one on the "
-                    a href="/ui/tokens" class="text-accent hover:underline" { "tokens page" }
+                    a href="/ui/tokens" class="text-accent underline underline-offset-2" { "tokens page" }
                     ": the token then follows later edits of the toolset at once. "
                     "Tool globs match the namespaced tool name, like prom_query*. "
                     "A toolset also limits "

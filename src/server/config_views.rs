@@ -507,7 +507,7 @@ pub(super) fn render_backends_page(
             @if backends.is_empty() {
                 div class="card-b muted" { "No backends in the database yet." }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Backends" {
                     table class="tbl" {
                         thead {
                             tr {
@@ -669,7 +669,7 @@ pub(super) fn render_toolsets_page(
             @if toolsets.is_empty() {
                 div class="card-b muted" { "No toolsets in the database yet." }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Toolsets" {
                     table class="tbl" {
                         thead {
                             tr {
@@ -874,7 +874,7 @@ pub(super) fn render_providers_page(
                     "No providers: the break-glass link (axon-gateway admin login-link) is the way in."
                 }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="OIDC providers" {
                     table class="tbl" {
                         thead {
                             tr {

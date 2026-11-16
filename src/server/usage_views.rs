@@ -19,7 +19,7 @@ use super::shell::Nav;
 use crate::store::{DailyUsage, SessionUser, UsageReport, UsageUser, UserUsageRow};
 
 const BACK_LINK: &str =
-    "inline-flex items-center gap-1 text-xs font-medium text-muted hover:text-text";
+    "inline-flex min-h-6 items-center gap-1 text-xs font-medium text-muted hover:text-text";
 const LINK: &str = "font-medium text-accent hover:underline";
 const NUMBER: &str = "text-right tabular-nums";
 /// The windows offered as links, in days
@@ -330,7 +330,7 @@ fn tools_section(report: &UsageReport) -> Markup {
                 h2 { "Top tools" }
                 span class="text-xs text-muted" { (thousands(report.totals.tools)) " used" }
             }
-            div class="tbl-wrap" {
+            div class="tbl-wrap" tabindex="0" role="region" aria-label="Top tools" {
                 table class="tbl" {
                     thead {
                         tr {
@@ -404,7 +404,7 @@ fn users_table(days: i32, rows: &[UserUsageRow]) -> Markup {
             @if rows.is_empty() {
                 p class="card-b text-muted" { "No calls in the last " (days) " days." }
             } @else {
-                div class="tbl-wrap" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Users by calls" {
                     table class="tbl" {
                         thead {
                             tr {
