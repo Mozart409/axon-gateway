@@ -4,3 +4,6 @@ target/
 *.md
 .claude/
 .env*
+# The Playwright suite and its node_modules never go into the image
+e2e/
+.playwright-mcp/
