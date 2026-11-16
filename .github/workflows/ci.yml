@@ -84,3 +84,84 @@ jobs:
 
       - name: Check against MSRV
         run: cargo check --locked --all-targets
+
+  e2e:
+    name: E2E (Playwright)
+    runs-on: ubuntu-latest
+    env:
+      # The dev stack of bacon.toml's run-long job: database mode against
+      # example/compose.local.yml, dev-only values.
+      RUST_LOG: info
+      AXON_BIND: 127.0.0.1:8080
+      AXON_BASE_URL: http://localhost:8080
+      AXON_DATABASE_URL: postgres://axon:axon-dev@127.0.0.1:5437/axon
+      AXON_KEK: axon-dev-only-kek-do-not-use-in-prod
+      AXON_OIDC_ISSUER: http://127.0.0.1:4011/default
+      AXON_OIDC_CLIENT_ID: axon-dev
+      AXON_OIDC_CLIENT_SECRET_FILE: example/dev-oidc-client-secret
+      AXON_OIDC_ADMIN_GROUPS: axon-admins
+      AXON_OIDC_SCOPES: openid,profile,email,offline_access
+      AXON_DEV_AUTO_CONSENT: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+
+      - name: Install Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Start Postgres and the mock OIDC provider
+        run: |
+          docker compose -f example/compose.local.yml up -d --wait
+          for _ in $(seq 60); do
+            curl -sf http://127.0.0.1:4011/default/.well-known/openid-configuration >/dev/null && exit 0
+            sleep 1
+          done
+          docker compose -f example/compose.local.yml logs mockoidc
+          exit 1
+
+      - name: Build the gateway and the demo backend
+        run: cargo build --locked --bin axon-gateway --example oidc_backend
+
+      - name: Start the demo backend and the gateway
+        run: |
+          ./target/debug/examples/oidc_backend > oidc-backend.log 2>&1 &
+          ./target/debug/axon-gateway > gateway.log 2>&1 &
+          # Both must answer before the e2e seed registers a backend on 3003.
+          for _ in $(seq 60); do
+            backend=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3003/open/mcp || true)
+            if [ "$backend" != 000 ] && curl -sf http://127.0.0.1:8080/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat oidc-backend.log gateway.log
+          exit 1
+
+      - name: Install the e2e dependencies and Chromium
+        working-directory: e2e
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Run the e2e suite
+        working-directory: e2e
+        run: npx playwright test
+
+      - name: Upload the report and logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: e2e-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+            gateway.log
+            oidc-backend.log
+          retention-days: 7
