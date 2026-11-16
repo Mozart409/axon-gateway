@@ -3,16 +3,22 @@
 //! they only ever go through maud's escaping.
 
 use chrono::{DateTime, Utc};
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{DOCTYPE, Markup, html};
 
 use super::AppState;
-use super::admin_views::{
-    BACK_LINK, BUTTON, BUTTON_DANGER, CARD, CODE, FAINT, HEADING, MUTED, TABLE, TABLE_WRAP, TBODY,
-    TD, TH, THEAD, render_flash_area, render_layout,
-};
+use super::admin_views::{render_flash_area, render_layout};
 use super::shell::{Nav, current_theme};
 use super::views::build_fingerprint;
 use crate::store::{AuthRequest, OauthGrant, SessionUser};
+
+const CARD: &str = "card";
+const CODE: &str = "font-mono";
+const FAINT: &str = "text-muted";
+const MUTED: &str = "text-sm text-muted";
+const BUTTON: &str = "btn primary";
+const BUTTON_DANGER: &str = "btn danger sm";
+const TABLE_WRAP: &str = "tbl-wrap";
+const TABLE: &str = "tbl";
 
 /// The consent page's view of a pending request
 pub(super) struct Consent<'a> {
@@ -46,15 +52,17 @@ pub(super) fn render_error_page(state: &AppState, title: &str, message: &str) ->
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 link rel="stylesheet" href="/styles/output.css?v=2";
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
-                main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
-                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
-                            "Authorization"
+            body class="axon" {
+                div class="grid min-h-screen place-items-center p-4" {
+                    div class="card w-full max-w-md" {
+                        div class="card-b text-center" {
+                            p class="text-xs font-semibold uppercase tracking-widest text-muted" {
+                                "Authorization"
+                            }
+                            h1 class="mt-3 text-3xl font-semibold tracking-tight" { (title) }
+                            p class="mt-3 text-muted" { (message) }
                         }
-                        h1 class="mt-3 text-3xl font-semibold tracking-tight" { (title) }
-                        p class="mt-3 text-slate-600 dark:text-slate-300" { (message) }
-                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:text-slate-400 dark:border-slate-700" {
+                        div class="card-f justify-center font-mono text-xs text-muted" {
                             (build_fingerprint(state))
                         }
                     }
@@ -80,43 +88,47 @@ pub(super) fn render_consent_page(
         .unwrap_or(&user.user.subject);
     let page = html! {
         section class=(CARD) {
-            h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Connect " (name) "?"
+            div class="card-h" {
+                h2 { "Connect " (name) "?" }
             }
-            p class=(format!("mt-2 {MUTED}")) {
-                "An app wants to use this gateway's tools as you. It can use only what you may "
-                "use, and you can end the connection at any time under Connected apps."
-            }
-            dl class="mt-4 grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 text-sm" {
-                dt class=(FAINT) { "App" }
-                dd { (name) }
-                @if let Some(host) = consent.client_host {
-                    dt class=(FAINT) { "App metadata from" }
-                    dd { code class=(CODE) { (host) } }
-                } @else {
-                    dt class=(FAINT) { "Client id" }
-                    dd { code class=(CODE) { (request.client_id) } }
+            div class="card-b" {
+                p class=(format!("mt-2 {MUTED}")) {
+                    "An app wants to use this gateway's tools as you. It can use only what you may "
+                    "use, and you can end the connection at any time under Connected apps."
                 }
-                dt class=(FAINT) { "Returns to" }
-                dd { code class=(CODE) { (consent.redirect_host) } }
-                dt class=(FAINT) { "Acting as" }
-                dd { (acting_as) }
-                dt class=(FAINT) { "Resource" }
-                dd { code class=(CODE) { (request.resource) } }
+                dl class="mt-4 grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 text-sm" {
+                    dt class=(FAINT) { "App" }
+                    dd { (name) }
+                    @if let Some(host) = consent.client_host {
+                        dt class=(FAINT) { "App metadata from" }
+                        dd { code class=(CODE) { (host) } }
+                    } @else {
+                        dt class=(FAINT) { "Client id" }
+                        dd { code class=(CODE) { (request.client_id) } }
+                    }
+                    dt class=(FAINT) { "Returns to" }
+                    dd { code class=(CODE) { (consent.redirect_host) } }
+                    dt class=(FAINT) { "Acting as" }
+                    dd { (acting_as) }
+                    dt class=(FAINT) { "Resource" }
+                    dd { code class=(CODE) { (request.resource) } }
+                }
             }
-            form method="post" action="/oauth/authorize/decision" class="mt-6 flex gap-3" {
+            form method="post" action="/oauth/authorize/decision" {
                 input type="hidden" name="csrf_token" value=(user.csrf_token);
                 input type="hidden" name="request" value=(request.id);
-                button class=(BUTTON) type="submit" name="decision" value="approve" {
-                    "Approve"
-                }
-                button
-                    class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                    type="submit"
-                    name="decision"
-                    value="deny"
-                {
-                    "Deny"
+                div class="card-f" {
+                    button class=(BUTTON) type="submit" name="decision" value="approve" {
+                        "Approve"
+                    }
+                    button
+                        class="btn"
+                        type="submit"
+                        name="decision"
+                        value="deny"
+                    {
+                        "Deny"
+                    }
                 }
             }
         }
@@ -128,55 +140,59 @@ pub(super) fn render_consent_page(
 pub(super) fn render_apps_section(grants: &[OauthGrant]) -> Markup {
     html! {
         section id="my-apps" class=(CARD) {
-            h2 class=(HEADING) { "Connected apps" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "Apps you let sign in to this gateway as you, such as an MCP client. Revoking one "
-                "ends its access at once; it has to ask you again to reconnect."
+            div class="card-h" {
+                h2 { "Connected apps" }
             }
-            @if grants.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No connected apps." }
-            } @else {
-                div class=(TABLE_WRAP) {
-                    table class=(TABLE) {
-                        thead class=(THEAD) {
-                            tr {
-                                th class=(TH) { "App" }
-                                th class=(TH) { "Resource" }
-                                th class=(TH) { "Connected" }
-                                th class=(TH) { "Last used" }
-                                th class=(TH) { "Actions" }
-                            }
-                        }
-                        tbody class=(TBODY) {
-                            @for grant in grants {
+            div class="card-b" {
+                p class=(format!("mt-1 {MUTED}")) {
+                    "Apps you let sign in to this gateway as you, such as an MCP client. Revoking one "
+                    "ends its access at once; it has to ask you again to reconnect."
+                }
+                @if grants.is_empty() {
+                    p class=(format!("mt-4 text-sm {FAINT}")) { "No connected apps." }
+                } @else {
+                    div class=(TABLE_WRAP) {
+                        table class=(TABLE) {
+                            thead {
                                 tr {
-                                    td class=(TD) {
-                                        (client_label(grant.client_name.as_deref(), &grant.client_id))
-                                        @if let Some(host) = super::oauth::cimd_host(&grant.client_id) {
-                                            div class=(format!("text-xs {FAINT}")) { (host) }
-                                        } @else if grant.client_name.is_some() {
-                                            div class=(format!("text-xs {FAINT}")) { (grant.client_id) }
+                                    th { "App" }
+                                    th { "Resource" }
+                                    th { "Connected" }
+                                    th { "Last used" }
+                                    th { "Actions" }
+                                }
+                            }
+                            tbody {
+                                @for grant in grants {
+                                    tr {
+                                        td {
+                                            (client_label(grant.client_name.as_deref(), &grant.client_id))
+                                            @if let Some(host) = super::oauth::cimd_host(&grant.client_id) {
+                                                div class=(format!("text-xs {FAINT}")) { (host) }
+                                            } @else if grant.client_name.is_some() {
+                                                div class=(format!("text-xs {FAINT}")) { (grant.client_id) }
+                                            }
                                         }
-                                    }
-                                    td class=(TD) { code class=(CODE) { (grant.resource) } }
-                                    td class=(TD) { (when(grant.created_at)) }
-                                    td class=(TD) {
-                                        @if let Some(at) = grant.last_used_at {
-                                            (when(at))
-                                        } @else {
-                                            span class=(FAINT) { "never" }
+                                        td { code class=(CODE) { (grant.resource) } }
+                                        td { (when(grant.created_at)) }
+                                        td {
+                                            @if let Some(at) = grant.last_used_at {
+                                                (when(at))
+                                            } @else {
+                                                span class=(FAINT) { "never" }
+                                            }
                                         }
-                                    }
-                                    td class=(TD) {
-                                        button
-                                            class=(BUTTON_DANGER)
-                                            type="button"
-                                            hx-post=(format!("/ui/actions/me/apps/{}/revoke", grant.id))
-                                            hx-target="#my-apps"
-                                            hx-swap="outerHTML"
-                                            hx-confirm="Revoke this app? It stops working at once."
-                                        {
-                                            "Revoke"
+                                        td {
+                                            button
+                                                class=(BUTTON_DANGER)
+                                                type="button"
+                                                hx-post=(format!("/ui/actions/me/apps/{}/revoke", grant.id))
+                                                hx-target="#my-apps"
+                                                hx-swap="outerHTML"
+                                                hx-confirm="Revoke this app? It stops working at once."
+                                            {
+                                                "Revoke"
+                                            }
                                         }
                                     }
                                 }
@@ -196,12 +212,6 @@ pub(super) fn render_apps_page(
     grants: &[OauthGrant],
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Connected apps"
-            }
-        }
         (render_flash_area(false))
         (render_apps_section(grants))
     };

@@ -16,15 +16,12 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
-use maud::{Markup, PreEscaped, html};
+use maud::{Markup, html};
 use serde_json::{Value, json};
 
 use super::admin_api::{ApiError, ApiPath, ApiResult};
 use super::admin_ui::{not_found, page_error};
-use super::admin_views::{
-    BACK_LINK, BUTTON, BUTTON_DANGER, CARD, CODE, FAINT, HEADING, MUTED, TABLE, TABLE_WRAP, TBODY,
-    TD, TH, THEAD, render_layout,
-};
+use super::admin_views::{BUTTON_DANGER, CODE, DESC, EMPTY, TABLE, TD, render_layout};
 use super::shell::Nav;
 use super::{AppState, reject_cross_site_middleware, session};
 use crate::policy::Permission;
@@ -317,17 +314,17 @@ fn when(at: DateTime<Utc>) -> String {
 fn render_issued(issued: &Issued<'_>) -> Markup {
     html! {
         div
-            class="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 p-4 dark:border-emerald-800 dark:bg-emerald-950/40"
+            class="mx-3.5 mt-3 rounded-md border border-ok bg-surface-2 p-3"
             role="status"
         {
-            p class="text-sm font-semibold text-emerald-900 dark:text-emerald-200" {
+            p class="text-sm font-semibold text-ok" {
                 "SCIM token for " code { (issued.provider) } " created"
             }
-            p class="mt-1 text-sm text-emerald-900 dark:text-emerald-200" {
+            p class="mt-1 text-sm text-muted" {
                 "Copy it now. It is not shown again, and the previous token no longer works."
             }
             code
-                class="mt-2 block select-all break-all rounded-md bg-white px-3 py-2 font-mono text-sm text-slate-900 dark:bg-slate-900 dark:text-slate-100"
+                class="mono mt-2 block select-all break-all rounded-md border border-border bg-surface px-3 py-2 text-text"
             {
                 (issued.token)
             }
@@ -338,9 +335,9 @@ fn render_issued(issued: &Issued<'_>) -> Markup {
 /// The providers table, which the actions swap whole
 fn render_panel(rows: &[Row], issued: Option<&Issued<'_>>) -> Markup {
     html! {
-        section id=(PANEL_ID) class=(CARD) {
-            h2 class=(HEADING) { "SCIM provisioning" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id=(PANEL_ID) class="card" {
+            div class="card-h" { h2 { "SCIM provisioning" } }
+            p class=(DESC) {
                 "An identity provider such as Entra ID or Okta pushes users and groups to the base URL "
                 "with the provider's token as a bearer token. Creating a token again replaces the old one."
             }
@@ -348,21 +345,21 @@ fn render_panel(rows: &[Row], issued: Option<&Issued<'_>>) -> Markup {
                 (render_issued(issued))
             }
             @if rows.is_empty() {
-                p class=(format!("mt-4 {FAINT}")) { "No OIDC provider is configured." }
+                p class=(EMPTY) { "No OIDC provider is configured." }
             } @else {
-                div class=(format!("mt-4 {TABLE_WRAP}")) {
+                div class="tbl-wrap mt-3 border-t border-border" {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "Provider" }
-                                th class=(TH) { "Base URL" }
-                                th class=(TH) { "Token" }
-                                th class=(TH) { "Users" }
-                                th class=(TH) { "Groups" }
-                                th class=(TH) {}
+                                th { "Provider" }
+                                th { "Base URL" }
+                                th { "Token" }
+                                th { "Users" }
+                                th { "Groups" }
+                                th {}
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for row in rows {
                                 (render_row(row))
                             }
@@ -384,7 +381,7 @@ fn render_row(row: &Row) -> Markup {
             td class=(TD) {
                 (row.display_name)
                 @if row.display_name != row.id {
-                    " " span class=(FAINT) { "(" (row.id) ")" }
+                    " " span class="text-muted" { "(" (row.id) ")" }
                 }
             }
             td class=(TD) { code class=(CODE) { (row.base_url) } }
@@ -392,7 +389,7 @@ fn render_row(row: &Row) -> Markup {
                 @if let Some(created) = row.state.token_created_at {
                     "created " (when(created))
                     br;
-                    span class=(FAINT) {
+                    span class="text-muted" {
                         @if let Some(used) = row.state.token_last_used_at {
                             "last used " (when(used))
                         } @else {
@@ -400,7 +397,7 @@ fn render_row(row: &Row) -> Markup {
                         }
                     }
                 } @else {
-                    span class=(FAINT) { "none" }
+                    span class="text-muted" { "none" }
                 }
             }
             td class=(TD) { (row.state.users) }
@@ -408,7 +405,7 @@ fn render_row(row: &Row) -> Markup {
             td class=(TD) {
                 div class="flex flex-wrap gap-2" {
                     button
-                        class=(BUTTON)
+                        class=(if has_token { "btn sm" } else { "btn sm primary" })
                         type="button"
                         hx-post=(create_path)
                         hx-target=(target)
@@ -435,7 +432,7 @@ fn render_row(row: &Row) -> Markup {
     }
 }
 
-/// The page: a back link and the panel.
+/// The page: the panel (the top bar shows the title).
 fn render_scim_page(
     state: &AppState,
     user: &SessionUser,
@@ -443,10 +440,6 @@ fn render_scim_page(
     issued: Option<&Issued<'_>>,
 ) -> Markup {
     let content = html! {
-        a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Admin" }
-        h1 class="mt-4 mb-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-            "SCIM provisioning"
-        }
         (render_panel(rows, issued))
     };
     render_layout(state, user, "SCIM provisioning", Nav::Admin, &content)

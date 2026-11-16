@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use super::shell::{Nav, current_theme, render_shell};
+use super::shell::{Nav, current_theme, icon, render_shell};
 use super::{AppState, FlashLevel, FlashMessage};
 use crate::gateway::DetailedGatewayStatus;
 use crate::policy::{AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, ToolRef};
@@ -19,6 +19,9 @@ use crate::types::{
 /// htmx under the page CSP: no injected indicator `<style>` and no `eval`.
 const HTMX_CONFIG: &str = r#"{"includeIndicatorStyles":false,"allowEval":false}"#;
 
+/// The icon sprite for pages rendered without the shell (see `shell::icon`).
+const ICON_SPRITE: &str = include_str!("../../static/icons.svg");
+
 /// One "Sign in with ..." choice on the login page.
 pub(super) struct LoginOption {
     pub display_name: String,
@@ -26,215 +29,130 @@ pub(super) struct LoginOption {
     pub href: String,
 }
 
-/// Landing page (`GET /`).
-#[allow(clippy::too_many_lines)]
-pub(super) fn render_landing_page(state: &AppState) -> Markup {
-    let mcp_server_url = build_mcp_server_url(&state.base_url);
-
+/// A centered card page without the shell (landing, login, 404, auth error).
+fn render_card_page(
+    state: &AppState,
+    page_title: &str,
+    eyebrow: &str,
+    heading: &str,
+    body: &Markup,
+) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" data-theme=(current_theme().slug()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Axon Gateway" }
+                title { (page_title) }
                 link rel="icon" type="image/svg+xml" href="/favicon.svg";
                 link rel="stylesheet" href="/styles/output.css?v=2";
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
-                main class="mx-auto flex min-h-screen max-w-4xl items-center px-6 py-12" {
-                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
-                            "Axon Gateway"
+            body class="axon" {
+                main class="mx-auto flex min-h-screen w-full max-w-xl items-center p-6" {
+                    section class="card w-full" {
+                        div class="card-b flex flex-col gap-4 p-6" {
+                            div class="flex flex-col gap-1" {
+                                p class="section-t" { (eyebrow) }
+                                h1 class="text-xl font-semibold" { (heading) }
+                            }
+                            (body)
                         }
-                        h1 class="mt-3 text-3xl font-semibold tracking-tight" {
-                            "One endpoint for your MCP backends"
-                        }
-                        p class="mt-3 text-slate-600 dark:text-slate-300" {
-                            "Use the dashboard for live backend health, and the MCP endpoint for agent calls."
-                        }
-                        div class="mt-6 rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-950" {
-                            p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
-                                "Axon Gateway MCP Server"
-                            }
-                            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" {
-                                "Copy this URL into your MCP client configuration."
-                            }
-                            div class="mt-3 flex flex-col gap-2 sm:flex-row" {
-                                code class="block flex-1 overflow-x-auto rounded-md border border-slate-200 bg-white px-3 py-2 text-xs text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" id="mcp-server-url" {
-                                    (mcp_server_url.as_str())
-                                }
-                                button
-                                    class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                                    data-url=(mcp_server_url.as_str())
-                                    id="copy-mcp-url"
-                                    type="button"
-                                {
-                                    "Copy MCP URL"
-                                }
-                            }
-                            p class="mt-2 text-xs text-slate-500 dark:text-slate-400" id="copy-mcp-url-feedback" aria-live="polite" {
-                                ""
-                            }
-                        }
-                        div class="mt-6 flex flex-wrap gap-3" {
-                            a
-                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
-                                href="/ui"
-                            {
-                                "Open Dashboard"
-                            }
-                            a
-                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                                href="/health"
-                            {
-                                "Health"
-                            }
-                        }
-                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
-                            (build_fingerprint(state))
+                        div class="card-f" {
+                            p class="mono muted break-all" { (build_fingerprint(state)) }
                         }
                     }
                 }
-                script src="/static/copy-url.js" defer {}
             }
         }
     }
+}
+
+/// Landing page (`GET /`).
+pub(super) fn render_landing_page(state: &AppState) -> Markup {
+    let mcp_server_url = build_mcp_server_url(&state.base_url);
+
+    let body = html! {
+        p class="muted" {
+            "Use the dashboard for live backend health, and the MCP endpoint for agent calls."
+        }
+        div class="flex flex-col gap-2" {
+            p class="section-t" { "Axon Gateway MCP Server" }
+            p class="hint" { "Copy this URL into your MCP client configuration." }
+            div class="copyline" {
+                code class="mono" id="mcp-server-url" { (mcp_server_url.as_str()) }
+                button
+                    class="btn sm ghost"
+                    data-url=(mcp_server_url.as_str())
+                    id="copy-mcp-url"
+                    type="button"
+                {
+                    "Copy MCP URL"
+                }
+            }
+            p class="hint" id="copy-mcp-url-feedback" aria-live="polite" { "" }
+        }
+        div class="flex flex-wrap gap-2" {
+            a class="btn primary" href="/ui" { "Open Dashboard" }
+            a class="btn" href="/health" { "Health" }
+        }
+        script src="/static/copy-url.js" defer {}
+    };
+    render_card_page(
+        state,
+        "Axon Gateway",
+        "Axon Gateway",
+        "One endpoint for your MCP backends",
+        &body,
+    )
 }
 
 /// Global 404 page for unmatched routes.
 pub(super) fn render_not_found_page(state: &AppState) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" data-theme=(current_theme().slug()) {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Page Not Found" }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=2";
-            }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
-                main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
-                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" { "404" }
-                        h1 class="mt-3 text-3xl font-semibold tracking-tight" { "Route not found" }
-                        p class="mt-3 text-slate-600 dark:text-slate-300" {
-                            "The page you requested does not exist on this gateway instance."
-                        }
-                        div class="mt-6 flex justify-center gap-3" {
-                            a
-                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
-                                href="/"
-                            {
-                                "Go Home"
-                            }
-                            a
-                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                                href="/ui"
-                            {
-                                "Open Dashboard"
-                            }
-                        }
-                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
-                            (build_fingerprint(state))
-                        }
-                    }
-                }
-            }
+    let body = html! {
+        p class="muted" { "The page you requested does not exist on this gateway instance." }
+        div class="flex flex-wrap gap-2" {
+            a class="btn primary" href="/" { "Go Home" }
+            a class="btn" href="/ui" { "Open Dashboard" }
         }
-    }
+    };
+    render_card_page(state, "Page Not Found", "404", "Route not found", &body)
 }
 
 /// Login page (`GET /auth/login`).
 pub(super) fn render_login_page(state: &AppState, options: &[LoginOption]) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" data-theme=(current_theme().slug()) {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Sign in - Axon Gateway" }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=2";
-            }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
-                main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
-                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
-                            "Axon Gateway"
-                        }
-                        h1 class="mt-3 text-3xl font-semibold tracking-tight" {
-                            "Sign in to Axon Gateway"
-                        }
-                        @if options.is_empty() {
-                            p class="mt-3 text-slate-600 dark:text-slate-300" {
-                                "No login providers are configured."
-                            }
-                        } @else {
-                            div class="mt-6 flex flex-col items-center gap-3" {
-                                @for option in options {
-                                    a
-                                        class="w-full max-w-xs rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
-                                        href=(option.href)
-                                    {
-                                        "Sign in with " (option.display_name)
-                                    }
-                                }
-                            }
-                        }
-                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
-                            (build_fingerprint(state))
-                        }
+    let body = html! {
+        @if options.is_empty() {
+            p class="muted" { "No login providers are configured." }
+        } @else {
+            div class="flex flex-col gap-2" {
+                @for option in options {
+                    a class="btn primary w-full justify-center" href=(option.href) {
+                        "Sign in with " (option.display_name)
                     }
                 }
             }
         }
-    }
+    };
+    render_card_page(
+        state,
+        "Sign in - Axon Gateway",
+        "Axon Gateway",
+        "Sign in to Axon Gateway",
+        &body,
+    )
 }
 
 /// Login failure page; `message` must be generic, never provider details.
 pub(super) fn render_auth_error_page(state: &AppState, title: &str, message: &str) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" data-theme=(current_theme().slug()) {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) " - Axon Gateway" }
-                link rel="icon" type="image/svg+xml" href="/favicon.svg";
-                link rel="stylesheet" href="/styles/output.css?v=2";
-            }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
-                main class="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-12" {
-                    section class="w-full rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-                        p class="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400" {
-                            "Sign-in failed"
-                        }
-                        h1 class="mt-3 text-3xl font-semibold tracking-tight" { (title) }
-                        p class="mt-3 text-slate-600 dark:text-slate-300" { (message) }
-                        div class="mt-6 flex justify-center gap-3" {
-                            a
-                                class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
-                                href="/auth/login"
-                            {
-                                "Try again"
-                            }
-                            a
-                                class="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-                                href="/"
-                            {
-                                "Home"
-                            }
-                        }
-                        p class="mt-8 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:text-slate-400 dark:border-slate-700" {
-                            (build_fingerprint(state))
-                        }
-                    }
-                }
-            }
+    let body = html! {
+        p class="muted" { (message) }
+        div class="flex flex-wrap gap-2" {
+            a class="btn primary" href="/auth/login" { "Try again" }
+            a class="btn" href="/" { "Home" }
         }
-    }
+    };
+    let page_title = format!("{title} - Axon Gateway");
+    render_card_page(state, &page_title, "Sign-in failed", title, &body)
 }
 
 /// `hx-headers` value that makes every htmx request carry the CSRF token.
@@ -248,36 +166,55 @@ pub(super) fn render_ui_page(
     state: &AppState,
     user: Option<&SessionUser>,
 ) -> Markup {
+    let mcp_server_url = build_mcp_server_url(&state.base_url);
     let content = html! {
-        section class="mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            h1 class="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Axon Gateway"
-            }
-            p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
-                "Server-rendered dashboard with SSE updates and HTMX actions."
-            }
-            // Database mode has no config file to reload
-            @if state.config_path.is_some() {
-                div class="mt-4 flex flex-wrap gap-3" {
+        div class="flex flex-col gap-4" {
+            div class="page-head" {
+                p { "Live backend health, with SSE updates and HTMX actions." }
+                // Database mode has no config file to reload
+                @if state.config_path.is_some() {
+                    span class="spacer" {}
                     button
-                        class="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300"
+                        class="btn primary"
                         hx-post="/ui/actions/reload"
                         hx-target="#flash"
                         hx-swap="innerHTML"
                     {
-                        "Reload Config"
+                        (icon("refresh-cw")) "Reload Config"
                     }
                 }
             }
-        }
-        div
-            hx-ext="sse"
-            sse-connect="/ui/events"
-        {
-            div id="flash" sse-swap="flash" {}
-            div id="backend-panel" sse-swap="backend_status_changed" {
-                (render_backend_panel(status))
+            section class="card" {
+                div class="card-h" {
+                    (icon("plug"))
+                    h2 { "Connect your client" }
+                }
+                div class="card-b flex flex-col gap-2" {
+                    div class="copyline" {
+                        code class="mono" id="mcp-server-url" { (mcp_server_url.as_str()) }
+                        button
+                            class="btn sm ghost"
+                            data-url=(mcp_server_url.as_str())
+                            id="copy-mcp-url"
+                            type="button"
+                        {
+                            (icon("copy")) "Copy MCP URL"
+                        }
+                    }
+                    p class="hint" id="copy-mcp-url-feedback" aria-live="polite" { "" }
+                }
             }
+            div
+                class="flex flex-col gap-4"
+                hx-ext="sse"
+                sse-connect="/ui/events"
+            {
+                div id="flash" class="empty:hidden" sse-swap="flash" {}
+                div id="backend-panel" sse-swap="backend_status_changed" {
+                    (render_backend_panel(status))
+                }
+            }
+            script src="/static/copy-url.js" defer {}
         }
     };
     match user {
@@ -301,13 +238,27 @@ fn render_standalone_page(state: &AppState, title: &str, content: &Markup) -> Ma
                 script src="/static/htmx-ext-sse-2.2.2.js" defer {};
                 link rel="stylesheet" href="/styles/output.css?v=2";
             }
-            body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100" {
-                main class="mx-auto max-w-6xl p-6" {
+            body class="axon" {
+                (PreEscaped(ICON_SPRITE))
+                main class="content mx-auto w-full max-w-6xl" {
+                    h1 class="text-xl font-semibold" { (title) }
                     (content)
-                    footer class="mt-6 border-t border-slate-200 pt-4 font-mono text-xs text-slate-500 dark:border-slate-700 dark:text-slate-400" {
-                        (build_fingerprint(state))
+                    footer class="card-f border-t-0 px-0" {
+                        p class="mono muted break-all" { (build_fingerprint(state)) }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// One tool or prompt in a backend's detail card.
+fn render_detail_item(name: &str, description: Option<&str>) -> Markup {
+    html! {
+        li class="px-3.5 py-2.5" {
+            p class="mono font-medium" { (name) }
+            @if let Some(description) = description {
+                p class="muted" { (description) }
             }
         }
     }
@@ -323,83 +274,93 @@ pub(super) fn render_ui_backend_detail_page(
     user: Option<&SessionUser>,
 ) -> Markup {
     let state_text = backend_state_text(backend.state);
-    let state_class = backend_state_class(backend.state);
+    let tone = backend_state_tone(backend.state);
 
     let content = html! {
-        section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            a
-                href="/ui"
-                class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
-            {
-                (PreEscaped("&larr;")) " Back to dashboard"
+        div class="flex flex-col gap-4" {
+            div class="page-head" {
+                a class="btn sm ghost" href="/ui" { (PreEscaped("&larr;")) " Back to dashboard" }
             }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                code { (&backend.name) }
-            }
-            div class="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-600 dark:text-slate-300" {
-                span { "State:" }
-                span class=(state_class) { (state_text) }
-                span { "Tools: " (backend.tool_count) }
-                span { "Prompts: " (prompts.len()) }
-                span { "Resources: " (resources.len()) }
-            }
-            @if let Some(error) = &backend.last_error {
-                p class="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300" {
-                    "Last error: " code { (error) }
+            section class="card" {
+                div class="card-h" {
+                    span class={"dot " (tone)} {}
+                    h2 { code { (&backend.name) } }
+                    span class={"pill " (tone)} { (state_text) }
                 }
-            }
-        }
-
-        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Tools" }
-            @if backend.tools.is_empty() {
-                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No tools exposed by this backend." }
-            } @else {
-                ul class="mt-4 space-y-3" {
-                    @for tool in &backend.tools {
-                        li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
-                            p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&tool.original_name) }
-                            @if let Some(description) = &tool.definition.description {
-                                p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
-                            }
+                div class="card-b flex flex-col gap-3" {
+                    div class="flex flex-wrap items-center gap-4 muted" {
+                        span { "State: " (state_text) }
+                        span { "Tools: " (backend.tool_count) }
+                        span { "Prompts: " (prompts.len()) }
+                        span { "Resources: " (resources.len()) }
+                    }
+                    @if let Some(error) = &backend.last_error {
+                        div class="banner text-err" {
+                            (icon("circle-alert"))
+                            span { "Last error: " code { (error) } }
                         }
                     }
                 }
             }
-        }
 
-        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Prompts" }
-            @if prompts.is_empty() {
-                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No prompts exposed by this backend." }
-            } @else {
-                ul class="mt-4 space-y-3" {
-                    @for prompt in prompts {
-                        li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
-                            p class="font-mono text-sm text-slate-900 dark:text-slate-100" { (&prompt.name) }
-                            @if let Some(description) = &prompt.description {
-                                p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
+            div class="cols" {
+                section class="card" {
+                    div class="card-h" {
+                        (icon("wrench"))
+                        h2 { "Tools" }
+                        span class="pill" { (backend.tools.len()) }
+                    }
+                    @if backend.tools.is_empty() {
+                        p class="card-b muted" { "No tools exposed by this backend." }
+                    } @else {
+                        ul class="m-0 list-none divide-y divide-border p-0" {
+                            @for tool in &backend.tools {
+                                (render_detail_item(
+                                    &tool.original_name,
+                                    tool.definition.description.as_deref(),
+                                ))
                             }
                         }
                     }
                 }
-            }
-        }
 
-        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Resources" }
-            @if resources.is_empty() {
-                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" { "No resources exposed by this backend." }
-            } @else {
-                ul class="mt-4 space-y-3" {
-                    @for resource in resources {
-                        li class="rounded-md border border-slate-200 p-3 dark:border-slate-800" {
-                            p class="font-mono text-xs break-all text-slate-900 dark:text-slate-100" { (&resource.uri) }
-                            @if let Some(name) = &resource.name {
-                                p class="mt-1 text-sm text-slate-700 dark:text-slate-200" { (name) }
+                section class="card" {
+                    div class="card-h" {
+                        (icon("scroll-text"))
+                        h2 { "Prompts" }
+                        span class="pill" { (prompts.len()) }
+                    }
+                    @if prompts.is_empty() {
+                        p class="card-b muted" { "No prompts exposed by this backend." }
+                    } @else {
+                        ul class="m-0 list-none divide-y divide-border p-0" {
+                            @for prompt in prompts {
+                                (render_detail_item(&prompt.name, prompt.description.as_deref()))
                             }
-                            @if let Some(description) = &resource.description {
-                                p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (description) }
+                        }
+                    }
+                }
+
+                section class="card" {
+                    div class="card-h" {
+                        (icon("library"))
+                        h2 { "Resources" }
+                        span class="pill" { (resources.len()) }
+                    }
+                    @if resources.is_empty() {
+                        p class="card-b muted" { "No resources exposed by this backend." }
+                    } @else {
+                        ul class="m-0 list-none divide-y divide-border p-0" {
+                            @for resource in resources {
+                                li class="px-3.5 py-2.5" {
+                                    p class="mono break-all font-medium" { (&resource.uri) }
+                                    @if let Some(name) = &resource.name {
+                                        p { (name) }
+                                    }
+                                    @if let Some(description) = &resource.description {
+                                        p class="muted" { (description) }
+                                    }
+                                }
                             }
                         }
                     }
@@ -474,6 +435,7 @@ fn not_granted_reason(explanation: &Explanation) -> String {
 fn render_opt_out_form(backend: &str, tool: Option<&str>, hide: bool, label: &str) -> Markup {
     html! {
         form
+            class="m-0"
             hx-post="/ui/actions/tools/opt-out"
             hx-target="closest section"
             hx-swap="outerHTML"
@@ -483,10 +445,7 @@ fn render_opt_out_form(backend: &str, tool: Option<&str>, hide: bool, label: &st
                 input type="hidden" name="tool" value=(tool);
             }
             input type="hidden" name="hidden" value=(hide.to_string());
-            button
-                class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                type="submit"
-            {
+            button class="btn sm" type="submit" {
                 (label)
             }
         }
@@ -503,41 +462,39 @@ fn render_tool_row(
 
     html! {
         tr class="align-top" {
-            td class="px-4 py-3" {
-                code class="text-slate-900 dark:text-slate-100" { (tool.namespaced_name) }
+            td {
+                code class="mono" { (tool.namespaced_name) }
                 @if tool.definition.read_only_hint() {
-                    span class="ml-2 rounded-full bg-sky-100 px-2 py-0.5 text-xs font-semibold text-sky-800 dark:bg-sky-900/40 dark:text-sky-300" {
-                        "read-only"
-                    }
+                    span class="pill accent ml-2" { "read-only" }
                 }
             }
-            td class="px-4 py-3 text-slate-600 dark:text-slate-300" {
+            td class="muted whitespace-normal" {
                 @if let Some(description) = &tool.definition.description {
                     (description)
                 }
             }
-            td class="px-4 py-3" {
+            td {
                 @match &state {
                     ToolState::Mandatory => {
-                        span class="font-medium text-amber-700 dark:text-amber-400" { "mandatory" }
-                        p class="mt-1 text-xs text-slate-500 dark:text-slate-400" { "required by your admin" }
+                        span class="pill warn" { "mandatory" }
+                        p class="hint" { "required by your admin" }
                     }
                     ToolState::On => {
-                        span class="font-medium text-emerald-700 dark:text-emerald-400" { "on" }
+                        span class="pill ok" { "on" }
                     }
                     ToolState::Hidden { via_backend } => {
-                        span class="font-medium text-slate-500 dark:text-slate-400" { "hidden by you" }
+                        span class="pill" { "hidden by you" }
                         @if *via_backend {
-                            p class="mt-1 text-xs text-slate-500 dark:text-slate-400" { "with the whole backend" }
+                            p class="hint" { "with the whole backend" }
                         }
                     }
                     ToolState::NotGranted(reason) => {
-                        span class="font-medium text-red-700 dark:text-red-400" { "not granted" }
-                        p class="mt-1 text-xs text-slate-500 dark:text-slate-400" { (reason) }
+                        span class="pill err" { "not granted" }
+                        p class="hint whitespace-normal" { (reason) }
                     }
                 }
             }
-            td class="px-4 py-3" {
+            td {
                 @match &state {
                     ToolState::On => {
                         (render_opt_out_form(&tool.backend_name, Some(&tool.original_name), true, "Hide"))
@@ -567,11 +524,12 @@ pub(super) fn render_tool_backend_section(
     tools.sort_by(|a, b| a.namespaced_name.cmp(&b.namespaced_name));
 
     html! {
-        section class="mt-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            div class="flex flex-wrap items-center justify-between gap-3" {
-                h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" {
+        section class="card" {
+            div class="card-h" {
+                h2 {
                     code { (backend.name) }
                 }
+                span class="spacer" {}
                 @if granted {
                     (render_opt_out_form(
                         &backend.name,
@@ -582,26 +540,26 @@ pub(super) fn render_tool_backend_section(
                 }
             }
             @if !granted {
-                p class="mt-3 text-sm text-slate-500 dark:text-slate-400" {
+                p class="card-b muted" {
                     "No access \u{2014} ask an admin"
                 }
             } @else {
                 @if backend_hidden {
-                    p class="mt-3 text-sm text-slate-600 dark:text-slate-300" {
+                    p class="card-b muted" {
                         "You hid this backend. Its mandatory tools stay visible."
                     }
                 }
-                div class="mt-4 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800" {
-                    table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800" {
-                        thead class="bg-slate-50 dark:bg-slate-800/80" {
+                div class="tbl-wrap" {
+                    table class="tbl" {
+                        thead {
                             tr {
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Tool" }
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Description" }
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "State" }
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Actions" }
+                                th { "Tool" }
+                                th { "Description" }
+                                th { "State" }
+                                th { "Actions" }
                             }
                         }
-                        tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-900" {
+                        tbody {
                             @for tool in tools {
                                 (render_tool_row(tool, effective, opt_outs))
                             }
@@ -630,41 +588,41 @@ pub(super) fn render_my_tools_page(
     sections.sort_by(|a, b| a.name.cmp(&b.name));
 
     let content = html! {
-        section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            a
-                href="/ui"
-                class="inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
-            {
-                (PreEscaped("&larr;")) " Back to dashboard"
+        div class="flex flex-col gap-4" {
+            div class="page-head" {
+                p {
+                    "Hiding a tool or a backend only removes it from your own tool list. "
+                    "Tools your admin marked mandatory stay visible, even when you hide their backend."
+                }
+                span class="spacer" {}
+                a class="btn sm ghost" href="/ui" { (PreEscaped("&larr;")) " Back to dashboard" }
             }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "My tools"
-            }
-            p class="mt-2 text-sm text-slate-600 dark:text-slate-300" {
-                "Hiding a tool or a backend only removes it from your own tool list. "
-                "Tools your admin marked mandatory stay visible, even when you hide their backend."
-            }
-            h2 class="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100" { "Your groups" }
-            ul class="mt-2 space-y-1 text-sm" {
-                @let policy = state.policy.current();
-                @for group in groups {
-                    li {
-                        code class="text-slate-900 dark:text-slate-100" { (group) }
-                        @if group == AUTHENTICATED_GROUP {
-                            span class="ml-2 text-xs text-slate-500 dark:text-slate-400" { "built in" }
-                        }
-                        @if let Some(description) = policy.group_description(group) {
-                            span class="ml-2 text-slate-600 dark:text-slate-300" { (description) }
+            section class="card" {
+                div class="card-h" {
+                    (icon("users"))
+                    h2 { "Your groups" }
+                }
+                ul class="card-b m-0 flex list-none flex-col gap-1 p-0" {
+                    @let policy = state.policy.current();
+                    @for group in groups {
+                        li {
+                            code class="mono" { (group) }
+                            @if group == AUTHENTICATED_GROUP {
+                                span class="pill ml-2" { "built in" }
+                            }
+                            @if let Some(description) = policy.group_description(group) {
+                                span class="muted ml-2" { (description) }
+                            }
                         }
                     }
                 }
             }
-        }
-        @if sections.is_empty() {
-            p class="mt-6 text-sm text-slate-500 dark:text-slate-400" { "No tools are available yet." }
-        }
-        @for backend in sections {
-            (render_tool_backend_section(backend, effective, opt_outs))
+            @if sections.is_empty() {
+                p class="muted" { "No tools are available yet." }
+            }
+            @for backend in sections {
+                (render_tool_backend_section(backend, effective, opt_outs))
+            }
         }
     };
     render_shell(state, user, "My tools", Nav::MyTools, &content)
@@ -690,15 +648,9 @@ fn build_mcp_server_url(base_url: &str) -> String {
 /// Flash message fragment (HTMX swap target).
 pub(super) fn render_flash(flash: &FlashMessage) -> Markup {
     let classes = match flash.level {
-        FlashLevel::Success => {
-            "rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300"
-        }
-        FlashLevel::Error => {
-            "rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"
-        }
-        FlashLevel::Info => {
-            "rounded-md border border-slate-200 bg-slate-100 px-4 py-3 text-sm text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
-        }
+        FlashLevel::Success => "card card-b text-sm text-ok",
+        FlashLevel::Error => "card card-b text-sm text-err",
+        FlashLevel::Info => "card card-b text-sm text-text",
     };
 
     html! {
@@ -708,27 +660,75 @@ pub(super) fn render_flash(flash: &FlashMessage) -> Markup {
     }
 }
 
-/// Backend table panel (full and SSE-pushed updates).
+/// Backend health panel (full and SSE-pushed updates): the "Needs attention"
+/// list (only while a backend is not healthy) above the backend tiles.
 pub(super) fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
+    let attention: Vec<&BackendInfo> = status
+        .backends
+        .iter()
+        .filter(|backend| needs_attention(backend.state))
+        .collect();
+    let count_in = |tone: &str| {
+        status
+            .backends
+            .iter()
+            .filter(|backend| backend_state_tone(backend.state) == tone)
+            .count()
+    };
+    let (healthy, degraded, down) = (count_in("ok"), count_in("warn"), count_in("err"));
+
     html! {
-        section class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900" {
-            h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100" { "Backends" }
-            p class="mt-1 text-sm text-slate-600 dark:text-slate-300" { (status.backend_count) " active backend actors" }
-            @if status.backends.is_empty() {
-                p class="mt-4 text-sm text-slate-500 dark:text-slate-400" { "No backends currently connected." }
-            } @else {
-                div class="mt-4 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800" {
-                    table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800" {
-                        thead class="bg-slate-50 dark:bg-slate-800/80" {
-                            tr {
-                                th class="px-4 py-3 text-left font-medium text-orange-600 dark:text-orange-300" { "Name" }
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "State" }
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Tools" }
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Actions" }
-                                th class="px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300" { "Last Error" }
+        div class="flex flex-col gap-4" {
+            @if !attention.is_empty() {
+                section class="card" {
+                    div class="card-h" {
+                        span class="text-warn" { (icon("triangle-alert")) }
+                        h2 { "Needs attention" }
+                        span class="pill warn" { (attention.len()) }
+                    }
+                    div class="list" {
+                        @for backend in &attention {
+                            a
+                                class="row text-text"
+                                href=(format!("/ui/backends/{}", backend.name))
+                            {
+                                span class={"dot " (backend_state_tone(backend.state))} {}
+                                div class="row-main" {
+                                    span class="font-medium" { (backend.name) }
+                                    span class="row-sub" {
+                                        @if let Some(error) = &backend.last_error {
+                                            (backend_state_text(backend.state)) ": " (error)
+                                        } @else {
+                                            (backend_state_text(backend.state))
+                                        }
+                                    }
+                                }
                             }
                         }
-                        tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-900" {
+                    }
+                }
+            }
+            section class="card" {
+                div class="card-h" {
+                    (icon("server"))
+                    h2 { "Backends" }
+                    @if healthy > 0 {
+                        span class="pill ok" { (healthy) " healthy" }
+                    }
+                    @if degraded > 0 {
+                        span class="pill warn" { (degraded) " degraded" }
+                    }
+                    @if down > 0 {
+                        span class="pill err" { (down) " down" }
+                    }
+                    span class="spacer" {}
+                    span class="muted" { (status.backend_count) " active backend actors" }
+                }
+                div class="card-b" {
+                    @if status.backends.is_empty() {
+                        p class="muted" { "No backends currently connected." }
+                    } @else {
+                        div class="tiles" {
                             @for backend in &status.backends {
                                 (render_backend_row(backend))
                             }
@@ -740,59 +740,57 @@ pub(super) fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
     }
 }
 
-/// A single backend row within the panel.
+/// A single backend tile within the panel.
 pub(super) fn render_backend_row(backend: &BackendInfo) -> Markup {
     let state_text = backend_state_text(backend.state);
-    let state_class = backend_state_class(backend.state);
+    let tone = backend_state_tone(backend.state);
 
     html! {
-        tr class="align-top" {
-            td class="px-4 py-3" {
+        div class="tile" {
+            div class="tile-h" {
+                span class={"dot " (tone)} {}
                 a
                     href=(format!("/ui/backends/{}", backend.name))
-                    class="font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 hover:decoration-orange-500 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100 dark:hover:decoration-orange-400"
+                    class="mono min-w-0 truncate font-medium"
                 {
-                    code { (backend.name) }
+                    (backend.name)
                 }
+                span class="spacer" {}
+                span class={"pill " (tone)} { (state_text) }
             }
-            td class="px-4 py-3" { span class=(state_class) { (state_text) } }
-            td class="px-4 py-3 text-slate-700 dark:text-slate-200" { (backend.tool_count) }
-            td class="px-4 py-3" {
-                div class="flex flex-wrap gap-2" {
+            div class="tile-meta" {
+                span { (backend.tool_count) " tools" }
+            }
+            @if let Some(error) = &backend.last_error {
+                code class="mono break-all text-err" { (error) }
+            }
+            div class="flex flex-wrap gap-2" {
+                button
+                    class="btn sm"
+                    hx-post=(format!("/ui/actions/backends/{}/reconnect", backend.name))
+                    hx-target="#flash"
+                    hx-swap="innerHTML"
+                {
+                    "Reconnect"
+                }
+                @if backend.state == BackendState::Disconnected {
                     button
-                        class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        hx-post=(format!("/ui/actions/backends/{}/reconnect", backend.name))
+                        class="btn sm"
+                        hx-post=(format!("/ui/actions/backends/{}/enable", backend.name))
                         hx-target="#flash"
                         hx-swap="innerHTML"
                     {
-                        "Reconnect"
+                        "Enable"
                     }
-                    @if backend.state == BackendState::Disconnected {
-                        button
-                            class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                            hx-post=(format!("/ui/actions/backends/{}/enable", backend.name))
-                            hx-target="#flash"
-                            hx-swap="innerHTML"
-                        {
-                            "Enable"
-                        }
-                    } @else {
-                        button
-                            class="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                            hx-post=(format!("/ui/actions/backends/{}/disable", backend.name))
-                            hx-target="#flash"
-                            hx-swap="innerHTML"
-                        {
-                            "Disable"
-                        }
-                    }
-                }
-            }
-            td class="px-4 py-3" {
-                @if let Some(error) = &backend.last_error {
-                    code class="text-xs text-red-700 dark:text-red-400" { (error) }
                 } @else {
-                    (PreEscaped("&mdash;"))
+                    button
+                        class="btn sm"
+                        hx-post=(format!("/ui/actions/backends/{}/disable", backend.name))
+                        hx-target="#flash"
+                        hx-swap="innerHTML"
+                    {
+                        "Disable"
+                    }
                 }
             }
         }
@@ -811,15 +809,17 @@ fn backend_state_text(state: BackendState) -> &'static str {
     }
 }
 
-fn backend_state_class(state: BackendState) -> &'static str {
+/// The `dot`/`pill` modifier of a state: `ok`, `warn`, `err`, or none (idle).
+fn backend_state_tone(state: BackendState) -> &'static str {
     match state {
-        BackendState::Connected => "text-emerald-700 dark:text-emerald-400",
-        BackendState::Idle => "text-slate-600 dark:text-slate-400",
-        BackendState::Connecting | BackendState::Reconnecting => {
-            "text-amber-700 dark:text-amber-400"
-        }
-        BackendState::Failed | BackendState::CircuitOpen | BackendState::Disconnected => {
-            "text-red-700 dark:text-red-400"
-        }
+        BackendState::Connected => "ok",
+        BackendState::Idle => "",
+        BackendState::Connecting | BackendState::Reconnecting => "warn",
+        BackendState::Failed | BackendState::CircuitOpen | BackendState::Disconnected => "err",
     }
+}
+
+/// Backends in any state but connected or idle are listed under "Needs attention".
+fn needs_attention(state: BackendState) -> bool {
+    !matches!(state, BackendState::Connected | BackendState::Idle)
 }

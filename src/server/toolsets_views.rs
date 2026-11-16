@@ -5,18 +5,24 @@
 //! fragment every action answers with (`hx-target` the section's id,
 //! `hx-swap="outerHTML"`).
 
-use maud::{Markup, PreEscaped, html};
+use maud::{Markup, html};
 
 use super::AppState;
-use super::admin_views::{
-    BACK_LINK, BUTTON, BUTTON_DANGER, CARD, FAINT, FORM_ROW, HEADING, INPUT, LABEL, MUTED,
-    render_flash_area, render_layout,
-};
+use super::admin_views::{render_flash_area, render_layout};
 use super::shell::Nav;
 use crate::store::{SessionUser, Toolset};
 
 const SECTION: &str = "#my-toolsets";
-const CHECKBOX: &str = "flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200";
+const CARD: &str = "card";
+const CHECKBOX: &str = "flex items-center gap-2 text-sm";
+const CODE: &str = "font-mono";
+const FAINT: &str = "text-muted";
+const MUTED: &str = "text-sm text-muted";
+const FORM_ROW: &str = "mt-4 flex flex-wrap items-end gap-3";
+const LABEL: &str = "field";
+const INPUT: &str = "input";
+const BUTTON: &str = "btn primary";
+const BUTTON_DANGER: &str = "btn danger sm";
 
 /// Backend names to offer: the ones the user is granted, plus any the toolset already
 /// lists (so that they can be unticked)
@@ -101,9 +107,9 @@ fn summary(toolset: &Toolset) -> String {
 fn render_toolset(toolset: &Toolset, granted: &[String]) -> Markup {
     let base = format!("/ui/actions/toolsets/{}", toolset.id);
     html! {
-        div class="mt-6 border-t border-slate-200 pt-4 dark:border-slate-800" {
+        div class="mt-6 border-t border-border pt-4" {
             div class="flex flex-wrap items-center gap-3" {
-                h3 class="text-base font-semibold text-slate-900 dark:text-slate-100" {
+                h3 class="text-base font-semibold" {
                     (toolset.name)
                 }
                 span class=(FAINT) { (summary(toolset)) }
@@ -131,28 +137,32 @@ fn render_toolset(toolset: &Toolset, granted: &[String]) -> Markup {
 pub(super) fn render_toolsets_section(toolsets: &[Toolset], backends: &[String]) -> Markup {
     html! {
         section id="my-toolsets" class=(CARD) {
-            h2 class=(HEADING) { "Toolsets" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "A toolset is a named set of tool globs and backends. It only narrows what you may "
-                "use. Pin a token to one on the "
-                a href="/ui/tokens" class="underline" { "tokens page" }
-                ": the token then follows later edits of the toolset at once. "
-                "Tool globs match the namespaced tool name, like prom_query*. "
-                "A toolset also limits "
-                code class="text-slate-900 dark:text-slate-100" { "/mcp/toolset/<name>" }
-                " when you call it with your own token."
+            div class="card-h" {
+                h2 { "Toolsets" }
             }
-            @if toolsets.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No toolsets yet." }
-            }
-            @for toolset in toolsets {
-                (render_toolset(toolset, backends))
-            }
-            div class="mt-6 border-t border-slate-200 pt-4 dark:border-slate-800" {
-                h3 class="text-base font-semibold text-slate-900 dark:text-slate-100" { "New toolset" }
-                form class=(FORM_ROW) hx-post="/ui/actions/toolsets" hx-target=(SECTION) hx-swap="outerHTML" {
-                    (render_fields(None, backends))
-                    button class=(BUTTON) type="submit" { "Create toolset" }
+            div class="card-b" {
+                p class=(format!("mt-1 {MUTED}")) {
+                    "A toolset is a named set of tool globs and backends. It only narrows what you may "
+                    "use. Pin a token to one on the "
+                    a href="/ui/tokens" class="text-accent hover:underline" { "tokens page" }
+                    ": the token then follows later edits of the toolset at once. "
+                    "Tool globs match the namespaced tool name, like prom_query*. "
+                    "A toolset also limits "
+                    code class=(CODE) { "/mcp/toolset/<name>" }
+                    " when you call it with your own token."
+                }
+                @if toolsets.is_empty() {
+                    p class=(format!("mt-4 text-sm {FAINT}")) { "No toolsets yet." }
+                }
+                @for toolset in toolsets {
+                    (render_toolset(toolset, backends))
+                }
+                div class="mt-6 border-t border-border pt-4" {
+                    h3 class="text-base font-semibold" { "New toolset" }
+                    form class=(FORM_ROW) hx-post="/ui/actions/toolsets" hx-target=(SECTION) hx-swap="outerHTML" {
+                        (render_fields(None, backends))
+                        button class=(BUTTON) type="submit" { "Create toolset" }
+                    }
                 }
             }
         }
@@ -167,12 +177,6 @@ pub(super) fn render_toolsets_page(
     backends: &[String],
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Toolsets"
-            }
-        }
         (render_flash_area(false))
         (render_toolsets_section(toolsets, backends))
     };

@@ -11,16 +11,26 @@ use chrono::{DateTime, Utc};
 use maud::{Markup, PreEscaped, html};
 
 use super::AppState;
-use super::admin_views::{
-    BACK_LINK, BUTTON, BUTTON_DANGER, BUTTON_SMALL, CARD, CODE, FAINT, FORM_ROW, HEADING, INPUT,
-    LABEL, MUTED, TABLE, TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
-};
+use super::admin_views::{render_flash_area, render_layout};
 use super::shell::Nav;
 use crate::rbac::{TokenState, lifetime_days};
 use crate::store::{
     ApiToken, DEFAULT_TOKEN_LIFETIME, IssuedToken, JwtBinding, MAX_SERVICE_TOKEN_LIFETIME,
     MAX_USER_TOKEN_LIFETIME, PAT_PREFIX, ServiceAccount, SessionUser, Toolset,
 };
+
+const CARD: &str = "card";
+const MUTED: &str = "text-sm text-muted";
+const FAINT: &str = "text-muted";
+const CODE: &str = "font-mono";
+const FORM_ROW: &str = "mt-4 flex flex-wrap items-end gap-3";
+const LABEL: &str = "field";
+const INPUT: &str = "input";
+const BUTTON: &str = "btn primary";
+const BUTTON_SMALL: &str = "btn sm";
+const BUTTON_DANGER: &str = "btn danger sm";
+const TABLE_WRAP: &str = "tbl-wrap";
+const TABLE: &str = "tbl";
 
 /// A service account with its tokens and the `IdP` subjects bound to it
 pub(super) struct AccountRow {
@@ -53,20 +63,20 @@ fn when(at: DateTime<Utc>) -> String {
 fn render_issued(issued: &Issued<'_>) -> Markup {
     html! {
         div
-            class="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 p-4 dark:border-emerald-800 dark:bg-emerald-950/40"
+            class="mt-4 rounded-lg border border-border bg-surface-2 p-4"
             role="status"
         {
-            p class="text-sm font-semibold text-emerald-900 dark:text-emerald-200" {
+            p class="text-sm font-semibold" {
                 "Token " code { (issued.issued.token.name) } " created"
                 @if let Some(account) = issued.account {
                     " for " code { (account) }
                 }
             }
-            p class="mt-1 text-sm text-emerald-900 dark:text-emerald-200" {
+            p class="mt-1 text-sm text-muted" {
                 "Copy it now: it will not be shown again."
             }
             code
-                class="mt-2 block select-all break-all rounded-md bg-white px-3 py-2 font-mono text-sm text-slate-900 dark:bg-slate-900 dark:text-slate-100"
+                class="code mt-2 block select-all whitespace-normal break-all"
             {
                 (issued.issued.plaintext)
             }
@@ -76,15 +86,9 @@ fn render_issued(issued: &Issued<'_>) -> Markup {
 
 fn state_badge(state: TokenState) -> Markup {
     let classes = match state {
-        TokenState::Active => {
-            "rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
-        }
-        TokenState::Expired => {
-            "rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
-        }
-        TokenState::Revoked => {
-            "rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300"
-        }
+        TokenState::Active => "pill ok",
+        TokenState::Expired => "pill warn",
+        TokenState::Revoked => "pill",
     };
     html! {
         span class=(classes) { (state.as_str()) }
@@ -131,38 +135,38 @@ fn render_token_table(
         } @else {
             div class=(TABLE_WRAP) {
                 table class=(TABLE) {
-                    thead class=(THEAD) {
+                    thead {
                         tr {
-                            th class=(TH) { "Name" }
-                            th class=(TH) { "Token" }
-                            th class=(TH) { "Scope" }
-                            th class=(TH) { "Created" }
-                            th class=(TH) { "Expires" }
-                            th class=(TH) { "Last used" }
-                            th class=(TH) { "State" }
-                            th class=(TH) { "Actions" }
+                            th { "Name" }
+                            th { "Token" }
+                            th { "Scope" }
+                            th { "Created" }
+                            th { "Expires" }
+                            th { "Last used" }
+                            th { "State" }
+                            th { "Actions" }
                         }
                     }
-                    tbody class=(TBODY) {
+                    tbody {
                         @for token in tokens {
                             @let state = TokenState::of(token);
                             tr {
-                                td class=(TD) { (token.name) }
-                                td class=(TD) {
+                                td { (token.name) }
+                                td {
                                     code class=(CODE) { (PAT_PREFIX) (token.public_id) "_" (PreEscaped("&hellip;")) }
                                 }
-                                td class=(TD) { (scope_cell(token)) }
-                                td class=(TD) { (when(token.created_at)) }
-                                td class=(TD) { (when(token.expires_at)) }
-                                td class=(TD) {
+                                td { (scope_cell(token)) }
+                                td { (when(token.created_at)) }
+                                td { (when(token.expires_at)) }
+                                td {
                                     @if let Some(at) = token.last_used_at {
                                         (when(at))
                                     } @else {
                                         span class=(FAINT) { "never" }
                                     }
                                 }
-                                td class=(TD) { (state_badge(state)) }
-                                td class=(TD) {
+                                td { (state_badge(state)) }
+                                td {
                                     @if state == TokenState::Active {
                                         button
                                             class=(BUTTON_DANGER)
@@ -257,28 +261,32 @@ pub(super) fn render_tokens_section(
 ) -> Markup {
     html! {
         section id="my-tokens" class=(CARD) {
-            h2 class=(HEADING) { "Personal access tokens" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "A token lets a client such as an agent call /mcp as you, with "
-                "Authorization: Bearer. It can only use what you may use, narrowed by its scope, "
-                "and your hidden tools stay hidden. Tokens last "
-                (lifetime_days(DEFAULT_TOKEN_LIFETIME)) " days unless you choose otherwise, at most "
-                (lifetime_days(MAX_USER_TOKEN_LIFETIME)) ". They stop working when you have not "
-                "logged in to the dashboard for 90 days."
+            div class="card-h" {
+                h2 { "Personal access tokens" }
             }
-            @if let Some(issued) = issued {
-                (render_issued(&Issued { account: None, issued }))
+            div class="card-b" {
+                p class=(format!("mt-1 {MUTED}")) {
+                    "A token lets a client such as an agent call /mcp as you, with "
+                    "Authorization: Bearer. It can only use what you may use, narrowed by its scope, "
+                    "and your hidden tools stay hidden. Tokens last "
+                    (lifetime_days(DEFAULT_TOKEN_LIFETIME)) " days unless you choose otherwise, at most "
+                    (lifetime_days(MAX_USER_TOKEN_LIFETIME)) ". They stop working when you have not "
+                    "logged in to the dashboard for 90 days."
+                }
+                @if let Some(issued) = issued {
+                    (render_issued(&Issued { account: None, issued }))
+                }
+                (render_token_table(tokens, "#my-tokens", |token| {
+                    format!("/ui/actions/tokens/{}/revoke", token.id)
+                }))
+                (render_token_form(
+                    "/ui/actions/tokens",
+                    "#my-tokens",
+                    lifetime_days(MAX_USER_TOKEN_LIFETIME),
+                    backends,
+                    toolsets,
+                ))
             }
-            (render_token_table(tokens, "#my-tokens", |token| {
-                format!("/ui/actions/tokens/{}/revoke", token.id)
-            }))
-            (render_token_form(
-                "/ui/actions/tokens",
-                "#my-tokens",
-                lifetime_days(MAX_USER_TOKEN_LIFETIME),
-                backends,
-                toolsets,
-            ))
         }
     }
 }
@@ -292,12 +300,6 @@ pub(super) fn render_tokens_page(
     toolsets: &[Toolset],
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Tokens"
-            }
-        }
         (render_flash_area(false))
         (render_tokens_section(tokens, backends, toolsets, None))
     };
@@ -307,11 +309,11 @@ pub(super) fn render_tokens_page(
 fn account_state_badge(account: &ServiceAccount) -> Markup {
     html! {
         @if account.disabled {
-            span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
+            span class="pill warn" {
                 "disabled"
             }
         } @else {
-            span class="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300" {
+            span class="pill ok" {
                 "enabled"
             }
         }
@@ -324,7 +326,7 @@ fn account_state_badge(account: &ServiceAccount) -> Markup {
 fn render_jwt_bindings(bindings: &[JwtBinding], issuers: &[String], base: &str) -> Markup {
     html! {
         @if !bindings.is_empty() || !issuers.is_empty() {
-            h4 class="mt-4 text-sm font-semibold text-slate-900 dark:text-slate-100" {
+            h4 class="mt-4 text-sm font-semibold" {
                 "JWT bindings"
             }
             p class=(format!("mt-1 {MUTED}")) {
@@ -335,21 +337,21 @@ fn render_jwt_bindings(bindings: &[JwtBinding], issuers: &[String], base: &str) 
             } @else {
                 div class=(TABLE_WRAP) {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "Issuer" }
-                                th class=(TH) { "Subject" }
-                                th class=(TH) { "Created" }
-                                th class=(TH) { "Actions" }
+                                th { "Issuer" }
+                                th { "Subject" }
+                                th { "Created" }
+                                th { "Actions" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for binding in bindings {
                                 tr {
-                                    td class=(TD) { (binding.issuer) }
-                                    td class=(TD) { code class=(CODE) { (binding.subject) } }
-                                    td class=(TD) { (when(binding.created_at)) }
-                                    td class=(TD) {
+                                    td { (binding.issuer) }
+                                    td { code class=(CODE) { (binding.subject) } }
+                                    td { (when(binding.created_at)) }
+                                    td {
                                         button
                                             class=(BUTTON_DANGER)
                                             type="button"
@@ -399,9 +401,9 @@ fn render_account(row: &AccountRow, backends: &[String], issuers: &[String]) -> 
     let base = format!("/ui/actions/admin/service-accounts/{}", account.id);
 
     html! {
-        div class="mt-6 border-t border-slate-200 pt-4 dark:border-slate-800" {
+        div class="mt-6 border-t border-border pt-4" {
             div class="flex flex-wrap items-center gap-3" {
-                h3 class="text-base font-semibold text-slate-900 dark:text-slate-100" {
+                h3 class="text-base font-semibold" {
                     (account.name)
                 }
                 (account_state_badge(account))
@@ -456,37 +458,41 @@ pub(super) fn render_service_accounts_section(
 ) -> Markup {
     html! {
         section id="service-accounts" class=(CARD) {
-            h2 class=(HEADING) { "Service accounts" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "A service account is a principal for an agent or a script. Add it to groups on a "
-                "group's page to give it tools; its tokens last "
-                (lifetime_days(DEFAULT_TOKEN_LIFETIME)) " days unless you choose otherwise, at most "
-                (lifetime_days(MAX_SERVICE_TOKEN_LIFETIME)) ". Disabling an account stops all its tokens."
+            div class="card-h" {
+                h2 { "Service accounts" }
             }
-            @if let Some(issued) = issued {
-                (render_issued(issued))
-            }
-            @if overview.accounts.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No service accounts yet." }
-            }
-            @for row in &overview.accounts {
-                (render_account(row, &overview.backends, &overview.issuers))
-            }
-            form
-                class=(FORM_ROW)
-                hx-post="/ui/actions/admin/service-accounts"
-                hx-target="#service-accounts"
-                hx-swap="outerHTML"
-            {
-                label class=(LABEL) {
-                    "Name"
-                    input class=(INPUT) type="text" name="name" placeholder="ci-agent" required;
+            div class="card-b" {
+                p class=(format!("mt-1 {MUTED}")) {
+                    "A service account is a principal for an agent or a script. Add it to groups on a "
+                    "group's page to give it tools; its tokens last "
+                    (lifetime_days(DEFAULT_TOKEN_LIFETIME)) " days unless you choose otherwise, at most "
+                    (lifetime_days(MAX_SERVICE_TOKEN_LIFETIME)) ". Disabling an account stops all its tokens."
                 }
-                label class=(LABEL) {
-                    "Description"
-                    input class=(INPUT) type="text" name="description";
+                @if let Some(issued) = issued {
+                    (render_issued(issued))
                 }
-                button class=(BUTTON) type="submit" { "Create service account" }
+                @if overview.accounts.is_empty() {
+                    p class=(format!("mt-4 text-sm {FAINT}")) { "No service accounts yet." }
+                }
+                @for row in &overview.accounts {
+                    (render_account(row, &overview.backends, &overview.issuers))
+                }
+                form
+                    class=(FORM_ROW)
+                    hx-post="/ui/actions/admin/service-accounts"
+                    hx-target="#service-accounts"
+                    hx-swap="outerHTML"
+                {
+                    label class=(LABEL) {
+                        "Name"
+                        input class=(INPUT) type="text" name="name" placeholder="ci-agent" required;
+                    }
+                    label class=(LABEL) {
+                        "Description"
+                        input class=(INPUT) type="text" name="description";
+                    }
+                    button class=(BUTTON) type="submit" { "Create service account" }
+                }
             }
         }
     }
@@ -499,12 +505,6 @@ pub(super) fn render_service_accounts_page(
     overview: &ServiceAccountsOverview,
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Service accounts"
-            }
-        }
         (render_flash_area(false))
         (render_service_accounts_section(overview, None))
     };

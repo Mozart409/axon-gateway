@@ -8,15 +8,18 @@
 //! `hx-swap="outerHTML"`). A header value or a credential value is never
 //! rendered: the lists show header names and whether a credential is set, and
 //! the forms that take values start empty.
+//!
+//! The add and create forms sit in a slide-over drawer built on the native
+//! Popover API (see `config_views`). The constraint attributes on the inputs
+//! mirror the rules `personal_api` and `personal` enforce; the server still
+//! validates every field.
 
 use chrono::{DateTime, Utc};
-use maud::{Markup, PreEscaped, html};
+use maud::{Markup, html};
 
 use super::AppState;
-use super::admin_views::{
-    BACK_LINK, BUTTON, BUTTON_DANGER, BUTTON_SMALL, CARD, CODE, FAINT, FORM_ROW, HEADING, INPUT,
-    LABEL, MUTED, TABLE, TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
-};
+use super::admin_views::{render_flash_area, render_layout};
+use super::config_views::{drawer_foot, drawer_head, drawer_trigger};
 use super::personal_api::{CatalogView, PersonalSaved};
 use super::shell::Nav;
 use crate::config::CredentialField;
@@ -32,12 +35,26 @@ const HEADER_ROWS: usize = 4;
 /// Empty credential field rows on the catalog create form
 const FIELD_ROWS: usize = 3;
 
-const FORM_COL: &str = "mt-4 flex flex-col items-start gap-3";
-const SUBHEADING: &str = "text-base font-semibold text-slate-900 dark:text-slate-100";
-const DIVIDER: &str = "mt-6 border-t border-slate-200 pt-4 dark:border-slate-800";
-const BADGE_OK: &str = "rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300";
-const BADGE_WARN: &str = "rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
-const BADGE_OFF: &str = "rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300";
+/// `MAX_URL_CHARS` of `personal_api`
+const URL_MAX: &str = "2048";
+/// `MAX_HEADER_VALUE_CHARS` of `personal_api`
+const HEADER_VALUE_MAX: &str = "4096";
+/// `MAX_CLIENT_ID_CHARS` of `personal_api`
+const CLIENT_ID_MAX: &str = "512";
+/// `MAX_CLIENT_SECRET_CHARS` of `personal_api`
+const CLIENT_SECRET_MAX: &str = "4096";
+/// `check_prefix` of `personal`: `[a-z][a-z0-9-]{1,30}`
+const PREFIX_PATTERN: &str = r"[a-z][a-z0-9\-]{1,30}";
+/// `clean_url` of `personal_api`: an `http` or `https` URL
+const URL_PATTERN: &str = "https?://.+";
+const PREFIX_ERROR: &str =
+    "2 to 31 characters: a lowercase letter, then lowercase letters, digits or dashes.";
+const URL_ERROR: &str = "Enter a full http or https URL.";
+
+/// A row of two inputs: a header name and its value
+const HEADER_ROW: &str = "grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-2";
+/// A row of the four inputs of a credential field
+const FIELD_ROW: &str = "grid grid-cols-2 gap-2";
 
 fn when(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%d %H:%M UTC").to_string()
@@ -58,11 +75,46 @@ fn owner_label(backend: &AdminPersonalBackend) -> &str {
 fn enabled_badge(enabled: bool) -> Markup {
     html! {
         @if enabled {
-            span class=(BADGE_OK) { "enabled" }
+            span class="pill ok" { "enabled" }
         } @else {
-            span class=(BADGE_OFF) { "disabled" }
+            span class="pill" { "disabled" }
         }
     }
+}
+
+/// A labelled field: the input, an optional hint and the error the browser's
+/// constraint check shows
+fn field(label: &str, id: &str, input: &Markup, hint: Option<&str>, error: Option<&str>) -> Markup {
+    html! {
+        div class="field" {
+            label for=(id) { (label) }
+            (input)
+            @if let Some(hint) = hint {
+                p class="hint" { (hint) }
+            }
+            @if let Some(error) = error {
+                p class="field-error" { (error) }
+            }
+        }
+    }
+}
+
+/// The URL input of a personal server or catalog entry
+fn url_field(id: &str, value: &str, placeholder: &str) -> Markup {
+    let input = html! {
+        input
+            class="input mono"
+            id=(id)
+            type="url"
+            name="url"
+            value=(value)
+            placeholder=[(!placeholder.is_empty()).then_some(placeholder)]
+            maxlength=(URL_MAX)
+            pattern=(URL_PATTERN)
+            autocomplete="off"
+            required;
+    };
+    field("URL", id, &input, None, Some(URL_ERROR))
 }
 
 /// How the last connection went: an error when the newest outcome is one,
@@ -74,18 +126,18 @@ fn status_cell(
 ) -> Markup {
     html! {
         @if let Some(failed_at) = last_error_at.filter(|failed| last_ok_at.is_none_or(|ok| failed >= &ok)) {
-            span class=(BADGE_WARN) { "error" }
+            span class="pill warn" { "error" }
             " "
-            span class=(FAINT) { (when(failed_at)) }
+            span class="muted" { (when(failed_at)) }
             @if let Some(message) = last_error {
-                div class=(format!("mt-1 break-words {MUTED}")) { (message) }
+                div class="muted mt-1 break-words" { (message) }
             }
         } @else if let Some(ok_at) = last_ok_at {
-            span class=(BADGE_OK) { "ok" }
+            span class="pill ok" { "ok" }
             " "
-            span class=(FAINT) { (when(ok_at)) }
+            span class="muted" { (when(ok_at)) }
         } @else {
-            span class=(FAINT) { "not tested" }
+            span class="muted" { "not tested" }
         }
     }
 }
@@ -95,7 +147,7 @@ fn enabled_toggle(path: &str, target: &str, enabled: bool) -> Markup {
     html! {
         form hx-post=(path) hx-target=(target) hx-swap="outerHTML" {
             input type="hidden" name="enabled" value=(if enabled { "false" } else { "true" });
-            button class=(BUTTON_SMALL) type="submit" {
+            button class="btn sm" type="submit" {
                 @if enabled {
                     "Disable"
                 } @else {
@@ -111,18 +163,21 @@ fn header_rows() -> Markup {
     html! {
         div class="flex flex-col gap-2" {
             @for _ in 0..HEADER_ROWS {
-                div class="flex flex-wrap gap-2" {
+                div class=(HEADER_ROW) {
                     input
-                        class=(format!("{INPUT} w-48"))
+                        class="input mono"
                         type="text"
                         name="header_name"
                         placeholder="Authorization"
+                        aria-label="Header name"
                         autocomplete="off";
                     input
-                        class=(format!("{INPUT} w-72"))
+                        class="input"
                         type="password"
                         name="header_value"
                         placeholder="value"
+                        maxlength=(HEADER_VALUE_MAX)
+                        aria-label="Header value"
                         autocomplete="new-password";
                 }
             }
@@ -132,26 +187,17 @@ fn header_rows() -> Markup {
 
 /// The result of saving a server, shown once in the response of the action
 fn render_saved(saved: &PersonalSaved) -> Markup {
-    let (classes, text) = match &saved.test {
-        Some(Ok(tools)) => (
-            "border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200",
-            format!("Connection test: {tools} tools."),
-        ),
-        Some(Err(error)) => (
-            "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200",
-            format!("Connection test failed: {error}"),
-        ),
-        None => (
-            "border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200",
-            String::from("Not tested."),
-        ),
+    let (tone, text) = match &saved.test {
+        Some(Ok(tools)) => ("ok", format!("Connection test: {tools} tools.")),
+        Some(Err(error)) => ("warn", format!("Connection test failed: {error}")),
+        None => ("ok", String::from("Not tested.")),
     };
     html! {
-        div class=(format!("mt-4 rounded-lg border p-4 text-sm {classes}")) role="status" {
-            p class="font-semibold" {
-                "Saved " code { (saved.backend.prefix) }
+        div class="card-f flex-wrap" role="status" {
+            span class=(format!("pill {tone}")) {
+                "Saved " span class="mono" { (saved.backend.prefix) }
             }
-            p class="mt-1 break-words" { (text) }
+            span class="muted min-w-0 break-words" { (text) }
         }
     }
 }
@@ -161,25 +207,25 @@ fn render_backend_row(backend: &PersonalBackend) -> Markup {
     let base = format!("/ui/actions/me/backends/{}", backend.prefix);
     html! {
         tr {
-            td class=(TD) { code class=(CODE) { (backend.prefix) } }
-            td class=(TD) { span class="break-all" { (backend.url) } }
-            td class=(TD) {
+            td { span class="mono" { (backend.prefix) } }
+            td class="wrap break-all" { (backend.url) }
+            td class="wrap" {
                 @if backend.header_names.is_empty() {
-                    span class=(FAINT) { "none" }
+                    span class="muted" { "none" }
                 }
                 @for name in &backend.header_names {
-                    div { code class=(CODE) { (name) } }
+                    div { span class="mono" { (name) } }
                 }
             }
-            td class=(TD) { (enabled_badge(backend.enabled)) }
-            td class=(TD) {
+            td { (enabled_badge(backend.enabled)) }
+            td class="wrap" {
                 (status_cell(backend.last_ok_at, backend.last_error_at, backend.last_error.as_deref()))
             }
-            td class=(TD) {
+            td class="wrap" {
                 div class="flex flex-wrap items-start gap-2" {
                     (enabled_toggle(&format!("{base}/enabled"), BACKENDS, backend.enabled))
                     button
-                        class=(BUTTON_DANGER)
+                        class="btn sm danger"
                         type="button"
                         hx-post=(format!("{base}/delete"))
                         hx-target=(BACKENDS)
@@ -190,28 +236,61 @@ fn render_backend_row(backend: &PersonalBackend) -> Markup {
                     }
                 }
                 details class="mt-2" {
-                    summary class="cursor-pointer text-xs text-slate-600 dark:text-slate-300" { "Edit" }
-                    form class=(FORM_COL) hx-post=(format!("{base}/update")) hx-target=(BACKENDS) hx-swap="outerHTML" {
-                        label class=(LABEL) {
-                            "URL"
-                            input
-                                class=(format!("{INPUT} w-72"))
-                                type="url"
-                                name="url"
-                                value=(backend.url)
-                                required;
+                    summary class="muted cursor-pointer" { "Edit" }
+                    div class="mt-2 flex w-80 max-w-full flex-col gap-3" {
+                        form class="flex flex-col gap-2" hx-post=(format!("{base}/update")) hx-target=(BACKENDS) hx-swap="outerHTML" {
+                            (url_field(&format!("url-{}", backend.prefix), &backend.url, ""))
+                            div { button class="btn sm" type="submit" { "Save URL" } }
                         }
-                        button class=(BUTTON_SMALL) type="submit" { "Save URL" }
-                    }
-                    form class=(FORM_COL) hx-post=(format!("{base}/headers")) hx-target=(BACKENDS) hx-swap="outerHTML" {
-                        p class=(MUTED) {
-                            "Saving replaces all headers of this server: enter every header it needs, "
-                            "not only the ones that change. Saving no header removes them all."
+                        form class="flex flex-col gap-2" hx-post=(format!("{base}/headers")) hx-target=(BACKENDS) hx-swap="outerHTML" {
+                            p class="hint" {
+                                "Saving replaces all headers of this server: enter every header it needs, "
+                                "not only the ones that change. Saving no header removes them all."
+                            }
+                            (header_rows())
+                            div { button class="btn sm" type="submit" { "Replace headers" } }
                         }
-                        (header_rows())
-                        button class=(BUTTON_SMALL) type="submit" { "Replace headers" }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The add form of the user's servers, in a drawer
+fn render_add_server() -> Markup {
+    let prefix = html! {
+        input
+            class="input mono"
+            id="add-server-prefix"
+            type="text"
+            name="prefix"
+            maxlength="31"
+            pattern=(PREFIX_PATTERN)
+            placeholder="work"
+            autocomplete="off"
+            required;
+    };
+    html! {
+        div id="add-server" popover class="drawer" aria-labelledby="add-server-title" {
+            (drawer_head("add-server", "Add a server"))
+            form
+                class="drawer-form"
+                hx-post="/ui/actions/me/backends"
+                hx-target=(BACKENDS)
+                hx-swap="outerHTML"
+            {
+                div class="drawer-b" {
+                    p class="hint" {
+                        "The server is tested when you add it and is kept whatever the test finds."
+                    }
+                    (field("Prefix", "add-server-prefix", &prefix, None, Some(PREFIX_ERROR)))
+                    (url_field("add-server-url", "", "https://mcp.example.com/mcp"))
+                    div class="section-t" { "Headers" }
+                    p class="hint" { "Headers sent with every request, such as Authorization (optional):" }
+                    (header_rows())
+                }
+                (drawer_foot("add-server", "Add server"))
             }
         }
     }
@@ -224,39 +303,46 @@ pub(super) fn render_backends_section(
     saved: Option<&PersonalSaved>,
 ) -> Markup {
     html! {
-        section id="my-backends" class=(CARD) {
-            h2 class=(HEADING) { "My MCP servers" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "Add your own MCP server and its tools show up in your session, next to the shared ones. "
-                "A tool of a server with the prefix "
-                code class=(CODE) { "work" }
-                " is named "
-                code class=(CODE) { "<prefix>_<tool>" }
-                ", here "
-                code class=(CODE) { "work_search" }
-                " for the tool "
-                code class=(CODE) { "search" }
-                ". Header values are stored encrypted and are never shown again."
+        section id="my-backends" class="card" {
+            div class="card-h" {
+                h2 { "My MCP servers" }
+                span class="muted" { (backends.len()) }
+                span class="spacer" {}
+                (drawer_trigger("add-server", "Add a server"))
+            }
+            div class="card-b" {
+                p class="muted" {
+                    "Add your own MCP server and its tools show up in your session, next to the shared ones. "
+                    "A tool of a server with the prefix "
+                    span class="mono" { "work" }
+                    " is named "
+                    span class="mono" { "<prefix>_<tool>" }
+                    ", here "
+                    span class="mono" { "work_search" }
+                    " for the tool "
+                    span class="mono" { "search" }
+                    ". Header values are stored encrypted and are never shown again."
+                }
             }
             @if let Some(saved) = saved {
                 (render_saved(saved))
             }
             @if backends.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No servers yet." }
+                div class="card-b muted" { "No servers yet." }
             } @else {
-                div class=(format!("mt-4 {TABLE_WRAP}")) {
-                    table class=(TABLE) {
-                        thead class=(THEAD) {
+                div class="tbl-wrap" {
+                    table class="tbl" {
+                        thead {
                             tr {
-                                th class=(TH) { "Prefix" }
-                                th class=(TH) { "URL" }
-                                th class=(TH) { "Headers" }
-                                th class=(TH) { "State" }
-                                th class=(TH) { "Status" }
-                                th class=(TH) { "Actions" }
+                                th { "Prefix" }
+                                th { "URL" }
+                                th { "Headers" }
+                                th { "State" }
+                                th { "Status" }
+                                th { "Actions" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for backend in backends {
                                 (render_backend_row(backend))
                             }
@@ -264,38 +350,7 @@ pub(super) fn render_backends_section(
                     }
                 }
             }
-            div class=(DIVIDER) {
-                h3 class=(SUBHEADING) { "Add a server" }
-                p class=(format!("mt-1 {MUTED}")) {
-                    "The server is tested when you add it and is kept whatever the test finds."
-                }
-                form class=(FORM_COL) hx-post="/ui/actions/me/backends" hx-target=(BACKENDS) hx-swap="outerHTML" {
-                    div class=(FORM_ROW) {
-                        label class=(LABEL) {
-                            "Prefix"
-                            input
-                                class=(INPUT)
-                                type="text"
-                                name="prefix"
-                                maxlength="32"
-                                placeholder="work"
-                                required;
-                        }
-                        label class=(LABEL) {
-                            "URL"
-                            input
-                                class=(format!("{INPUT} w-96"))
-                                type="url"
-                                name="url"
-                                placeholder="https://mcp.example.com/mcp"
-                                required;
-                        }
-                    }
-                    p class=(MUTED) { "Headers sent with every request, such as Authorization (optional):" }
-                    (header_rows())
-                    button class=(BUTTON) type="submit" { "Add server" }
-                }
-            }
+            (render_add_server())
         }
     }
 }
@@ -307,11 +362,8 @@ pub(super) fn render_backends_page(
     backends: &[PersonalBackend],
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "My MCP servers"
-            }
+        div class="page-head" {
+            h1 { "My MCP servers" }
         }
         (render_flash_area(false))
         (render_backends_section(backends, None))
@@ -328,14 +380,14 @@ fn field_label(field: &CredentialField) -> &str {
 fn credential_state(view: &CatalogView) -> Markup {
     html! {
         @if let Some(credential) = &view.credential {
-            span class=(BADGE_OK) { "set" }
+            span class="pill ok" { "set" }
             " "
-            span class=(FAINT) { "updated " (when(credential.updated_at)) }
+            span class="muted" { "updated " (when(credential.updated_at)) }
             div class="mt-1" {
                 (status_cell(credential.last_ok_at, credential.last_error_at, credential.last_error.as_deref()))
             }
         } @else {
-            span class=(BADGE_OFF) { "not set" }
+            span class="pill" { "not set" }
         }
     }
 }
@@ -375,37 +427,53 @@ fn oauth_settings(item: &CatalogItem) -> OauthSettings {
 
 /// The `auth` choice and the OAuth inputs of the admin forms. `current` is
 /// `None` on the create form, which has no stored secret to keep or clear.
-fn oauth_inputs(oauth: bool, current: Option<&OauthSettings>) -> Markup {
+/// `scope` keeps the ids of the inputs apart.
+fn oauth_inputs(scope: &str, oauth: bool, current: Option<&OauthSettings>) -> Markup {
     let client_id = current.map_or("", |settings| settings.client_id.as_str());
     let scopes = current.map_or("", |settings| settings.scopes.as_str());
     let secret_set = current.is_some_and(|settings| settings.secret_set);
+    let auth = html! {
+        select class="input" id=(format!("{scope}-auth")) name="auth" {
+            option value="fields" selected[!oauth] { "credential fields" }
+            option value="oauth" selected[oauth] { "OAuth (users connect their account)" }
+        }
+    };
+    let id_input = html! {
+        input
+            class="input mono"
+            id=(format!("{scope}-client-id"))
+            type="text"
+            name="oauth_client_id"
+            value=(client_id)
+            maxlength=(CLIENT_ID_MAX)
+            autocomplete="off";
+    };
+    let scopes_input = html! {
+        input
+            class="input mono"
+            id=(format!("{scope}-scopes"))
+            type="text"
+            name="oauth_scopes"
+            value=(scopes)
+            autocomplete="off";
+    };
+    let secret_input = html! {
+        input
+            class="input"
+            id=(format!("{scope}-client-secret"))
+            type="password"
+            name="oauth_client_secret"
+            placeholder=(if secret_set { "stored; leave empty to keep it" } else { "" })
+            maxlength=(CLIENT_SECRET_MAX)
+            autocomplete="new-password";
+    };
     html! {
-        label class=(LABEL) {
-            "Sign-in"
-            select class=(INPUT) name="auth" {
-                option value="fields" selected[!oauth] { "credential fields" }
-                option value="oauth" selected[oauth] { "OAuth (users connect their account)" }
-            }
-        }
-        label class=(LABEL) {
-            "OAuth client ID (optional)"
-            input class=(format!("{INPUT} w-72")) type="text" name="oauth_client_id" value=(client_id) autocomplete="off";
-        }
-        label class=(LABEL) {
-            "OAuth scopes (space or comma separated)"
-            input class=(format!("{INPUT} w-72")) type="text" name="oauth_scopes" value=(scopes) autocomplete="off";
-        }
-        label class=(LABEL) {
-            "OAuth client secret"
-            input
-                class=(format!("{INPUT} w-72"))
-                type="password"
-                name="oauth_client_secret"
-                placeholder=(if secret_set { "stored; leave empty to keep it" } else { "" })
-                autocomplete="new-password";
-        }
+        (field("Sign-in", &format!("{scope}-auth"), &auth, None, None))
+        (field("OAuth client ID (optional)", &format!("{scope}-client-id"), &id_input, None, None))
+        (field("OAuth scopes (space or comma separated)", &format!("{scope}-scopes"), &scopes_input, None, None))
+        (field("OAuth client secret", &format!("{scope}-client-secret"), &secret_input, None, None))
         @if secret_set {
-            label class=(LABEL) {
+            label class="flex items-center gap-2" {
                 input type="checkbox" name="clear_oauth_secret" value="true";
                 " Clear the stored client secret"
             }
@@ -417,55 +485,53 @@ fn oauth_inputs(oauth: bool, current: Option<&OauthSettings>) -> Markup {
 fn render_entry_admin(view: &CatalogView) -> Markup {
     let item = &view.item;
     let base = format!("/ui/actions/catalog/{}", item.name);
+    let scope = format!("ent-{}", item.name);
     let settings = oauth_settings(item);
     let oauth = matches!(item.auth, CatalogAuth::OAuth { .. });
+    let description = html! {
+        input
+            class="input"
+            id=(format!("{scope}-description"))
+            type="text"
+            name="description"
+            maxlength="500"
+            value=(item.description.as_deref().unwrap_or_default());
+    };
+    let state = html! {
+        select class="input" id=(format!("{scope}-enabled")) name="enabled" {
+            option value="true" selected[item.enabled] { "enabled" }
+            option value="false" selected[!item.enabled] { "disabled" }
+        }
+    };
     html! {
-        details class="mt-3" {
-            summary class="cursor-pointer text-xs text-slate-600 dark:text-slate-300" { "Edit entry" }
-            form class=(FORM_ROW) hx-post=(format!("{base}/update")) hx-target=(CATALOG) hx-swap="outerHTML" {
-                label class=(LABEL) {
-                    "Description"
-                    input
-                        class=(format!("{INPUT} w-72"))
-                        type="text"
-                        name="description"
-                        maxlength="500"
-                        value=(item.description.as_deref().unwrap_or_default());
+        details class="w-full" {
+            summary class="muted cursor-pointer" { "Edit entry" }
+            div class="mt-3 flex flex-col gap-3" {
+                form class="flex flex-col gap-3" hx-post=(format!("{base}/update")) hx-target=(CATALOG) hx-swap="outerHTML" {
+                    (field("Description", &format!("{scope}-description"), &description, None, None))
+                    (url_field(&format!("{scope}-url"), &item.url, ""))
+                    (field("State", &format!("{scope}-enabled"), &state, None, None))
+                    p class="hint" {
+                        "The credential fields apply when Sign-in is \"credential fields\". "
+                        "Users' stored values are kept by field name, so a renamed field is a new one they enter again. "
+                        "Empty rows are ignored."
+                    }
+                    (field_rows(&item.credential_fields))
+                    (oauth_inputs(&scope, oauth, Some(&settings)))
+                    div { button class="btn sm primary" type="submit" { "Save entry" } }
                 }
-                label class=(LABEL) {
-                    "URL"
-                    input
-                        class=(format!("{INPUT} w-72"))
-                        type="url"
-                        name="url"
-                        value=(item.url)
-                        required;
-                }
-                label class=(LABEL) {
-                    "State"
-                    select class=(INPUT) name="enabled" {
-                        option value="true" selected[item.enabled] { "enabled" }
-                        option value="false" selected[!item.enabled] { "disabled" }
+                div {
+                    button
+                        class="btn sm danger"
+                        type="button"
+                        hx-post=(format!("{base}/delete"))
+                        hx-target=(CATALOG)
+                        hx-swap="outerHTML"
+                        hx-confirm=(format!("Delete the catalog entry {}? Every user's credential for it goes with it.", item.name))
+                    {
+                        "Delete entry"
                     }
                 }
-                p class=(MUTED) {
-                    "The credential fields apply when Sign-in is \"credential fields\". "
-                    "Users' stored values are kept by field name, so a renamed field is a new one they enter again. "
-                    "Empty rows are ignored."
-                }
-                (field_rows(&item.credential_fields))
-                (oauth_inputs(oauth, Some(&settings)))
-                button class=(BUTTON_SMALL) type="submit" { "Save entry" }
-            }
-            button
-                class=(format!("mt-3 {BUTTON_DANGER}"))
-                type="button"
-                hx-post=(format!("{base}/delete"))
-                hx-target=(CATALOG)
-                hx-swap="outerHTML"
-                hx-confirm=(format!("Delete the catalog entry {}? Every user's credential for it goes with it.", item.name))
-            {
-                "Delete entry"
             }
         }
     }
@@ -476,7 +542,7 @@ fn render_entry_admin(view: &CatalogView) -> Markup {
 fn render_credential(view: &CatalogView, base: &str) -> Markup {
     let item = &view.item;
     html! {
-        p class=(format!("mt-2 {MUTED}")) {
+        p class="muted" {
             "Fields: "
             @for (index, field) in item.credential_fields.iter().enumerate() {
                 @if index > 0 {
@@ -485,47 +551,50 @@ fn render_credential(view: &CatalogView, base: &str) -> Markup {
                 (field_label(field))
                 @if view.manage {
                     " ("
-                    code class=(CODE) {
+                    span class="mono" {
                         (field.header) ": " (field.prefix.as_deref().unwrap_or_default()) "<value>"
                     }
                     ")"
                 }
             }
         }
-        div class="mt-2 text-sm" {
+        div {
             "Your credential: "
             (credential_state(view))
         }
         @if item.enabled {
-            form class=(FORM_COL) hx-post=(format!("{base}/credential")) hx-target=(CATALOG) hx-swap="outerHTML" {
-                div class=(FORM_ROW) {
-                    @for field in &item.credential_fields {
-                        label class=(LABEL) {
-                            (field_label(field))
-                            input
-                                class=(format!("{INPUT} w-72"))
-                                type="password"
-                                name=(format!("field:{}", field.name))
-                                autocomplete="new-password";
-                        }
-                    }
+            form class="flex flex-col gap-3" hx-post=(format!("{base}/credential")) hx-target=(CATALOG) hx-swap="outerHTML" {
+                @for (index, credential_field) in item.credential_fields.iter().enumerate() {
+                    @let id = format!("cred-{}-{index}", item.name);
+                    @let input = html! {
+                        input
+                            class="input"
+                            id=(id)
+                            type="password"
+                            name=(format!("field:{}", credential_field.name))
+                            maxlength=(HEADER_VALUE_MAX)
+                            autocomplete="new-password";
+                    };
+                    (field(field_label(credential_field), &id, &input, None, None))
                 }
-                p class=(MUTED) {
+                p class="hint" {
                     "Saving replaces your stored credential. Fields left empty are not stored."
                 }
-                button class=(BUTTON_SMALL) type="submit" { "Save credential" }
+                div { button class="btn sm primary" type="submit" { "Save credential" } }
             }
         }
         @if view.credential.is_some() {
-            button
-                class=(format!("mt-3 {BUTTON_DANGER}"))
-                type="button"
-                hx-post=(format!("{base}/credential/delete"))
-                hx-target=(CATALOG)
-                hx-swap="outerHTML"
-                hx-confirm=(format!("Remove your credential for {}?", item.name))
-            {
-                "Remove credential"
+            div {
+                button
+                    class="btn sm danger"
+                    type="button"
+                    hx-post=(format!("{base}/credential/delete"))
+                    hx-target=(CATALOG)
+                    hx-swap="outerHTML"
+                    hx-confirm=(format!("Remove your credential for {}?", item.name))
+                {
+                    "Remove credential"
+                }
             }
         }
     }
@@ -542,46 +611,59 @@ fn render_connection(view: &CatalogView, base: &str, client_unusable: bool) -> M
         "Connect"
     };
     html! {
-        div class="mt-2 text-sm" {
+        div {
             "Your connection: "
             @if let Some(connection) = &view.connection {
                 @if let Some(message) = &connection.last_error {
-                    span class=(BADGE_WARN) { "Reconnect needed" }
+                    span class="pill warn" { "Reconnect needed" }
                     @if let Some(failed_at) = connection.last_error_at {
                         " "
-                        span class=(FAINT) { (when(failed_at)) }
+                        span class="muted" { (when(failed_at)) }
                     }
-                    div class=(format!("mt-1 break-words {MUTED}")) { (message) }
+                    div class="muted mt-1 break-words" { (message) }
                 } @else {
-                    span class=(BADGE_OK) { "Connected" }
+                    span class="pill ok" { "Connected" }
                     " "
-                    span class=(FAINT) { "token expires " (when(connection.expires_at)) }
+                    span class="muted" { "token expires " (when(connection.expires_at)) }
                 }
             } @else {
-                span class=(BADGE_OFF) { "Not connected" }
+                span class="pill" { "Not connected" }
             }
         }
         @if client_unusable {
-            p class=(format!("mt-2 {MUTED}")) {
+            p class="muted" {
                 "The administrator's OAuth client secret for this service cannot be read, "
                 "so it cannot be connected until it is set again."
             }
         } @else if item.enabled {
-            form class="mt-3" hx-post=(format!("{base}/connect")) hx-swap="none" {
-                button class=(BUTTON_SMALL) type="submit" { (connect) }
+            form hx-post=(format!("{base}/connect")) hx-swap="none" {
+                button class="btn sm primary" type="submit" { (connect) }
             }
         }
         @if view.connection.is_some() {
-            button
-                class=(format!("mt-3 {BUTTON_DANGER}"))
-                type="button"
-                hx-post=(format!("{base}/disconnect"))
-                hx-target=(CATALOG)
-                hx-swap="outerHTML"
-                hx-confirm=(format!("Disconnect {}?", item.name))
-            {
-                "Disconnect"
+            div {
+                button
+                    class="btn sm danger"
+                    type="button"
+                    hx-post=(format!("{base}/disconnect"))
+                    hx-target=(CATALOG)
+                    hx-swap="outerHTML"
+                    hx-confirm=(format!("Disconnect {}?", item.name))
+                {
+                    "Disconnect"
+                }
             }
+        }
+    }
+}
+
+/// How an entry signs the user in, as the pill of its card
+fn auth_pill(auth: &CatalogAuth) -> Markup {
+    html! {
+        @match auth {
+            CatalogAuth::Fields => { span class="pill" { "Credentials" } }
+            CatalogAuth::OAuth { .. } => { span class="pill accent" { "OAuth" } }
+            CatalogAuth::Passthrough(_) => { span class="pill ok" { "Your sign-in" } }
         }
     }
 }
@@ -592,44 +674,55 @@ fn render_entry(view: &CatalogView) -> Markup {
     let item = &view.item;
     let base = format!("/ui/actions/catalog/{}", item.name);
     let classes = if item.enabled {
-        "mt-6 border-t border-slate-200 pt-4 dark:border-slate-800"
+        "card flex flex-col"
     } else {
-        "mt-6 border-t border-slate-200 pt-4 opacity-60 dark:border-slate-800"
+        "card flex flex-col opacity-60"
     };
+    let initial: String = item
+        .name
+        .chars()
+        .take(1)
+        .flat_map(char::to_uppercase)
+        .collect();
     html! {
-        div class=(classes) {
-            div class="flex flex-wrap items-center gap-3" {
-                h3 class=(SUBHEADING) { (item.name) }
-                @if !item.enabled {
-                    span class=(BADGE_OFF) { "disabled" }
-                }
-                @if item.source == CatalogSource::Config {
-                    span class=(BADGE_OFF) { "from backend config" }
+        article class=(classes) {
+            div class="card-b flex flex-1 flex-col gap-2" {
+                div class="flex flex-wrap items-center gap-2" {
+                    span class="avatar" aria-hidden="true" { (initial) }
+                    h3 class="mono font-semibold" { (item.name) }
+                    @if !item.enabled {
+                        span class="pill" { "disabled" }
+                    }
+                    @if item.source == CatalogSource::Config {
+                        span class="pill" { "from backend config" }
+                    }
+                    span class="spacer" {}
+                    (auth_pill(&item.auth))
                 }
                 @if let Some(description) = &item.description {
-                    span class=(MUTED) { (description) }
+                    p class="muted" { (description) }
                 }
-            }
-            @if view.manage {
-                p class=(format!("mt-1 break-all {MUTED}")) { code class=(CODE) { (item.url) } }
-            }
-            @match &item.auth {
-                CatalogAuth::Fields => { (render_credential(view, &base)) }
-                CatalogAuth::OAuth { client_unusable, .. } => {
-                    (render_connection(view, &base, *client_unusable))
+                @if view.manage {
+                    p class="mono muted break-all" { (item.url) }
                 }
-                CatalogAuth::Passthrough(_) => {
-                    div class="mt-2 text-sm" {
-                        span class=(BADGE_OK) { "Uses your sign-in" }
-                        " "
-                        span class=(MUTED) {
-                            "The gateway trades your sign-in for a token this service accepts."
+                @match &item.auth {
+                    CatalogAuth::Fields => { (render_credential(view, &base)) }
+                    CatalogAuth::OAuth { client_unusable, .. } => {
+                        (render_connection(view, &base, *client_unusable))
+                    }
+                    CatalogAuth::Passthrough(_) => {
+                        div {
+                            span class="pill ok" { "Uses your sign-in" }
+                            " "
+                            span class="muted" {
+                                "The gateway trades your sign-in for a token this service accepts."
+                            }
                         }
                     }
                 }
             }
             @if view.manage && item.source == CatalogSource::Database {
-                (render_entry_admin(view))
+                div class="card-f" { (render_entry_admin(view)) }
             }
         }
     }
@@ -643,56 +736,75 @@ fn field_rows(existing: &[CredentialField]) -> Markup {
     html! {
         div class="flex flex-col gap-2" {
             @for field in existing {
-                div class="flex flex-wrap gap-2" {
-                    input class=(format!("{INPUT} w-36")) type="text" name="field_name" placeholder="name: token" maxlength="64" value=(field.name);
-                    input class=(format!("{INPUT} w-40")) type="text" name="field_label" placeholder="label: API token" value=(field.label.as_deref().unwrap_or_default());
-                    input class=(format!("{INPUT} w-44")) type="text" name="field_header" placeholder="header: Authorization" value=(field.header);
-                    input class=(format!("{INPUT} w-36")) type="text" name="field_prefix" placeholder="prefix: Bearer " value=(field.prefix.as_deref().unwrap_or_default());
+                div class=(FIELD_ROW) {
+                    input class="input mono" type="text" name="field_name" placeholder="name: token" aria-label="Field name" maxlength="64" value=(field.name);
+                    input class="input" type="text" name="field_label" placeholder="label: API token" aria-label="Field label" value=(field.label.as_deref().unwrap_or_default());
+                    input class="input mono" type="text" name="field_header" placeholder="header: Authorization" aria-label="Header" value=(field.header);
+                    input class="input mono" type="text" name="field_prefix" placeholder="prefix: Bearer " aria-label="Prefix" value=(field.prefix.as_deref().unwrap_or_default());
                 }
             }
             @for _ in 0..empty {
-                div class="flex flex-wrap gap-2" {
-                    input class=(format!("{INPUT} w-36")) type="text" name="field_name" placeholder="name: token" maxlength="64";
-                    input class=(format!("{INPUT} w-40")) type="text" name="field_label" placeholder="label: API token";
-                    input class=(format!("{INPUT} w-44")) type="text" name="field_header" placeholder="header: Authorization";
-                    input class=(format!("{INPUT} w-36")) type="text" name="field_prefix" placeholder="prefix: Bearer ";
+                div class=(FIELD_ROW) {
+                    input class="input mono" type="text" name="field_name" placeholder="name: token" aria-label="Field name" maxlength="64";
+                    input class="input" type="text" name="field_label" placeholder="label: API token" aria-label="Field label";
+                    input class="input mono" type="text" name="field_header" placeholder="header: Authorization" aria-label="Header";
+                    input class="input mono" type="text" name="field_prefix" placeholder="prefix: Bearer " aria-label="Prefix";
                 }
             }
         }
     }
 }
 
-/// The create form of the catalog admin
+/// The create form of the catalog admin, in a drawer
 fn render_catalog_create() -> Markup {
+    let name = html! {
+        input
+            class="input mono"
+            id="new-entry-name"
+            type="text"
+            name="name"
+            maxlength="31"
+            pattern=(PREFIX_PATTERN)
+            autocomplete="off"
+            required;
+    };
+    let description = html! {
+        input
+            class="input"
+            id="new-entry-description"
+            type="text"
+            name="description"
+            maxlength="500"
+            autocomplete="off";
+    };
     html! {
-        div class=(DIVIDER) {
-            h3 class=(SUBHEADING) { "New catalog entry" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "Each credential field is one input for the user and one header the gateway sends: "
-                "its value, with the prefix put in front. Empty rows are ignored. "
-                "For an OAuth entry leave the rows empty: each user connects their own account, "
-                "with the static client below or, without one, a client the gateway registers itself."
-            }
-            form class=(FORM_COL) hx-post="/ui/actions/catalog" hx-target=(CATALOG) hx-swap="outerHTML" {
-                div class=(FORM_ROW) {
-                    label class=(LABEL) {
-                        "Name (the tool prefix)"
-                        input class=(INPUT) type="text" name="name" maxlength="32" required;
+        div id="new-entry" popover class="drawer" aria-labelledby="new-entry-title" {
+            (drawer_head("new-entry", "New catalog entry"))
+            form
+                class="drawer-form"
+                hx-post="/ui/actions/catalog"
+                hx-target=(CATALOG)
+                hx-swap="outerHTML"
+            {
+                div class="drawer-b" {
+                    div class="section-t" { "Server" }
+                    div class="form-grid" {
+                        (field("Name (the tool prefix)", "new-entry-name", &name, None, Some(PREFIX_ERROR)))
+                        (field("Description", "new-entry-description", &description, None, None))
                     }
-                    label class=(LABEL) {
-                        "Description"
-                        input class=(format!("{INPUT} w-72")) type="text" name="description" maxlength="500";
+                    (url_field("new-entry-url", "", ""))
+                    div class="section-t" { "Credential fields" }
+                    p class="hint" {
+                        "Each credential field is one input for the user and one header the gateway sends: "
+                        "its value, with the prefix put in front. Empty rows are ignored. "
+                        "For an OAuth entry leave the rows empty: each user connects their own account, "
+                        "with the static client below or, without one, a client the gateway registers itself."
                     }
-                    label class=(LABEL) {
-                        "URL"
-                        input class=(format!("{INPUT} w-96")) type="url" name="url" required;
-                    }
+                    (field_rows(&[]))
+                    div class="section-t" { "How users sign in" }
+                    (oauth_inputs("new-entry", false, None))
                 }
-                (field_rows(&[]))
-                div class=(FORM_ROW) {
-                    (oauth_inputs(false, None))
-                }
-                button class=(BUTTON) type="submit" { "Create entry" }
+                (drawer_foot("new-entry", "Create entry"))
             }
         }
     }
@@ -702,19 +814,25 @@ fn render_catalog_create() -> Markup {
 /// `manage`r; the swap target of the `catalog` actions
 pub(super) fn render_catalog_section(entries: &[CatalogView], manage: bool) -> Markup {
     html! {
-        section id="catalog" class=(CARD) {
-            h2 class=(HEADING) { "Catalog" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "Servers the admin has set up for you to use with your own credential or account. "
-                "Store a credential or connect here and the tools appear in your session, named "
-                code class=(CODE) { "<name>_<tool>" }
-                ". Credentials are stored encrypted and are never shown again."
+        section id="catalog" class="flex flex-col gap-4" {
+            div class="flex flex-wrap items-center gap-3" {
+                p class="muted min-w-0 flex-1" {
+                    "Servers the admin has set up for you to use with your own credential or account. "
+                    "Store a credential or connect here and the tools appear in your session, named "
+                    span class="mono" { "<name>_<tool>" }
+                    ". Credentials are stored encrypted and are never shown again."
+                }
+                @if manage {
+                    (drawer_trigger("new-entry", "New entry"))
+                }
             }
             @if entries.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No catalog entries." }
+                div class="card card-b muted" { "No catalog entries." }
             }
-            @for view in entries {
-                (render_entry(view))
+            div class="cards" {
+                @for view in entries {
+                    (render_entry(view))
+                }
             }
             @if manage {
                 (render_catalog_create())
@@ -731,11 +849,8 @@ pub(super) fn render_catalog_page(
     manage: bool,
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Catalog"
-            }
+        div class="page-head" {
+            h1 { "Catalog" }
         }
         (render_flash_area(false))
         (render_catalog_section(entries, manage))
@@ -746,46 +861,51 @@ pub(super) fn render_catalog_page(
 /// Every user's personal servers, the swap target of the admin actions
 pub(super) fn render_admin_section(backends: &[AdminPersonalBackend]) -> Markup {
     html! {
-        section id="admin-personal" class=(CARD) {
-            h2 class=(HEADING) { "Personal MCP servers" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "The servers users brought themselves. Disabling one takes its tools out of the "
-                "owner's session; header values are never shown."
+        section id="admin-personal" class="card" {
+            div class="card-h" {
+                h2 { "Personal MCP servers" }
+                span class="muted" { (backends.len()) }
+            }
+            div class="card-b" {
+                p class="muted" {
+                    "The servers users brought themselves. Disabling one takes its tools out of the "
+                    "owner's session; header values are never shown."
+                }
             }
             @if backends.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No personal servers yet." }
+                div class="card-b muted" { "No personal servers yet." }
             } @else {
-                div class=(format!("mt-4 {TABLE_WRAP}")) {
-                    table class=(TABLE) {
-                        thead class=(THEAD) {
+                div class="tbl-wrap" {
+                    table class="tbl" {
+                        thead {
                             tr {
-                                th class=(TH) { "Owner" }
-                                th class=(TH) { "Prefix" }
-                                th class=(TH) { "URL" }
-                                th class=(TH) { "State" }
-                                th class=(TH) { "Status" }
-                                th class=(TH) { "Actions" }
+                                th { "Owner" }
+                                th { "Prefix" }
+                                th { "URL" }
+                                th { "State" }
+                                th { "Status" }
+                                th { "Actions" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for backend in backends {
                                 @let base = format!(
                                     "/ui/actions/admin/personal-backends/{}/{}",
                                     backend.owner_id, backend.prefix
                                 );
                                 tr {
-                                    td class=(TD) { (owner_label(backend)) }
-                                    td class=(TD) { code class=(CODE) { (backend.prefix) } }
-                                    td class=(TD) { span class="break-all" { (backend.url) } }
-                                    td class=(TD) { (enabled_badge(backend.enabled)) }
-                                    td class=(TD) {
+                                    td { (owner_label(backend)) }
+                                    td { span class="mono" { (backend.prefix) } }
+                                    td class="wrap break-all" { (backend.url) }
+                                    td { (enabled_badge(backend.enabled)) }
+                                    td class="wrap" {
                                         (status_cell(backend.last_ok_at, backend.last_error_at, backend.last_error.as_deref()))
                                     }
-                                    td class=(TD) {
+                                    td {
                                         div class="flex flex-wrap items-start gap-2" {
                                             (enabled_toggle(&format!("{base}/enabled"), ADMIN_PERSONAL, backend.enabled))
                                             button
-                                                class=(BUTTON_DANGER)
+                                                class="btn sm danger"
                                                 type="button"
                                                 hx-post=(format!("{base}/delete"))
                                                 hx-target=(ADMIN_PERSONAL)
@@ -813,11 +933,8 @@ pub(super) fn render_admin_page(
     backends: &[AdminPersonalBackend],
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Personal MCP servers"
-            }
+        div class="page-head" {
+            h1 { "Personal MCP servers" }
         }
         (render_flash_area(false))
         (render_admin_section(backends))

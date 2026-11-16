@@ -7,39 +7,35 @@
 //! Forms and buttons only render for users who hold the permission, the
 //! service layer in `rbac` still decides.
 
-use maud::{Markup, PreEscaped, html};
+use maud::{Markup, html};
 use uuid::Uuid;
 
 use super::AppState;
-use super::shell::{Nav, render_shell};
+use super::shell::{Nav, icon, render_shell};
 use crate::policy::{
     GrantView, GroupView, Permission, Permissions, RoleBinding, RoleSource, RoleSubject, RoleView,
 };
 use crate::rbac::{ManagedUser, RoleEntry};
 use crate::store::{AuditRecord, ServiceAccount, SessionUser, User};
 
-pub(super) const CARD: &str = "mb-6 rounded-xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900";
-pub(super) const HEADING: &str = "text-lg font-semibold text-slate-900 dark:text-slate-100";
-pub(super) const MUTED: &str = "text-sm text-slate-600 dark:text-slate-300";
-pub(super) const FAINT: &str = "text-slate-500 dark:text-slate-400";
-pub(super) const TABLE_WRAP: &str =
-    "mt-4 overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800";
-pub(super) const TABLE: &str = "min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800";
-pub(super) const THEAD: &str = "bg-slate-50 dark:bg-slate-800/80";
-pub(super) const TBODY: &str =
-    "divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-900";
-pub(super) const TH: &str = "px-4 py-3 text-left font-medium text-slate-600 dark:text-slate-300";
-pub(super) const TD: &str = "px-4 py-3 align-top text-slate-700 dark:text-slate-200";
-pub(super) const CODE: &str = "text-slate-900 dark:text-slate-100";
-pub(super) const FORM_ROW: &str = "mt-4 flex flex-wrap items-end gap-3";
-pub(super) const LABEL: &str =
-    "flex flex-col gap-1 text-xs font-medium text-slate-600 dark:text-slate-300";
-pub(super) const INPUT: &str = "rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100";
-pub(super) const BUTTON: &str = "rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-300";
-pub(super) const BUTTON_SMALL: &str = "rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800";
-pub(super) const BUTTON_DANGER: &str = "rounded-md border border-red-300 px-2 py-1 text-xs text-red-700 hover:bg-red-50 dark:border-red-900 dark:text-red-300 dark:hover:bg-red-950/40";
-pub(super) const LINK: &str = "font-medium text-orange-700 underline decoration-orange-300 underline-offset-2 hover:text-orange-900 dark:text-orange-200 dark:decoration-orange-700 dark:hover:text-orange-100";
-pub(super) const BACK_LINK: &str = "inline-flex items-center text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100";
+/// The intro line of a card, under its header
+pub(super) const DESC: &str = "card-b pb-0 text-muted";
+/// The empty-state line of a card
+pub(super) const EMPTY: &str = "card-b text-muted";
+pub(super) const TABLE: &str = "tbl";
+pub(super) const TD: &str = "align-middle";
+pub(super) const CODE: &str = "mono text-text";
+/// A form that is the footer of its card
+pub(super) const FORM_FOOT: &str = "card-f flex-wrap items-end gap-3";
+pub(super) const LABEL: &str = "flex min-w-40 flex-col gap-1 text-xs font-medium text-muted";
+pub(super) const INPUT: &str = "input";
+pub(super) const BUTTON: &str = "btn primary";
+pub(super) const BUTTON_SMALL: &str = "btn sm";
+pub(super) const BUTTON_DANGER: &str = "btn sm danger";
+/// A link that looks like a small button (`.axon a` would colour it as a link)
+pub(super) const LINK_BUTTON: &str = "btn sm text-text";
+pub(super) const LINK: &str =
+    "font-medium text-accent underline underline-offset-2 hover:opacity-80";
 
 /// What the signed-in user may do on the admin pages
 #[derive(Debug, Clone, Copy)]
@@ -162,23 +158,29 @@ fn group_href(name: &str) -> String {
 fn role_source_badge(source: RoleSource) -> Markup {
     match source {
         RoleSource::Builtin => html! {
-            span class="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-semibold text-sky-800 dark:bg-sky-900/40 dark:text-sky-300" {
-                "built-in"
-            }
+            span class="pill accent" { "built-in" }
         },
         RoleSource::Local => html! {
-            span class="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300" {
-                "local"
-            }
+            span class="pill ok" { "local" }
         },
     }
+}
+
+/// The first letter or digit, capitalised, for an avatar
+fn initials(label: &str) -> String {
+    label
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .into_iter()
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 /// Where action errors show: the target of their `HX-Retarget`. Successful
 /// actions send it again as an out-of-band swap to clear an old error.
 pub(super) fn render_flash_area(oob: bool) -> Markup {
     html! {
-        div id="admin-flash" class="mb-4" hx-swap-oob=[oob.then_some("true")] {}
+        div id="admin-flash" class="empty:hidden" hx-swap-oob=[oob.then_some("true")] {}
     }
 }
 
@@ -196,14 +198,9 @@ pub(super) fn render_layout(
 /// The page for a user who may not see an admin page (answered with 403).
 pub(super) fn render_forbidden_page(state: &AppState, user: &SessionUser) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Not allowed"
-            }
-            p class=(format!("mt-2 {MUTED}")) {
-                "You do not have the permission to view this page."
-            }
+        section class="card" {
+            div class="card-h" { h2 { "Not allowed" } }
+            p class=(EMPTY) { "You do not have the permission to view this page." }
         }
     };
     render_layout(state, user, "Not allowed", Nav::None, &content)
@@ -216,60 +213,34 @@ pub(super) fn render_admin_page(
     overview: &AdminOverview,
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Admin"
-            }
-            p class=(format!("mt-2 {MUTED}")) {
-                "Groups, grants and role bindings."
-            }
-            @if overview.access.read_audit {
-                p class="mt-3 text-sm" {
-                    a href="/ui/admin/audit" class=(LINK) { "Audit log" }
+        div class="page-head" {
+            p { "Groups, grants and role bindings." }
+            span class="spacer" {}
+            nav class="flex flex-wrap gap-2" aria-label="Admin pages" {
+                @if overview.access.read_audit {
+                    a href="/ui/admin/audit" class=(LINK_BUTTON) { "Audit log" }
+                    a href="/ui/admin/tool-calls" class=(LINK_BUTTON) { "Tool calls" }
+                    a href="/ui/admin/usage" class=(LINK_BUTTON) { "Usage" }
+                    a href="/ui/admin/audit-settings" class=(LINK_BUTTON) { "Audit settings" }
                 }
-                p class="mt-3 text-sm" {
-                    a href="/ui/admin/tool-calls" class=(LINK) { "Tool calls" }
-                }
-                p class="mt-3 text-sm" {
-                    a href="/ui/admin/usage" class=(LINK) { "Usage" }
-                }
-                p class="mt-3 text-sm" {
-                    a href="/ui/admin/audit-settings" class=(LINK) { "Audit settings" }
-                }
-            }
-            @if overview.access.manage_users {
-                p class="mt-3 text-sm" {
-                    a href="/ui/admin/users" class=(LINK) { "Users" }
-                }
-                @if overview.access.manage_groups {
-                    p class="mt-3 text-sm" {
-                        a href="/ui/admin/scim" class=(LINK) { "SCIM provisioning" }
+                @if overview.access.manage_users {
+                    a href="/ui/admin/users" class=(LINK_BUTTON) { "Users" }
+                    @if overview.access.manage_groups {
+                        a href="/ui/admin/scim" class=(LINK_BUTTON) { "SCIM provisioning" }
+                    }
+                    @if state.personal.is_some() {
+                        a href="/ui/admin/personal-backends" class=(LINK_BUTTON) { "Personal MCP servers" }
                     }
                 }
-                @if state.personal.is_some() {
-                    p class="mt-3 text-sm" {
-                        a href="/ui/admin/personal-backends" class=(LINK) { "Personal MCP servers" }
-                    }
+                @if overview.access.manage_service_accounts {
+                    a href="/ui/admin/service-accounts" class=(LINK_BUTTON) { "Service accounts" }
                 }
-            }
-            @if overview.access.manage_service_accounts {
-                p class="mt-3 text-sm" {
-                    a href="/ui/admin/service-accounts" class=(LINK) { "Service accounts" }
-                }
-            }
-            p class="mt-3 text-sm" {
-                a href="/ui/admin/roles" class=(LINK) { "Roles" }
-            }
-            @if state.db_config.is_some() {
-                p class="mt-3 text-sm" {
-                    a href="/ui/admin/config/backends" class=(LINK) { "Backends" }
-                    " / "
-                    a href="/ui/admin/config/toolsets" class=(LINK) { "Toolsets" }
-                    " / "
-                    a href="/ui/admin/config/oidc-providers" class=(LINK) { "OIDC providers" }
-                    " / "
-                    a href="/ui/admin/config/settings" class=(LINK) { "Gateway settings" }
+                a href="/ui/admin/roles" class=(LINK_BUTTON) { "Roles" }
+                @if state.db_config.is_some() {
+                    a href="/ui/admin/config/backends" class=(LINK_BUTTON) { "Backends" }
+                    a href="/ui/admin/config/toolsets" class=(LINK_BUTTON) { "Toolsets" }
+                    a href="/ui/admin/config/oidc-providers" class=(LINK_BUTTON) { "OIDC providers" }
+                    a href="/ui/admin/config/settings" class=(LINK_BUTTON) { "Gateway settings" }
                 }
             }
         }
@@ -285,26 +256,26 @@ pub(super) fn render_admin_page(
 /// `oob` renders it as an out-of-band swap next to another fragment.
 pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Markup {
     html! {
-        section id="admin-groups" class=(CARD) hx-swap-oob=[oob.then_some("true")] {
-            h2 class=(HEADING) { "Groups" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="admin-groups" class="card" hx-swap-oob=[oob.then_some("true")] {
+            div class="card-h" { h2 { "Groups" } }
+            p class=(DESC) {
                 "Users join a group through an IdP mapping or by being added by hand. "
                 "Everyone is also in the built-in authenticated group."
             }
             @if overview.groups.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No groups yet." }
+                p class=(EMPTY) { "No groups yet." }
             } @else {
-                div class=(TABLE_WRAP) {
+                div class="tbl-wrap mt-3 border-t border-border" {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "Name" }
-                                th class=(TH) { "Description" }
-                                th class=(TH) { "IdP mappings" }
-                                th class=(TH) { "Members" }
+                                th { "Name" }
+                                th { "Description" }
+                                th { "IdP mappings" }
+                                th { "Members" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for row in &overview.groups {
                                 tr {
                                     td class=(TD) {
@@ -335,7 +306,7 @@ pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Mark
             }
             @if overview.access.manage_groups {
                 form
-                    class=(FORM_ROW)
+                    class=(FORM_FOOT)
                     hx-post="/ui/actions/admin/groups"
                     hx-target="#admin-groups"
                     hx-swap="outerHTML"
@@ -359,7 +330,7 @@ pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Mark
 fn globs(patterns: &[String]) -> Markup {
     html! {
         @if patterns.is_empty() {
-            span class=(FAINT) { "-" }
+            span class="text-muted" { "-" }
         } @else {
             code class=(CODE) { (patterns.join(", ")) }
         }
@@ -369,43 +340,143 @@ fn globs(patterns: &[String]) -> Markup {
 fn yes_no(value: bool) -> Markup {
     html! {
         @if value {
-            "yes"
+            span class="pill ok" { "yes" }
         } @else {
-            span class=(FAINT) { "no" }
+            span class="text-muted" { "no" }
         }
     }
 }
 
-/// Grants table and the add form, the swap target of `grants` actions.
+/// The groups and backends of the grants matrix: the known ones first, then any
+/// a grant names that is not known (a grant outlives a removed backend).
+fn matrix_axes(overview: &AdminOverview) -> (Vec<&str>, Vec<&str>) {
+    let mut groups: Vec<&str> = overview.group_names.iter().map(String::as_str).collect();
+    let mut backends: Vec<&str> = overview.backends.iter().map(String::as_str).collect();
+    for view in &overview.grants {
+        if !groups.contains(&view.grant.group.as_str()) {
+            groups.push(&view.grant.group);
+        }
+        if !backends.contains(&view.grant.backend.as_str()) {
+            backends.push(&view.grant.backend);
+        }
+    }
+    (groups, backends)
+}
+
+/// One cell of the matrix: every tool, some of them or read-only, or no grant.
+fn matrix_cell(overview: &AdminOverview, group: &str, backend: &str) -> Markup {
+    let matching: Vec<&GrantView> = overview
+        .grants
+        .iter()
+        .filter(|view| view.grant.group == group && view.grant.backend == backend)
+        .collect();
+    let full = matching.iter().any(|view| {
+        let grant = &view.grant;
+        !grant.read_only
+            && grant.exclude.is_empty()
+            && (grant.include.is_empty() || grant.include.iter().any(|pattern| pattern == "*"))
+    });
+    let read_only = !matching.is_empty() && matching.iter().all(|view| view.grant.read_only);
+    let (state, title) = if matching.is_empty() {
+        ("none", format!("{group} has no grant on {backend}"))
+    } else if full {
+        ("full", format!("{group} may use every tool of {backend}"))
+    } else {
+        (
+            "partial",
+            format!("{group} may use some tools of {backend} (include, exclude or read-only)"),
+        )
+    };
+    html! {
+        span class="cell cursor-default" data-state=(state) role="img" aria-label=(title) title=(title) {
+            @if full {
+                (icon("check"))
+            } @else if read_only {
+                "ro"
+            } @else if state == "partial" {
+                "sel"
+            }
+        }
+    }
+}
+
+/// Read-only groups x backends view of the grants; the forms below change them.
+fn grants_matrix(overview: &AdminOverview) -> Markup {
+    let (groups, backends) = matrix_axes(overview);
+    html! {
+        @if !groups.is_empty() && !backends.is_empty() {
+            div class="section-t px-3.5 pt-3" { "Access matrix" }
+            div class="tbl-wrap mt-2 border-t border-border" {
+                table class="tbl matrix" {
+                    thead {
+                        tr {
+                            th { "Group" }
+                            @for backend in &backends {
+                                th { code class=(CODE) { (backend) } }
+                            }
+                        }
+                    }
+                    tbody {
+                        @for group in &groups {
+                            tr {
+                                td { code class=(CODE) { (group) } }
+                                @for backend in &backends {
+                                    td { (matrix_cell(overview, group, backend)) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div class="card-f flex-wrap gap-4 text-muted" {
+                span class="inline-flex items-center gap-1.5" {
+                    span class="cell size-5 cursor-default" data-state="full" { (icon("check")) }
+                    "all tools"
+                }
+                span class="inline-flex items-center gap-1.5" {
+                    span class="cell size-5 cursor-default" data-state="partial" {}
+                    "some tools or read-only"
+                }
+                span class="inline-flex items-center gap-1.5" {
+                    span class="cell size-5 cursor-default" data-state="none" {}
+                    "no grant"
+                }
+            }
+        }
+    }
+}
+
+/// Grants matrix, table and the add form, the swap target of `grants` actions.
 #[allow(clippy::too_many_lines)]
 pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Markup {
     let manage = overview.access.manage_groups;
 
     html! {
-        section id="admin-grants" class=(CARD) hx-swap-oob=[oob.then_some("true")] {
-            h2 class=(HEADING) { "Grants" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="admin-grants" class="card" hx-swap-oob=[oob.then_some("true")] {
+            div class="card-h" { h2 { "Grants" } }
+            p class=(DESC) {
                 "A grant lets a group use a backend's tools. Include and exclude are globs over the tool's original name."
             }
+            (grants_matrix(overview))
             @if overview.grants.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No grants yet." }
+                p class=(EMPTY) { "No grants yet." }
             } @else {
-                div class=(TABLE_WRAP) {
+                div class="tbl-wrap mt-3 border-t border-border" {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "Group" }
-                                th class=(TH) { "Backend" }
-                                th class=(TH) { "Include" }
-                                th class=(TH) { "Exclude" }
-                                th class=(TH) { "Read-only" }
-                                th class=(TH) { "Mandatory" }
+                                th { "Group" }
+                                th { "Backend" }
+                                th { "Include" }
+                                th { "Exclude" }
+                                th { "Read-only" }
+                                th { "Mandatory" }
                                 @if manage {
-                                    th class=(TH) { "Actions" }
+                                    th { "Actions" }
                                 }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for view in &overview.grants {
                                 tr {
                                     td class=(TD) { code class=(CODE) { (view.grant.group) } }
@@ -438,10 +509,10 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
             }
             @if manage {
                 @if overview.backends.is_empty() {
-                    p class=(format!("mt-4 text-sm {FAINT}")) { "No backends are configured, so there is nothing to grant." }
+                    p class=(EMPTY) { "No backends are configured, so there is nothing to grant." }
                 } @else {
                     form
-                        class=(FORM_ROW)
+                        class=(FORM_FOOT)
                         hx-post="/ui/actions/admin/grants"
                         hx-target="#admin-grants"
                         hx-swap="outerHTML"
@@ -470,12 +541,12 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                             "Exclude"
                             input class=(INPUT) type="text" name="exclude" placeholder="delete_*, drop_*";
                         }
-                        label class="flex items-center gap-2 pb-2 text-sm text-slate-700 dark:text-slate-200" {
-                            input type="checkbox" name="read_only" value="true";
+                        label class="flex items-center gap-2 pb-2 text-sm text-text" {
+                            input class="accent-accent" type="checkbox" name="read_only" value="true";
                             "Read-only"
                         }
-                        label class="flex items-center gap-2 pb-2 text-sm text-slate-700 dark:text-slate-200" {
-                            input type="checkbox" name="mandatory" value="true";
+                        label class="flex items-center gap-2 pb-2 text-sm text-text" {
+                            input class="accent-accent" type="checkbox" name="mandatory" value="true";
                             "Mandatory"
                         }
                         button class=(BUTTON) type="submit" { "Add grant" }
@@ -493,46 +564,44 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
     let manage = overview.access.manage_roles;
 
     html! {
-        section id="admin-bindings" class=(CARD) hx-swap-oob=[oob.then_some("true")] {
-            h2 class=(HEADING) { "Role bindings" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="admin-bindings" class="card" hx-swap-oob=[oob.then_some("true")] {
+            div class="card-h" { h2 { "Role bindings" } }
+            p class=(DESC) {
                 "A role binding gives a role to every member of a group, or to one user. "
                 "A role you do not hold every permission of cannot be given away."
             }
             @if overview.bindings.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No role bindings yet." }
+                p class=(EMPTY) { "No role bindings yet." }
             } @else {
-                div class=(TABLE_WRAP) {
+                div class="tbl-wrap mt-3 border-t border-border" {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "Role" }
-                                th class=(TH) { "Subject" }
+                                th { "Role" }
+                                th { "Subject" }
                                 @if manage {
-                                    th class=(TH) { "Actions" }
+                                    th { "Actions" }
                                 }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for binding in &overview.bindings {
                                 tr {
                                     td class=(TD) {
                                         code class=(CODE) { (binding.role) }
                                         @if !overview.roles.iter().any(|role| role.name == binding.role) {
                                             " "
-                                            span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
-                                                "unknown role"
-                                            }
+                                            span class="pill warn" { "unknown role" }
                                         }
                                     }
                                     td class=(TD) {
                                         @match &binding.subject {
                                             RoleSubject::Group(group) => {
-                                                "group "
+                                                span class="text-muted" { "group " }
                                                 code class=(CODE) { (group) }
                                             }
                                             RoleSubject::User(id) => {
-                                                "user "
+                                                span class="text-muted" { "user " }
                                                 (label_for(&overview.users, *id))
                                             }
                                         }
@@ -561,7 +630,7 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
             }
             @if manage {
                 form
-                    class=(FORM_ROW)
+                    class=(FORM_FOOT)
                     hx-post="/ui/actions/admin/role-bindings"
                     hx-target="#admin-bindings"
                     hx-swap="outerHTML"
@@ -602,12 +671,8 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
 /// Roles page (`GET /ui/admin/roles`).
 pub(super) fn render_roles_page(state: &AppState, user: &SessionUser, page: &RolesPage) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Roles"
-            }
-            p class=(format!("mt-2 {MUTED}")) {
+        div class="page-head" {
+            p {
                 "A role is a named set of permissions, given to groups and users by role bindings. "
                 "The built-in roles are fixed."
             }
@@ -623,9 +688,9 @@ fn permission_checkboxes(selected: &[Permission]) -> Markup {
     html! {
         div class="mt-2 grid gap-x-6 gap-y-1 sm:grid-cols-2" {
             @for permission in Permission::ALL {
-                label class="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-200" {
+                label class="flex items-start gap-2 text-sm text-text" {
                     input
-                        class="mt-1"
+                        class="mt-1 accent-accent"
                         type="checkbox"
                         name="permissions"
                         value=(permission.as_str())
@@ -633,7 +698,7 @@ fn permission_checkboxes(selected: &[Permission]) -> Markup {
                     span {
                         code class=(CODE) { (permission.as_str()) }
                         " "
-                        span class=(FAINT) { (permission.description()) }
+                        span class="text-muted" { (permission.description()) }
                     }
                 }
             }
@@ -648,41 +713,43 @@ pub(super) fn render_roles_section(page: &RolesPage) -> Markup {
     let manage = page.access.manage_roles;
 
     html! {
-        section id="admin-roles" class=(CARD) {
-            h2 class=(HEADING) { "Roles" }
-            div class=(TABLE_WRAP) {
+        section id="admin-roles" class="card" {
+            div class="card-h" { h2 { "Roles" } }
+            div class="tbl-wrap" {
                 table class=(TABLE) {
-                    thead class=(THEAD) {
+                    thead {
                         tr {
-                            th class=(TH) { "Name" }
-                            th class=(TH) { "Source" }
-                            th class=(TH) { "Description" }
-                            th class=(TH) { "Permissions" }
-                            th class=(TH) { "Bindings" }
+                            th { "Name" }
+                            th { "Source" }
+                            th { "Description" }
+                            th { "Permissions" }
+                            th { "Bindings" }
                             @if manage {
-                                th class=(TH) { "Actions" }
+                                th { "Actions" }
                             }
                         }
                     }
-                    tbody class=(TBODY) {
+                    tbody {
                         @for entry in &page.roles {
                             @let role = &entry.role;
                             tr {
                                 td class=(TD) { code class=(CODE) { (role.name) } }
                                 td class=(TD) { (role_source_badge(role.source)) }
-                                td class=(TD) {
+                                td class="whitespace-normal align-top" {
                                     @if let Some(description) = &role.description {
                                         (description)
                                     }
                                 }
-                                td class=(TD) {
-                                    @for permission in &role.permissions {
-                                        div { code class=(CODE) { (permission.as_str()) } }
+                                td class="min-w-64 whitespace-normal align-top" {
+                                    div class="flex flex-wrap gap-1" {
+                                        @for permission in &role.permissions {
+                                            span class="pill mono" { (permission.as_str()) }
+                                        }
                                     }
                                 }
-                                td class=(TD) { (entry.bindings) }
+                                td class="align-top" { (entry.bindings) }
                                 @if manage {
-                                    td class=(TD) {
+                                    td class="align-top" {
                                         @if role.source == RoleSource::Local {
                                             (render_role_actions(entry))
                                         }
@@ -694,33 +761,33 @@ pub(super) fn render_roles_section(page: &RolesPage) -> Markup {
                 }
             }
             @if manage {
-                h3 class="mt-6 text-sm font-semibold text-slate-900 dark:text-slate-100" {
-                    "Create a role"
-                }
-                form
-                    class="mt-2"
-                    hx-post="/ui/actions/admin/roles"
-                    hx-target="#admin-roles"
-                    hx-swap="outerHTML"
-                {
-                    div class=(FORM_ROW) {
-                        label class=(LABEL) {
-                            "Name"
-                            input
-                                class=(INPUT)
-                                type="text"
-                                name="name"
-                                placeholder="log-reader"
-                                pattern="[a-z0-9][a-z0-9_\\-]{0,62}"
-                                required;
+                div class="card-b border-t border-border" {
+                    h3 class="section-t" { "Create a role" }
+                    form
+                        class="mt-2"
+                        hx-post="/ui/actions/admin/roles"
+                        hx-target="#admin-roles"
+                        hx-swap="outerHTML"
+                    {
+                        div class="flex flex-wrap items-end gap-3" {
+                            label class=(LABEL) {
+                                "Name"
+                                input
+                                    class=(INPUT)
+                                    type="text"
+                                    name="name"
+                                    placeholder="log-reader"
+                                    pattern="[a-z0-9][a-z0-9_\\-]{0,62}"
+                                    required;
+                            }
+                            label class=(LABEL) {
+                                "Description"
+                                input class=(INPUT) type="text" name="description";
+                            }
                         }
-                        label class=(LABEL) {
-                            "Description"
-                            input class=(INPUT) type="text" name="description";
-                        }
+                        (permission_checkboxes(&[]))
+                        button class=(format!("mt-4 {BUTTON}")) type="submit" { "Create role" }
                     }
-                    (permission_checkboxes(&[]))
-                    button class=(format!("mt-4 {BUTTON}")) type="submit" { "Create role" }
                 }
             }
         }
@@ -733,10 +800,10 @@ fn render_role_actions(entry: &RoleEntry) -> Markup {
     let name = &role.name;
 
     html! {
-        details class="mb-2" {
-            summary class="cursor-pointer text-xs text-slate-700 dark:text-slate-200" { "Edit" }
+        details class="mb-2 whitespace-normal" {
+            summary class="btn sm ghost w-fit" { "Edit" }
             form
-                class="mt-2"
+                class="mt-2 min-w-80"
                 hx-post=(format!("/ui/actions/admin/roles/{name}/update"))
                 hx-target="#admin-roles"
                 hx-swap="outerHTML"
@@ -761,8 +828,8 @@ fn render_role_actions(entry: &RoleEntry) -> Markup {
             hx-confirm=(format!("Delete the role {name}?"))
         {
             @if entry.bindings > 0 {
-                label class="flex items-center gap-1 text-xs text-slate-700 dark:text-slate-200" {
-                    input type="checkbox" name="force" value="true";
+                label class="flex items-center gap-1 text-xs text-text" {
+                    input class="accent-accent" type="checkbox" name="force" value="true";
                     "also delete its " (entry.bindings) " binding(s)"
                 }
             }
@@ -778,16 +845,15 @@ pub(super) fn render_group_page(
     detail: &GroupDetail,
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                (detail.group.name)
-            }
+        div class="page-head" {
+            p { "Description, IdP mappings and members of this group." }
         }
         (render_flash_area(false))
         (render_group_settings(detail))
-        (render_group_mappings(detail))
-        (render_group_members(detail))
+        div class="cols" {
+            (render_group_mappings(detail))
+            (render_group_members(detail))
+        }
     };
     render_layout(state, user, &detail.group.name, Nav::Admin, &content)
 }
@@ -797,23 +863,23 @@ pub(super) fn render_group_settings(detail: &GroupDetail) -> Markup {
     let name = &detail.group.name;
 
     html! {
-        section id="group-settings" class=(CARD) {
-            h2 class=(HEADING) { "Description" }
+        section id="group-settings" class="card" {
+            div class="card-h" { h2 { "Description" } }
             @if detail.editable() {
                 form
-                    class=(FORM_ROW)
+                    class="card-b flex flex-wrap items-end gap-3"
                     hx-post=(format!("/ui/actions/admin/groups/{name}/update"))
                     hx-target="#group-settings"
                     hx-swap="outerHTML"
                 {
                     input
-                        class=(format!("{INPUT} w-96"))
+                        class=(format!("{INPUT} w-96 max-w-full"))
                         type="text"
                         name="description"
                         value=(detail.group.description.as_deref().unwrap_or_default());
                     button class=(BUTTON) type="submit" { "Save" }
                 }
-                div class="mt-4" {
+                div class="card-f" {
                     button
                         class=(BUTTON_DANGER)
                         type="button"
@@ -825,9 +891,9 @@ pub(super) fn render_group_settings(detail: &GroupDetail) -> Markup {
                 }
             } @else {
                 @if let Some(description) = &detail.group.description {
-                    p class=(format!("mt-2 {MUTED}")) { (description) }
+                    p class="card-b" { (description) }
                 } @else {
-                    p class=(format!("mt-2 text-sm {FAINT}")) { "No description." }
+                    p class=(EMPTY) { "No description." }
                 }
             }
         }
@@ -840,21 +906,23 @@ pub(super) fn render_group_mappings(detail: &GroupDetail) -> Markup {
     let editable = detail.editable();
 
     html! {
-        section id="group-mappings" class=(CARD) {
-            h2 class=(HEADING) { "IdP mappings" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="group-mappings" class="card" {
+            div class="card-h" { h2 { "IdP mappings" } }
+            p class=(DESC) {
                 "Users whose claim values at the login provider match a mapping are members."
             }
             @if detail.group.idp.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No mappings." }
+                p class=(EMPTY) { "No mappings." }
             } @else {
-                ul class="mt-4 space-y-2 text-sm" {
+                ul class="list mt-3 border-t border-border" {
                     @for mapping in &detail.group.idp {
-                        li class="flex items-center gap-3" {
-                            span {
-                                code class=(CODE) { (mapping.provider) }
-                                ": "
-                                code class=(CODE) { (mapping.value) }
+                        li class="row cursor-default" {
+                            span class="row-main" {
+                                span {
+                                    code class=(CODE) { (mapping.provider) }
+                                    ": "
+                                    code class=(CODE) { (mapping.value) }
+                                }
                             }
                             @if editable {
                                 form
@@ -873,7 +941,7 @@ pub(super) fn render_group_mappings(detail: &GroupDetail) -> Markup {
             }
             @if editable {
                 form
-                    class=(FORM_ROW)
+                    class=(FORM_FOOT)
                     hx-post=(format!("/ui/actions/admin/groups/{name}/idp-mappings/add"))
                     hx-target="#group-mappings"
                     hx-swap="outerHTML"
@@ -913,16 +981,18 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
         .collect();
 
     html! {
-        section id="group-members" class=(CARD) {
-            h2 class=(HEADING) { "Members" }
-            p class=(format!("mt-1 {MUTED}")) { "Users added by hand, besides the IdP mappings." }
+        section id="group-members" class="card" {
+            div class="card-h" { h2 { "Members" } }
+            p class=(DESC) { "Users added by hand, besides the IdP mappings." }
             @if detail.members.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No members added by hand." }
+                p class=(EMPTY) { "No members added by hand." }
             } @else {
-                ul class="mt-4 space-y-2 text-sm" {
+                ul class="list mt-3 border-t border-border" {
                     @for id in &detail.members {
-                        li class="flex items-center gap-3" {
-                            span { (member_label(detail, *id)) }
+                        @let label = member_label(detail, *id);
+                        li class="row cursor-default" {
+                            span class="avatar" { (initials(&label)) }
+                            span class="row-main" { (label) }
                             @if editable {
                                 form
                                     hx-post=(format!("/ui/actions/admin/groups/{name}/members/remove"))
@@ -939,7 +1009,7 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
             }
             @if editable && !(candidates.is_empty() && account_candidates.is_empty()) {
                 form
-                    class=(FORM_ROW)
+                    class=(FORM_FOOT)
                     hx-post=(format!("/ui/actions/admin/groups/{name}/members/add"))
                     hx-target="#group-members"
                     hx-swap="outerHTML"
@@ -965,11 +1035,8 @@ pub(super) fn render_group_members(detail: &GroupDetail) -> Markup {
 /// Users page (`GET /ui/admin/users`).
 pub(super) fn render_users_page(state: &AppState, user: &SessionUser, page: &UsersPage) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Users"
-            }
+        div class="page-head" {
+            p { "Everyone who has signed in, and whether they may still log in." }
         }
         (render_flash_area(false))
         (render_users_section(page))
@@ -980,13 +1047,9 @@ pub(super) fn render_users_page(state: &AppState, user: &SessionUser, page: &Use
 fn user_state_badge(disabled: bool) -> Markup {
     html! {
         @if disabled {
-            span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
-                "disabled"
-            }
+            span class="pill warn" { "disabled" }
         } @else {
-            span class="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300" {
-                "enabled"
-            }
+            span class="pill ok" { "enabled" }
         }
     }
 }
@@ -994,30 +1057,30 @@ fn user_state_badge(disabled: bool) -> Markup {
 /// The users table, the swap target of the disable and enable actions.
 pub(super) fn render_users_section(page: &UsersPage) -> Markup {
     html! {
-        section id="admin-users" class=(CARD) {
-            h2 class=(HEADING) { "Users" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="admin-users" class="card" {
+            div class="card-h" { h2 { "Users" } }
+            p class=(DESC) {
                 "A disabled user cannot log in, their sessions end and their tokens stop working. "
                 "Service accounts are on their own page."
             }
             @if page.users.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No users yet." }
+                p class=(EMPTY) { "No users yet." }
             } @else {
-                div class=(TABLE_WRAP) {
+                div class="tbl-wrap mt-3 border-t border-border" {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "User" }
-                                th class=(TH) { "Issuer" }
-                                th class=(TH) { "Last login" }
-                                th class=(TH) { "Admin" }
-                                th class=(TH) { "State" }
+                                th { "User" }
+                                th { "Issuer" }
+                                th { "Last login" }
+                                th { "Admin" }
+                                th { "State" }
                                 @if page.access.manage_users {
-                                    th class=(TH) {}
+                                    th {}
                                 }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for row in &page.users {
                                 (render_user_row(page, row))
                             }
@@ -1031,27 +1094,30 @@ pub(super) fn render_users_section(page: &UsersPage) -> Markup {
 
 fn render_user_row(page: &UsersPage, row: &ManagedUser) -> Markup {
     let user = &row.user;
-    let (action, label) = if row.disabled {
-        ("enable", "Enable")
+    let (action, label, button) = if row.disabled {
+        ("enable", "Enable", BUTTON_SMALL)
     } else {
-        ("disable", "Disable")
+        ("disable", "Disable", BUTTON_DANGER)
     };
     html! {
         tr {
-            td class=(TD) { (user_label(user)) }
+            td class=(TD) {
+                span class="inline-flex items-center gap-2" {
+                    span class="avatar" { (initials(user_label(user))) }
+                    (user_label(user))
+                }
+            }
             td class=(TD) { code class=(CODE) { (user.issuer) } }
-            td class=(format!("{TD} whitespace-nowrap")) {
+            td class=(TD) {
                 @if let Some(at) = row.last_login_at {
                     (at.format("%Y-%m-%d %H:%M UTC"))
                 } @else {
-                    span class=(FAINT) { "-" }
+                    span class="text-muted" { "-" }
                 }
             }
             td class=(TD) {
                 @if user.is_admin {
-                    span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" {
-                        "admin"
-                    }
+                    span class="pill accent" { "admin" }
                 }
             }
             td class=(TD) { (user_state_badge(row.disabled)) }
@@ -1060,7 +1126,7 @@ fn render_user_row(page: &UsersPage, row: &ManagedUser) -> Markup {
                     // Disabling yourself is refused, so the button is left out.
                     @if user.id != page.viewer || row.disabled {
                         button
-                            class=(BUTTON_SMALL)
+                            class=(button)
                             type="button"
                             hx-post=(format!("/ui/actions/admin/users/{}/{action}", user.id))
                             hx-target="#admin-users"
@@ -1086,37 +1152,37 @@ pub(super) fn render_audit_page(
     older: Option<i64>,
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                "Audit log"
-            }
+        div class="page-head" {
+            p { "What was changed through the admin pages and by whom, newest first." }
+        }
+        section class="card" {
+            div class="card-h" { h2 { "Audit log" } }
             @if entries.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No entries." }
+                p class=(EMPTY) { "No entries." }
             } @else {
-                div class=(TABLE_WRAP) {
+                div class="tbl-wrap" {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "Time" }
-                                th class=(TH) { "Actor" }
-                                th class=(TH) { "Action" }
-                                th class=(TH) { "Target" }
-                                th class=(TH) { "Details" }
+                                th { "Time" }
+                                th { "Actor" }
+                                th { "Action" }
+                                th { "Target" }
+                                th { "Details" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for entry in entries {
                                 tr {
-                                    td class=(format!("{TD} whitespace-nowrap")) {
+                                    td class=(TD) {
                                         (entry.at.format("%Y-%m-%d %H:%M:%S UTC"))
                                     }
                                     td class=(TD) { (entry.actor) }
                                     td class=(TD) { code class=(CODE) { (entry.action) } }
                                     td class=(TD) { code class=(CODE) { (entry.target) } }
-                                    td class=(format!("{TD} break-all")) {
+                                    td class="min-w-64 whitespace-normal break-all" {
                                         @if !entry.details.is_null() {
-                                            code class="text-xs text-slate-600 dark:text-slate-300" {
+                                            code class="mono text-muted" {
                                                 (entry.details.to_string())
                                             }
                                         }
@@ -1127,12 +1193,14 @@ pub(super) fn render_audit_page(
                     }
                 }
             }
-            div class="mt-4 flex gap-4 text-sm" {
-                @if before.is_some() {
-                    a href="/ui/admin/audit" class=(LINK) { "Newest" }
-                }
-                @if let Some(id) = older {
-                    a href=(format!("/ui/admin/audit?before={id}")) class=(LINK) { "Older" }
+            @if before.is_some() || older.is_some() {
+                div class="card-f gap-2" {
+                    @if before.is_some() {
+                        a href="/ui/admin/audit" class=(LINK_BUTTON) { "Newest" }
+                    }
+                    @if let Some(id) = older {
+                        a href=(format!("/ui/admin/audit?before={id}")) class=(LINK_BUTTON) { "Older" }
+                    }
                 }
             }
         }

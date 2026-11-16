@@ -8,18 +8,22 @@
 //! service layer in `config_api` still decides. A secret value is never
 //! rendered: the forms show whether one is set, and an empty secret input keeps
 //! it.
+//!
+//! The create forms of the list pages sit in a slide-over drawer built on the
+//! native Popover API (no script, which the page CSP would refuse anyway): a
+//! trigger button with `popovertarget`, and a `popover` element with the
+//! `.drawer` classes. The constraint attributes on the inputs (`required`,
+//! `type="url"`, `pattern`, `maxlength`) only mirror what the server already
+//! enforces; the server still validates every field.
 
 use std::fmt::Display;
 
-use maud::{Markup, PreEscaped, html};
+use maud::{Markup, html};
 
 use super::AppState;
-use super::admin_views::{
-    BACK_LINK, BUTTON, BUTTON_DANGER, CARD, CODE, FAINT, HEADING, INPUT, LABEL, LINK, MUTED, TABLE,
-    TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
-};
+use super::admin_views::{render_flash_area, render_layout};
 use super::config_api::{BackendView, ProviderSource, ProviderView, ToolsetView};
-use super::shell::Nav;
+use super::shell::{Nav, icon};
 use crate::config::{
     BackendConfig, GatewaySettings, OidcProviderConfig, ToolsetConfig, TransportType,
 };
@@ -31,13 +35,13 @@ const SETTINGS: &str = "#config-settings";
 /// Empty header and environment rows on the backend forms
 const SECRET_ROWS: usize = 3;
 
-const FORM_COL: &str = "mt-4 flex flex-col items-start gap-3";
-const SUBHEADING: &str = "text-base font-semibold text-slate-900 dark:text-slate-100";
-const DIVIDER: &str = "mt-6 border-t border-slate-200 pt-4 dark:border-slate-800";
-const TEXTAREA: &str = "rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100";
-const BADGE_OK: &str = "rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300";
-const BADGE_OFF: &str = "rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-300";
-const BADGE_INFO: &str = "rounded-full bg-sky-100 px-2 py-0.5 text-xs font-semibold text-sky-800 dark:bg-sky-900/40 dark:text-sky-300";
+/// A stored header or variable: its fixed name, a value that is empty to keep
+/// it and the "remove" checkbox
+const STORED_ROW: &str = "grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto] items-center gap-2";
+/// An empty row for a new header or variable
+const NEW_ROW: &str = "grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-2";
+/// The body of a card that holds a form
+const FORM_BODY: &str = "card-b flex flex-col gap-4";
 
 /// The pages the sub-navigation links to
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +73,9 @@ fn when(at: chrono::DateTime<chrono::Utc>) -> String {
 fn enabled_badge(enabled: bool) -> Markup {
     html! {
         @if enabled {
-            span class=(BADGE_OK) { "enabled" }
+            span class="pill ok" { "enabled" }
         } @else {
-            span class=(BADGE_OFF) { "disabled" }
+            span class="pill" { "disabled" }
         }
     }
 }
@@ -79,9 +83,9 @@ fn enabled_badge(enabled: bool) -> Markup {
 fn set_badge(set: bool) -> Markup {
     html! {
         @if set {
-            span class=(BADGE_OK) { "set" }
+            span class="pill ok" { "set" }
         } @else {
-            span class=(FAINT) { "-" }
+            span class="muted" { "-" }
         }
     }
 }
@@ -99,49 +103,134 @@ fn transport_name(transport: TransportType) -> &'static str {
     }
 }
 
-fn text_field(label: &str, name: &str, value: &str, required: bool) -> Markup {
+// -- drawer -------------------------------------------------------------------
+
+/// The button that opens the drawer `id`
+pub(super) fn drawer_trigger(id: &str, label: &str) -> Markup {
     html! {
-        label class=(LABEL) {
+        button class="btn sm primary" type="button" popovertarget=(id) {
+            (icon("plus"))
             (label)
-            input
-                class=(format!("{INPUT} w-72"))
-                type="text"
-                name=(name)
-                value=(value)
-                required[required]
-                autocomplete="off";
         }
     }
 }
 
-fn number_field(label: &str, name: &str, value: Option<impl Display>) -> Markup {
-    let value = value.map(|value| value.to_string()).unwrap_or_default();
+/// The header of the drawer `id`: its title and the close button
+pub(super) fn drawer_head(id: &str, title: &str) -> Markup {
     html! {
-        label class=(LABEL) {
-            (label)
+        div class="drawer-h" {
+            h2 id=(format!("{id}-title")) { (title) }
+            span class="spacer" {}
+            button
+                class="btn icon ghost"
+                type="button"
+                aria-label="Close"
+                popovertarget=(id)
+                popovertargetaction="hide"
+            {
+                (icon("x"))
+            }
+        }
+    }
+}
+
+/// The footer of the drawer `id`: cancel and the submit button of its form
+pub(super) fn drawer_foot(id: &str, submit: &str) -> Markup {
+    html! {
+        div class="drawer-f" {
+            button class="btn" type="button" popovertarget=(id) popovertargetaction="hide" {
+                "Cancel"
+            }
+            button class="btn primary" type="submit" { (submit) }
+        }
+    }
+}
+
+// -- fields -------------------------------------------------------------------
+
+/// The constraints a text input carries, each one a rule the server enforces
+#[derive(Clone, Copy)]
+struct Rule<'a> {
+    required: bool,
+    /// `type="url"`
+    url: bool,
+    pattern: Option<&'a str>,
+    /// Shown under the field while the browser flags it
+    error: &'a str,
+}
+
+impl Rule<'_> {
+    fn constrained(&self) -> bool {
+        self.required || self.url || self.pattern.is_some()
+    }
+}
+
+const NO_RULE: Rule<'static> = Rule {
+    required: false,
+    url: false,
+    pattern: None,
+    error: "",
+};
+const REQUIRED_RULE: Rule<'static> = Rule {
+    required: true,
+    url: false,
+    pattern: None,
+    error: "Required.",
+};
+
+fn text_field(scope: &str, label: &str, name: &str, value: &str, rule: Rule) -> Markup {
+    let id = format!("{scope}-{name}");
+    html! {
+        div class="field" {
+            label for=(id) { (label) }
             input
-                class=(format!("{INPUT} w-40"))
+                class="input"
+                id=(id)
+                type=(if rule.url { "url" } else { "text" })
+                name=(name)
+                value=(value)
+                required[rule.required]
+                pattern=[rule.pattern]
+                autocomplete="off";
+            @if rule.constrained() {
+                p class="field-error" { (rule.error) }
+            }
+        }
+    }
+}
+
+fn number_field(scope: &str, label: &str, name: &str, value: Option<impl Display>) -> Markup {
+    let value = value.map(|value| value.to_string()).unwrap_or_default();
+    let id = format!("{scope}-{name}");
+    html! {
+        div class="field" {
+            label for=(id) { (label) }
+            input
+                class="input"
+                id=(id)
                 type="number"
                 min="0"
                 name=(name)
                 value=(value)
                 autocomplete="off";
+            p class="field-error" { "Enter a whole number, 0 or more." }
         }
     }
 }
 
-fn lines_field(label: &str, name: &str, items: &[String]) -> Markup {
+fn lines_field(scope: &str, label: &str, name: &str, items: &[String]) -> Markup {
+    let id = format!("{scope}-{name}");
     html! {
-        label class=(LABEL) {
-            (label) " (one per line)"
-            textarea class=(format!("{TEXTAREA} w-72")) name=(name) rows="3" { (lines(items)) }
+        div class="field" {
+            label for=(id) { (label) " (one per line)" }
+            textarea class="input mono" id=(id) name=(name) rows="3" { (lines(items)) }
         }
     }
 }
 
 fn check_field(label: &str, name: &str, checked: bool) -> Markup {
     html! {
-        label class="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200" {
+        label class="flex items-center gap-2" {
             input type="checkbox" name=(name) value="true" checked[checked];
             (label)
         }
@@ -150,19 +239,21 @@ fn check_field(label: &str, name: &str, checked: bool) -> Markup {
 
 /// A password input for a secret whose stored value is never shown: empty keeps
 /// it, and a "clear" checkbox appears while one is stored
-fn secret_field(label: &str, name: &str, clear_name: &str, set: bool) -> Markup {
+fn secret_field(scope: &str, label: &str, name: &str, clear_name: &str, set: bool) -> Markup {
+    let id = format!("{scope}-{name}");
     html! {
-        label class=(LABEL) {
-            (label)
+        div class="field" {
+            label for=(id) { (label) }
             input
-                class=(format!("{INPUT} w-72"))
+                class="input"
+                id=(id)
                 type="password"
                 name=(name)
                 placeholder=(if set { "stored; leave empty to keep it" } else { "" })
                 autocomplete="new-password";
         }
         @if set {
-            label class="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200" {
+            label class="flex items-center gap-2" {
                 input type="checkbox" name=(clear_name) value="true";
                 "Clear the stored value"
             }
@@ -180,38 +271,42 @@ fn secret_rows(prefix: &str, placeholder: &str, existing: &[String]) -> Markup {
     html! {
         div class="flex flex-col gap-2" {
             @for name in existing {
-                div class="flex flex-wrap items-center gap-2" {
+                div class=(STORED_ROW) {
                     input
-                        class=(format!("{INPUT} w-48"))
+                        class="input mono"
                         type="text"
                         name=(name_key)
                         value=(name)
+                        aria-label="Name"
                         readonly;
                     input
-                        class=(format!("{INPUT} w-72"))
+                        class="input"
                         type="password"
                         name=(value_key)
                         placeholder="stored; leave empty to keep it"
+                        aria-label="Value"
                         autocomplete="new-password";
-                    label class="flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300" {
+                    label class="flex items-center gap-1 muted" {
                         input type="checkbox" name=(remove_key) value=(name);
                         "remove"
                     }
                 }
             }
             @for _ in 0..SECRET_ROWS {
-                div class="flex flex-wrap gap-2" {
+                div class=(NEW_ROW) {
                     input
-                        class=(format!("{INPUT} w-48"))
+                        class="input mono"
                         type="text"
                         name=(name_key)
                         placeholder=(placeholder)
+                        aria-label="Name"
                         autocomplete="off";
                     input
-                        class=(format!("{INPUT} w-72"))
+                        class="input"
                         type="password"
                         name=(value_key)
                         placeholder="value"
+                        aria-label="Value"
                         autocomplete="new-password";
                 }
             }
@@ -243,19 +338,16 @@ fn page(
         links.push((Section::Settings, "/ui/admin/config/settings", "Settings"));
     }
     let content = html! {
-        section class=(CARD) {
-            a href="/ui" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to dashboard" }
-            h1 class="mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100" {
-                (title)
+        div class="page-head" {
+            div class="flex min-w-0 flex-1 flex-col gap-1" {
+                h1 { (title) }
+                p { (intro) }
             }
-            p class=(format!("mt-2 {MUTED}")) { (intro) }
-            nav class="mt-4 flex flex-wrap gap-4 text-sm" {
-                @for (section, href, label) in &links {
-                    @if *section == current {
-                        span class="font-semibold text-slate-900 dark:text-slate-100" aria-current="page" { (label) }
-                    } @else {
-                        a href=(href) class=(LINK) { (label) }
-                    }
+        }
+        nav class="tabs" aria-label="Configuration" {
+            @for (section, href, label) in &links {
+                a class="tab" href=(href) aria-current=[(*section == current).then_some("page")] {
+                    (label)
                 }
             }
         }
@@ -263,6 +355,24 @@ fn page(
         (body)
     };
     render_layout(state, user, title, Nav::Config, &content)
+}
+
+/// The link back to a list, above an edit section
+fn back_to(href: &str, label: &str) -> Markup {
+    html! {
+        div {
+            a class="btn sm ghost" href=(href) { (label) }
+        }
+    }
+}
+
+/// The "Saved." note an action answers with
+fn saved_note() -> Markup {
+    html! {
+        div class="card-f" {
+            span class="pill ok" role="status" { (icon("check")) "Saved." }
+        }
+    }
 }
 
 const JSON_ONLY: &str = "Per-user, OAuth and passthrough backends, credential fields and the \
@@ -284,13 +394,14 @@ fn backend_fields(view: Option<&BackendView>, ctx: PageCtx) -> Markup {
     let env_names: &[String] = view
         .map(|view| view.env_names.as_slice())
         .unwrap_or_default();
+    let scope = if view.is_some() { "bk-edit" } else { "bk-new" };
     html! {
         @if view.is_none() {
-            (text_field("Name", "name", "", true))
+            (text_field(scope, "Name", "name", "", REQUIRED_RULE))
         }
-        label class=(LABEL) {
-            "Transport"
-            select class=(INPUT) name="transport" {
+        div class="field" {
+            label for=(format!("{scope}-transport")) { "Transport" }
+            select class="input" id=(format!("{scope}-transport")) name="transport" {
                 @for transport in [TransportType::Http, TransportType::Sse, TransportType::Stdio] {
                     option
                         value=(transport_name(transport))
@@ -303,43 +414,46 @@ fn backend_fields(view: Option<&BackendView>, ctx: PageCtx) -> Markup {
             }
         }
         @if !ctx.allow_stdio {
-            p class=(MUTED) {
-                "stdio backends are off: start the gateway with AXON_ALLOW_STDIO=true."
+            div class="banner" {
+                (icon("triangle-alert"))
+                span { "stdio backends are off: start the gateway with AXON_ALLOW_STDIO=true." }
             }
         }
-        (text_field("URL (http and sse)", "url", config.url.as_deref().unwrap_or_default(), false))
+        (text_field(scope, "URL (http and sse)", "url", config.url.as_deref().unwrap_or_default(), NO_RULE))
         @if view.is_some() {
-            p class=(MUTED) { "Changing it needs the secrets entered again." }
+            p class="hint" { "Changing it needs the secrets entered again." }
         }
-        (text_field("Command (stdio)", "command", config.command.as_deref().unwrap_or_default(), false))
-        (lines_field("Arguments (stdio)", "args", &args))
+        (text_field(scope, "Command (stdio)", "command", config.command.as_deref().unwrap_or_default(), NO_RULE))
+        (lines_field(scope, "Arguments (stdio)", "args", &args))
         (check_field("Enabled", "enabled", config.enabled))
-        (lines_field("Allowed tools (empty exposes all)", "allowed_tools", &config.allowed_tools))
-        div class="flex flex-wrap gap-3" {
-            (number_field("Call timeout (s)", "timeout_secs", Some(config.timeout_secs)))
-            (number_field("Health check every (s, 0 = off)", "health_check_interval_secs", Some(config.health_check_interval_secs)))
-            (number_field("Failures before the breaker opens", "max_consecutive_failures", Some(config.max_consecutive_failures)))
-            (number_field("Breaker cooldown (s)", "circuit_breaker_cooldown_secs", Some(config.circuit_breaker_cooldown_secs)))
-            (number_field("Idle timeout (s, empty = gateway default)", "idle_timeout_secs", config.idle_timeout_secs))
+        (lines_field(scope, "Allowed tools (empty exposes all)", "allowed_tools", &config.allowed_tools))
+        div class="form-grid" {
+            (number_field(scope, "Call timeout (s)", "timeout_secs", Some(config.timeout_secs)))
+            (number_field(scope, "Health check every (s, 0 = off)", "health_check_interval_secs", Some(config.health_check_interval_secs)))
+            (number_field(scope, "Failures before the breaker opens", "max_consecutive_failures", Some(config.max_consecutive_failures)))
+            (number_field(scope, "Breaker cooldown (s)", "circuit_breaker_cooldown_secs", Some(config.circuit_breaker_cooldown_secs)))
+            (number_field(scope, "Idle timeout (s, empty = gateway default)", "idle_timeout_secs", config.idle_timeout_secs))
         }
         (secret_field(
+            scope,
             "Auth token (Bearer)",
             "auth_token",
             "clear_auth_token",
             view.is_some_and(|view| view.auth_token_set),
         ))
-        div {
-            h3 class=(SUBHEADING) { "Headers" }
-            p class=(MUTED) { "Values are secret. Empty rows are ignored." }
-            div class="mt-2" { (secret_rows("header", "Authorization", header_names)) }
+        div class="flex flex-col gap-1" {
+            h3 class="section-t" { "Headers" }
+            p class="hint" { "Values are secret. Empty rows are ignored." }
+            div class="mt-1" { (secret_rows("header", "Authorization", header_names)) }
         }
-        div {
-            h3 class=(SUBHEADING) { "Environment (stdio)" }
-            p class=(MUTED) { "Values are secret. Empty rows are ignored." }
-            div class="mt-2" { (secret_rows("env", "API_KEY", env_names)) }
+        div class="flex flex-col gap-1" {
+            h3 class="section-t" { "Environment (stdio)" }
+            p class="hint" { "Values are secret. Empty rows are ignored." }
+            div class="mt-1" { (secret_rows("env", "API_KEY", env_names)) }
         }
         @if config.oauth.is_some() {
             (secret_field(
+                scope,
                 "OAuth client secret",
                 "oauth_client_secret",
                 "clear_oauth_secret",
@@ -358,16 +472,16 @@ fn backend_row(view: &BackendView) -> Markup {
         .unwrap_or_default();
     html! {
         tr {
-            td class=(TD) {
-                a href=(format!("/ui/admin/config/backends/{}", config.name)) class=(LINK) {
+            td {
+                a class="mono" href=(format!("/ui/admin/config/backends/{}", config.name)) {
                     (config.name)
                 }
             }
-            td class=(TD) { (transport_name(config.transport)) }
-            td class=(TD) { code class=(CODE) { (target) } }
-            td class=(TD) { (enabled_badge(config.enabled)) }
-            td class=(TD) { (set_badge(view.auth_token_set)) }
-            td class=(TD) { (view.header_names.len()) }
+            td { (transport_name(config.transport)) }
+            td { span class="mono" { (target) } }
+            td { (enabled_badge(config.enabled)) }
+            td { (set_badge(view.auth_token_set)) }
+            td { (view.header_names.len()) }
         }
     }
 }
@@ -380,25 +494,32 @@ pub(super) fn render_backends_page(
     backends: &[BackendView],
 ) -> Markup {
     let body = html! {
-        section class=(CARD) {
-            h2 class=(HEADING) { "Backends" }
-            p class=(format!("mt-1 {MUTED}")) { (JSON_ONLY) }
+        section class="card" {
+            div class="card-h" {
+                h2 { "Backends" }
+                span class="muted" { (backends.len()) }
+                span class="spacer" {}
+                @if ctx.can_write {
+                    (drawer_trigger("new-backend", "Add a backend"))
+                }
+            }
+            div class="card-b" { p class="hint" { (JSON_ONLY) } }
             @if backends.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No backends in the database yet." }
+                div class="card-b muted" { "No backends in the database yet." }
             } @else {
-                div class=(TABLE_WRAP) {
-                    table class=(TABLE) {
-                        thead class=(THEAD) {
+                div class="tbl-wrap" {
+                    table class="tbl" {
+                        thead {
                             tr {
-                                th class=(TH) { "Name" }
-                                th class=(TH) { "Transport" }
-                                th class=(TH) { "Target" }
-                                th class=(TH) { "State" }
-                                th class=(TH) { "Auth token" }
-                                th class=(TH) { "Headers" }
+                                th { "Name" }
+                                th { "Transport" }
+                                th { "Target" }
+                                th { "State" }
+                                th { "Auth token" }
+                                th { "Headers" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for view in backends {
                                 (backend_row(view))
                             }
@@ -406,19 +527,17 @@ pub(super) fn render_backends_page(
                     }
                 }
             }
-            @if ctx.can_write {
-                details class=(DIVIDER) {
-                    summary class="cursor-pointer text-sm font-medium text-slate-700 dark:text-slate-200" {
-                        "Add a backend"
-                    }
-                    form
-                        class=(FORM_COL)
-                        hx-post="/ui/actions/admin/config/backends"
-                        hx-swap="none"
-                    {
-                        (backend_fields(None, ctx))
-                        button class=(BUTTON) type="submit" { "Create backend" }
-                    }
+        }
+        @if ctx.can_write {
+            div id="new-backend" popover class="drawer" aria-labelledby="new-backend-title" {
+                (drawer_head("new-backend", "Add a backend"))
+                form
+                    class="drawer-form"
+                    hx-post="/ui/actions/admin/config/backends"
+                    hx-swap="none"
+                {
+                    div class="drawer-b" { (backend_fields(None, ctx)) }
+                    (drawer_foot("new-backend", "Create backend"))
                 }
             }
         }
@@ -439,29 +558,37 @@ pub(super) fn render_backend_edit(view: &BackendView, ctx: PageCtx, saved: bool)
     let config = &view.config;
     let base = format!("/ui/actions/admin/config/backends/{}", config.name);
     html! {
-        section id="config-edit" class=(CARD) {
-            h2 class=(HEADING) { (config.name) }
-            p class=(format!("mt-1 {MUTED}")) {
-                "Created " (when(view.created_at)) ", changed " (when(view.updated_at)) ". "
-                "Credential mode: " code class=(CODE) { (format!("{:?}", config.credential_mode)) } "."
+        section id="config-edit" class="card" {
+            div class="card-h" {
+                h2 class="mono" { (config.name) }
+                (enabled_badge(config.enabled))
             }
-            p class=(format!("mt-1 {MUTED}")) { (JSON_ONLY) }
+            div class="card-b flex flex-col gap-2" {
+                p class="muted" {
+                    "Created " (when(view.created_at)) ", changed " (when(view.updated_at)) ". "
+                    "Credential mode: " span class="mono" { (format!("{:?}", config.credential_mode)) } "."
+                }
+                p class="hint" { (JSON_ONLY) }
+            }
             @if saved {
-                p class="mt-3 text-sm font-medium text-emerald-700 dark:text-emerald-300" { "Saved." }
+                (saved_note())
             }
             @if ctx.can_write {
-                form class=(FORM_COL) hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
-                    (backend_fields(Some(view), ctx))
-                    button class=(BUTTON) type="submit" { "Save backend" }
+                form hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
+                    div class=(FORM_BODY) { (backend_fields(Some(view), ctx)) }
+                    div class="card-f" {
+                        button class="btn primary" type="submit" { "Save backend" }
+                    }
                 }
-                div class=(DIVIDER) {
+                div class="card-f" {
                     button
-                        class=(BUTTON_DANGER)
+                        class="btn danger"
                         type="button"
                         hx-post=(format!("{base}/delete"))
                         hx-swap="none"
                         hx-confirm=(format!("Delete the backend {}?", config.name))
                     {
+                        (icon("trash-2"))
                         "Delete backend"
                     }
                 }
@@ -478,9 +605,7 @@ pub(super) fn render_backend_page(
     view: &BackendView,
 ) -> Markup {
     let body = html! {
-        p class="mb-4 text-sm" {
-            a href="/ui/admin/config/backends" class=(LINK) { "All backends" }
-        }
+        (back_to("/ui/admin/config/backends", "All backends"))
         (render_backend_edit(view, ctx, false))
     };
     page(
@@ -504,13 +629,18 @@ fn toolset_fields(config: Option<&ToolsetConfig>) -> Markup {
         description: None,
     };
     let toolset = config.unwrap_or(&empty);
+    let scope = if config.is_some() {
+        "ts-edit"
+    } else {
+        "ts-new"
+    };
     html! {
         @if config.is_none() {
-            (text_field("Name", "name", "", true))
+            (text_field(scope, "Name", "name", "", REQUIRED_RULE))
         }
-        (text_field("Description", "description", toolset.description.as_deref().unwrap_or_default(), false))
-        (lines_field("Tool patterns (globs such as backend_*)", "tools", &toolset.tools))
-        (lines_field("Backends (empty = all)", "backends", &toolset.backends))
+        (text_field(scope, "Description", "description", toolset.description.as_deref().unwrap_or_default(), NO_RULE))
+        (lines_field(scope, "Tool patterns (globs such as backend_*)", "tools", &toolset.tools))
+        (lines_field(scope, "Backends (empty = all)", "backends", &toolset.backends))
     }
 }
 
@@ -522,54 +652,61 @@ pub(super) fn render_toolsets_page(
     toolsets: &[ToolsetView],
 ) -> Markup {
     let body = html! {
-        section class=(CARD) {
-            h2 class=(HEADING) { "Toolsets" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "A toolset exposes a subset of the tools at " code class=(CODE) { "/mcp/toolset/{name}" } "."
+        section class="card" {
+            div class="card-h" {
+                h2 { "Toolsets" }
+                span class="muted" { (toolsets.len()) }
+                span class="spacer" {}
+                @if ctx.can_write {
+                    (drawer_trigger("new-toolset", "Add a toolset"))
+                }
+            }
+            div class="card-b" {
+                p class="muted" {
+                    "A toolset exposes a subset of the tools at " span class="mono" { "/mcp/toolset/{name}" } "."
+                }
             }
             @if toolsets.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No toolsets in the database yet." }
+                div class="card-b muted" { "No toolsets in the database yet." }
             } @else {
-                div class=(TABLE_WRAP) {
-                    table class=(TABLE) {
-                        thead class=(THEAD) {
+                div class="tbl-wrap" {
+                    table class="tbl" {
+                        thead {
                             tr {
-                                th class=(TH) { "Name" }
-                                th class=(TH) { "Description" }
-                                th class=(TH) { "Tools" }
-                                th class=(TH) { "Backends" }
+                                th { "Name" }
+                                th { "Description" }
+                                th { "Tools" }
+                                th { "Backends" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for view in toolsets {
                                 tr {
-                                    td class=(TD) {
-                                        a href=(format!("/ui/admin/config/toolsets/{}", view.config.name)) class=(LINK) {
+                                    td {
+                                        a class="mono" href=(format!("/ui/admin/config/toolsets/{}", view.config.name)) {
                                             (view.config.name)
                                         }
                                     }
-                                    td class=(TD) { (view.config.description.as_deref().unwrap_or_default()) }
-                                    td class=(TD) { code class=(CODE) { (view.config.tools.join(", ")) } }
-                                    td class=(TD) { (view.config.backends.join(", ")) }
+                                    td { (view.config.description.as_deref().unwrap_or_default()) }
+                                    td { span class="mono" { (view.config.tools.join(", ")) } }
+                                    td { (view.config.backends.join(", ")) }
                                 }
                             }
                         }
                     }
                 }
             }
-            @if ctx.can_write {
-                details class=(DIVIDER) {
-                    summary class="cursor-pointer text-sm font-medium text-slate-700 dark:text-slate-200" {
-                        "Add a toolset"
-                    }
-                    form
-                        class=(FORM_COL)
-                        hx-post="/ui/actions/admin/config/toolsets"
-                        hx-swap="none"
-                    {
-                        (toolset_fields(None))
-                        button class=(BUTTON) type="submit" { "Create toolset" }
-                    }
+        }
+        @if ctx.can_write {
+            div id="new-toolset" popover class="drawer" aria-labelledby="new-toolset-title" {
+                (drawer_head("new-toolset", "Add a toolset"))
+                form
+                    class="drawer-form"
+                    hx-post="/ui/actions/admin/config/toolsets"
+                    hx-swap="none"
+                {
+                    div class="drawer-b" { (toolset_fields(None)) }
+                    (drawer_foot("new-toolset", "Create toolset"))
                 }
             }
         }
@@ -589,27 +726,34 @@ pub(super) fn render_toolsets_page(
 pub(super) fn render_toolset_edit(view: &ToolsetView, ctx: PageCtx, saved: bool) -> Markup {
     let base = format!("/ui/actions/admin/config/toolsets/{}", view.config.name);
     html! {
-        section id="config-edit" class=(CARD) {
-            h2 class=(HEADING) { (view.config.name) }
-            p class=(format!("mt-1 {MUTED}")) {
-                "Created " (when(view.created_at)) ", changed " (when(view.updated_at)) "."
+        section id="config-edit" class="card" {
+            div class="card-h" {
+                h2 class="mono" { (view.config.name) }
+            }
+            div class="card-b" {
+                p class="muted" {
+                    "Created " (when(view.created_at)) ", changed " (when(view.updated_at)) "."
+                }
             }
             @if saved {
-                p class="mt-3 text-sm font-medium text-emerald-700 dark:text-emerald-300" { "Saved." }
+                (saved_note())
             }
             @if ctx.can_write {
-                form class=(FORM_COL) hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
-                    (toolset_fields(Some(&view.config)))
-                    button class=(BUTTON) type="submit" { "Save toolset" }
+                form hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
+                    div class=(FORM_BODY) { (toolset_fields(Some(&view.config))) }
+                    div class="card-f" {
+                        button class="btn primary" type="submit" { "Save toolset" }
+                    }
                 }
-                div class=(DIVIDER) {
+                div class="card-f" {
                     button
-                        class=(BUTTON_DANGER)
+                        class="btn danger"
                         type="button"
                         hx-post=(format!("{base}/delete"))
                         hx-swap="none"
                         hx-confirm=(format!("Delete the toolset {}?", view.config.name))
                     {
+                        (icon("trash-2"))
                         "Delete toolset"
                     }
                 }
@@ -626,9 +770,7 @@ pub(super) fn render_toolset_page(
     view: &ToolsetView,
 ) -> Markup {
     let body = html! {
-        p class="mb-4 text-sm" {
-            a href="/ui/admin/config/toolsets" class=(LINK) { "All toolsets" }
-        }
+        (back_to("/ui/admin/config/toolsets", "All toolsets"))
         (render_toolset_edit(view, ctx, false))
     };
     page(
@@ -644,41 +786,62 @@ pub(super) fn render_toolset_page(
 
 // -- OIDC providers -----------------------------------------------------------
 
+/// `[a-z0-9-]+`, the rule `Config::validate` holds a provider id to
+const PROVIDER_ID: Rule<'static> = Rule {
+    required: true,
+    url: false,
+    pattern: Some(r"[a-z0-9\-]+"),
+    error: "Lowercase letters, digits and dashes only.",
+};
+/// The issuer must parse as a URL
+const ISSUER: Rule<'static> = Rule {
+    required: true,
+    url: true,
+    pattern: None,
+    error: "Enter the issuer as a full URL, such as https://idp.example.com.",
+};
+
 fn provider_fields(view: Option<&ProviderView>) -> Markup {
     let defaults = OidcProviderConfig::default();
     let config = view.map_or(&defaults, |view| &view.config);
+    let scope = if view.is_some() {
+        "oidc-edit"
+    } else {
+        "oidc-new"
+    };
     html! {
         @if view.is_none() {
-            (text_field("Id (a-z, 0-9, -)", "id", "", true))
+            (text_field(scope, "Id (a-z, 0-9, -)", "id", "", PROVIDER_ID))
         }
-        (text_field("Button label", "display_name", config.display_name.as_deref().unwrap_or_default(), false))
-        (text_field("Issuer URL", "issuer", &config.issuer, true))
-        (text_field("Client ID", "client_id", &config.client_id, true))
+        (text_field(scope, "Button label", "display_name", config.display_name.as_deref().unwrap_or_default(), NO_RULE))
+        (text_field(scope, "Issuer URL", "issuer", &config.issuer, ISSUER))
+        (text_field(scope, "Client ID", "client_id", &config.client_id, REQUIRED_RULE))
         (secret_field(
+            scope,
             "Client secret (empty for a public client)",
             "client_secret",
             "clear_client_secret",
             view.is_some_and(|view| view.client_secret_set),
         ))
-        (lines_field("Scopes", "scopes", &config.scopes))
-        (text_field("Groups claim", "groups_claim", &config.groups_claim, false))
-        (lines_field("Allowed email domains (empty = any)", "allowed_email_domains", &config.allowed_email_domains))
-        (lines_field("Admin groups", "admin_groups", &config.admin_groups))
+        (lines_field(scope, "Scopes", "scopes", &config.scopes))
+        (text_field(scope, "Groups claim", "groups_claim", &config.groups_claim, NO_RULE))
+        (lines_field(scope, "Allowed email domains (empty = any)", "allowed_email_domains", &config.allowed_email_domains))
+        (lines_field(scope, "Admin groups", "admin_groups", &config.admin_groups))
         (check_field("Accept access tokens this provider issued as bearer tokens", "accept_access_tokens", config.accept_access_tokens))
-        (text_field("Access token audience (default: client ID)", "access_token_audience", config.access_token_audience.as_deref().unwrap_or_default(), false))
+        (text_field(scope, "Access token audience (default: client ID)", "access_token_audience", config.access_token_audience.as_deref().unwrap_or_default(), NO_RULE))
         (check_field("Fetch groups from Microsoft Graph on a groups overage", "graph_overage", config.graph_overage))
-        (text_field("Graph URL (default: graph.microsoft.com)", "graph_url", config.graph_url.as_deref().unwrap_or_default(), false))
-        (text_field("SCIM match claim (default: sub)", "scim_match_claim", config.scim_match_claim.as_deref().unwrap_or_default(), false))
-        (number_field("Position (empty: last on create, unchanged on save)", "position", view.and_then(|view| view.position)))
+        (text_field(scope, "Graph URL (default: graph.microsoft.com)", "graph_url", config.graph_url.as_deref().unwrap_or_default(), NO_RULE))
+        (text_field(scope, "SCIM match claim (default: sub)", "scim_match_claim", config.scim_match_claim.as_deref().unwrap_or_default(), NO_RULE))
+        (number_field(scope, "Position (empty: last on create, unchanged on save)", "position", view.and_then(|view| view.position)))
     }
 }
 
 fn source_badge(source: ProviderSource) -> Markup {
     html! {
         @if source == ProviderSource::Env {
-            span class=(BADGE_INFO) { "env" }
+            span class="pill accent" { "env" }
         } @else {
-            span class=(BADGE_OFF) { "database" }
+            span class="pill" { "database" }
         }
     }
 }
@@ -691,59 +854,66 @@ pub(super) fn render_providers_page(
     providers: &[ProviderView],
 ) -> Markup {
     let body = html! {
-        section class=(CARD) {
-            h2 class=(HEADING) { "OIDC providers" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "The login buttons, in this order. The provider set by the AXON_OIDC_* environment is read-only. "
-                "Provider changes apply on every replica within moments."
+        section class="card" {
+            div class="card-h" {
+                h2 { "OIDC providers" }
+                span class="muted" { (providers.len()) }
+                span class="spacer" {}
+                @if ctx.can_write {
+                    (drawer_trigger("new-provider", "Add a provider"))
+                }
+            }
+            div class="card-b" {
+                p class="muted" {
+                    "The login buttons, in this order. The provider set by the AXON_OIDC_* environment is read-only. "
+                    "Provider changes apply on every replica within moments."
+                }
             }
             @if providers.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) {
+                div class="card-b muted" {
                     "No providers: the break-glass link (axon-gateway admin login-link) is the way in."
                 }
             } @else {
-                div class=(TABLE_WRAP) {
-                    table class=(TABLE) {
-                        thead class=(THEAD) {
+                div class="tbl-wrap" {
+                    table class="tbl" {
+                        thead {
                             tr {
-                                th class=(TH) { "Id" }
-                                th class=(TH) { "Source" }
-                                th class=(TH) { "Issuer" }
-                                th class=(TH) { "Client ID" }
-                                th class=(TH) { "Secret" }
+                                th { "Id" }
+                                th { "Source" }
+                                th { "Issuer" }
+                                th { "Client ID" }
+                                th { "Secret" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for view in providers {
                                 tr {
-                                    td class=(TD) {
-                                        a href=(format!("/ui/admin/config/oidc-providers/{}", view.config.id)) class=(LINK) {
+                                    td {
+                                        a class="mono" href=(format!("/ui/admin/config/oidc-providers/{}", view.config.id)) {
                                             (view.config.id)
                                         }
                                     }
-                                    td class=(TD) { (source_badge(view.source)) }
-                                    td class=(TD) { code class=(CODE) { (view.config.issuer) } }
-                                    td class=(TD) { code class=(CODE) { (view.config.client_id) } }
-                                    td class=(TD) { (set_badge(view.client_secret_set)) }
+                                    td { (source_badge(view.source)) }
+                                    td { span class="mono" { (view.config.issuer) } }
+                                    td { span class="mono" { (view.config.client_id) } }
+                                    td { (set_badge(view.client_secret_set)) }
                                 }
                             }
                         }
                     }
                 }
             }
-            @if ctx.can_write {
-                details class=(DIVIDER) {
-                    summary class="cursor-pointer text-sm font-medium text-slate-700 dark:text-slate-200" {
-                        "Add a provider"
-                    }
-                    form
-                        class=(FORM_COL)
-                        hx-post="/ui/actions/admin/config/oidc-providers"
-                        hx-swap="none"
-                    {
-                        (provider_fields(None))
-                        button class=(BUTTON) type="submit" { "Create provider" }
-                    }
+        }
+        @if ctx.can_write {
+            div id="new-provider" popover class="drawer" aria-labelledby="new-provider-title" {
+                (drawer_head("new-provider", "Add a provider"))
+                form
+                    class="drawer-form"
+                    hx-post="/ui/actions/admin/config/oidc-providers"
+                    hx-swap="none"
+                {
+                    div class="drawer-b" { (provider_fields(None)) }
+                    (drawer_foot("new-provider", "Create provider"))
                 }
             }
         }
@@ -765,42 +935,50 @@ pub(super) fn render_provider_edit(view: &ProviderView, ctx: PageCtx, saved: boo
     let config = &view.config;
     let base = format!("/ui/actions/admin/config/oidc-providers/{}", config.id);
     html! {
-        section id="config-edit" class=(CARD) {
-            h2 class=(HEADING) { (config.id) " " (source_badge(view.source)) }
+        section id="config-edit" class="card" {
+            div class="card-h" {
+                h2 class="mono" { (config.id) }
+                (source_badge(view.source))
+            }
             @if view.source == ProviderSource::Env {
-                p class=(format!("mt-1 {MUTED}")) {
-                    "This provider is set by the environment (AXON_OIDC_*) and cannot be changed here."
-                }
-                dl class="mt-4 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm" {
-                    dt class=(FAINT) { "Issuer" }
-                    dd { code class=(CODE) { (config.issuer) } }
-                    dt class=(FAINT) { "Client ID" }
-                    dd { code class=(CODE) { (config.client_id) } }
-                    dt class=(FAINT) { "Client secret" }
-                    dd { (set_badge(view.client_secret_set)) }
-                    dt class=(FAINT) { "Admin groups" }
-                    dd { (config.admin_groups.join(", ")) }
+                div class="card-b flex flex-col gap-3" {
+                    p class="muted" {
+                        "This provider is set by the environment (AXON_OIDC_*) and cannot be changed here."
+                    }
+                    dl class="kv" {
+                        dt { "Issuer" }
+                        dd { span class="mono" { (config.issuer) } }
+                        dt { "Client ID" }
+                        dd { span class="mono" { (config.client_id) } }
+                        dt { "Client secret" }
+                        dd { (set_badge(view.client_secret_set)) }
+                        dt { "Admin groups" }
+                        dd { (config.admin_groups.join(", ")) }
+                    }
                 }
             } @else {
                 @if let Some(at) = view.updated_at {
-                    p class=(format!("mt-1 {MUTED}")) { "Changed " (when(at)) "." }
+                    div class="card-b" { p class="muted" { "Changed " (when(at)) "." } }
                 }
                 @if saved {
-                    p class="mt-3 text-sm font-medium text-emerald-700 dark:text-emerald-300" { "Saved." }
+                    (saved_note())
                 }
                 @if ctx.can_write {
-                    form class=(FORM_COL) hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
-                        (provider_fields(Some(view)))
-                        button class=(BUTTON) type="submit" { "Save provider" }
+                    form hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
+                        div class=(FORM_BODY) { (provider_fields(Some(view))) }
+                        div class="card-f" {
+                            button class="btn primary" type="submit" { "Save provider" }
+                        }
                     }
-                    div class=(DIVIDER) {
+                    div class="card-f" {
                         button
-                            class=(BUTTON_DANGER)
+                            class="btn danger"
                             type="button"
                             hx-post=(format!("{base}/delete"))
                             hx-swap="none"
                             hx-confirm=(format!("Delete the provider {}? People who log in with it can no longer do so.", config.id))
                         {
+                            (icon("trash-2"))
                             "Delete provider"
                         }
                     }
@@ -818,9 +996,7 @@ pub(super) fn render_provider_page(
     view: &ProviderView,
 ) -> Markup {
     let body = html! {
-        p class="mb-4 text-sm" {
-            a href="/ui/admin/config/oidc-providers" class=(LINK) { "All providers" }
-        }
+        (back_to("/ui/admin/config/oidc-providers", "All providers"))
         (render_provider_edit(view, ctx, false))
     };
     page(
@@ -843,37 +1019,52 @@ pub(super) fn render_settings_section(
     saved: bool,
 ) -> Markup {
     let personal = &settings.personal_backends;
+    let scope = "settings";
     html! {
-        section id="config-settings" class=(CARD) {
-            h2 class=(HEADING) { "Gateway settings" }
-            p class=(format!("mt-1 {MUTED}")) {
-                "Personal backend settings apply after a restart; the others on every replica within moments."
+        section id="config-settings" class="card" {
+            div class="card-h" {
+                h2 { "Gateway settings" }
+            }
+            div class="card-b" {
+                p class="muted" {
+                    "Personal backend settings apply after a restart; the others on every replica within moments."
+                }
             }
             @if saved {
-                p class="mt-3 text-sm font-medium text-emerald-700 dark:text-emerald-300" { "Saved." }
+                (saved_note())
             }
             @if ctx.can_write {
-                form class=(FORM_COL) hx-post="/ui/actions/admin/config/settings" hx-target=(SETTINGS) hx-swap="outerHTML" {
-                    (number_field("Rate limit (requests per minute per token, 0 = unlimited)", "rate_limit_per_minute", Some(settings.rate_limit_per_minute)))
-                    (number_field("Idle timeout (s, 0 = always connected)", "idle_timeout_secs", Some(settings.idle_timeout_secs)))
-                    (lines_field("Allowed hosts (besides loopback and the base URL)", "allowed_hosts", &settings.allowed_hosts))
-                    h3 class=(SUBHEADING) { "Personal backends" }
-                    (check_field("Let people add personal backends and store catalog credentials", "personal_enabled", personal.enabled))
-                    (number_field("Max personal backends per user", "personal_max_per_user", Some(personal.max_per_user)))
-                    (number_field("Max tool calls per minute per user (0 = unlimited)", "personal_max_calls_per_minute", Some(personal.max_calls_per_minute)))
-                    (number_field("Max open connections per replica", "personal_max_instances", Some(personal.max_instances)))
-                    (lines_field("Egress allow (hosts or CIDRs, empty = any public host)", "personal_egress_allow", &personal.egress_allow))
-                    (lines_field("Egress deny (hosts or CIDRs)", "personal_egress_deny", &personal.egress_deny))
-                    button class=(BUTTON) type="submit" { "Save settings" }
+                form hx-post="/ui/actions/admin/config/settings" hx-target=(SETTINGS) hx-swap="outerHTML" {
+                    div class=(FORM_BODY) {
+                        div class="form-grid" {
+                            (number_field(scope, "Rate limit (requests per minute per token, 0 = unlimited)", "rate_limit_per_minute", Some(settings.rate_limit_per_minute)))
+                            (number_field(scope, "Idle timeout (s, 0 = always connected)", "idle_timeout_secs", Some(settings.idle_timeout_secs)))
+                        }
+                        (lines_field(scope, "Allowed hosts (besides loopback and the base URL)", "allowed_hosts", &settings.allowed_hosts))
+                        h3 class="section-t" { "Personal backends" }
+                        (check_field("Let people add personal backends and store catalog credentials", "personal_enabled", personal.enabled))
+                        div class="form-grid" {
+                            (number_field(scope, "Max personal backends per user", "personal_max_per_user", Some(personal.max_per_user)))
+                            (number_field(scope, "Max tool calls per minute per user (0 = unlimited)", "personal_max_calls_per_minute", Some(personal.max_calls_per_minute)))
+                            (number_field(scope, "Max open connections per replica", "personal_max_instances", Some(personal.max_instances)))
+                        }
+                        (lines_field(scope, "Egress allow (hosts or CIDRs, empty = any public host)", "personal_egress_allow", &personal.egress_allow))
+                        (lines_field(scope, "Egress deny (hosts or CIDRs)", "personal_egress_deny", &personal.egress_deny))
+                    }
+                    div class="card-f" {
+                        button class="btn primary" type="submit" { "Save settings" }
+                    }
                 }
             } @else {
-                dl class="mt-4 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm" {
-                    dt class=(FAINT) { "Rate limit" }
-                    dd { (settings.rate_limit_per_minute) }
-                    dt class=(FAINT) { "Idle timeout" }
-                    dd { (settings.idle_timeout_secs) " s" }
-                    dt class=(FAINT) { "Allowed hosts" }
-                    dd { (settings.allowed_hosts.join(", ")) }
+                div class="card-b" {
+                    dl class="kv" {
+                        dt { "Rate limit" }
+                        dd { (settings.rate_limit_per_minute) }
+                        dt { "Idle timeout" }
+                        dd { (settings.idle_timeout_secs) " s" }
+                        dt { "Allowed hosts" }
+                        dd { (settings.allowed_hosts.join(", ")) }
+                    }
                 }
             }
         }

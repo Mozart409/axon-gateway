@@ -9,23 +9,20 @@
 
 use std::fmt::Write as _;
 
-use maud::{Markup, PreEscaped, html};
+use maud::{Markup, html};
 use serde_json::Value;
 
 use super::AppState;
 use super::admin_views::{
-    BACK_LINK, BUTTON, BUTTON_DANGER, CARD, CODE, FAINT, FORM_ROW, HEADING, INPUT, LABEL, LINK,
-    MUTED, TABLE, TABLE_WRAP, TBODY, TD, TH, THEAD, render_flash_area, render_layout,
+    BUTTON, BUTTON_DANGER, CODE, DESC, EMPTY, FORM_FOOT, INPUT, LABEL, LINK, LINK_BUTTON, TABLE,
+    TD, render_flash_area, render_layout,
 };
-use super::shell::Nav;
+use super::shell::{Nav, icon};
 use crate::audit::{AuditSettings, CaptureMode, CaptureRule, StoredArguments, ToolCallRecord};
 use crate::audit_admin::MAX_RETENTION_DAYS;
 use crate::store::SessionUser;
 
-const H1: &str = "mt-4 text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100";
-const WARNING: &str = "mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300";
-const BADGE: &str = "rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
-const ARGUMENTS: &str = "mt-2 overflow-x-auto rounded-md bg-white px-3 py-2 font-mono text-sm text-slate-900 dark:bg-slate-900 dark:text-slate-100";
+const BADGE: &str = "pill warn";
 
 /// What `/ui/admin/tool-calls` shows: a page of calls and the filter values
 /// that produced it.
@@ -97,9 +94,9 @@ fn calls_href(page: &CallsPage, before: Option<i64>) -> String {
 fn outcome_badge(outcome: &str) -> Markup {
     html! {
         @match outcome {
-            "ok" => { "ok" }
-            "tool_error" => { span class="text-amber-700 dark:text-amber-400" { "tool error" } }
-            _ => { span class="text-red-700 dark:text-red-300" { (outcome) } }
+            "ok" => { span class="pill ok" { "ok" } }
+            "tool_error" => { span class="pill warn" { "tool error" } }
+            _ => { span class="pill err" { (outcome) } }
         }
     }
 }
@@ -121,14 +118,14 @@ fn mode_label(mode: CaptureMode) -> Markup {
 /// The call list (`GET /ui/admin/tool-calls`).
 pub(super) fn render_calls_page(state: &AppState, user: &SessionUser, page: &CallsPage) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class=(H1) { "Tool calls" }
-            p class=(format!("mt-2 {MUTED}")) {
+        div class="page-head" {
+            p {
                 "Every call through the gateway, newest first. Arguments are stored only as "
                 "the capture rules say."
             }
-            form class=(FORM_ROW) method="get" action="/ui/admin/tool-calls" {
+        }
+        section class="card" {
+            form class="card-b flex flex-wrap items-end gap-3" method="get" action="/ui/admin/tool-calls" {
                 label class=(LABEL) {
                     "User id"
                     input class=(INPUT) type="text" name="user" value=(page.user);
@@ -153,40 +150,39 @@ pub(super) fn render_calls_page(state: &AppState, user: &SessionUser, page: &Cal
             }
         }
         (render_flash_area(false))
-        section class=(CARD) {
+        section class="card" {
+            div class="card-h" { h2 { "Tool calls" } }
             @if page.calls.is_empty() {
-                p class=(format!("text-sm {FAINT}")) { "No calls." }
+                p class=(EMPTY) { "No calls." }
             } @else {
-                div class=(TABLE_WRAP) {
+                div class="tbl-wrap" {
                     table class=(TABLE) {
-                        thead class=(THEAD) {
+                        thead {
                             tr {
-                                th class=(TH) { "Time" }
-                                th class=(TH) { "Principal" }
-                                th class=(TH) { "Backend" }
-                                th class=(TH) { "Tool" }
-                                th class=(TH) { "Outcome" }
-                                th class=(TH) { "Duration" }
-                                th class=(TH) { "Arguments" }
-                                th class=(TH) { "" }
+                                th { "Time" }
+                                th { "Principal" }
+                                th { "Backend" }
+                                th { "Tool" }
+                                th { "Outcome" }
+                                th { "Duration" }
+                                th { "Arguments" }
+                                th { "" }
                             }
                         }
-                        tbody class=(TBODY) {
+                        tbody {
                             @for call in &page.calls {
                                 tr {
-                                    td class=(format!("{TD} whitespace-nowrap")) { (time(call)) }
+                                    td class=(TD) { (time(call)) }
                                     td class=(TD) { (call.principal_label) }
                                     td class=(TD) { code class=(CODE) { (call.backend) } }
                                     td class=(TD) { code class=(CODE) { (call.tool) } }
                                     td class=(TD) { (outcome_badge(&call.outcome)) }
-                                    td class=(format!("{TD} whitespace-nowrap")) {
-                                        (call.duration_ms) " ms"
-                                    }
+                                    td class=(TD) { (call.duration_ms) " ms" }
                                     td class=(TD) {
                                         @if let Some(capture) = &call.arguments_capture {
                                             (capture)
                                         } @else {
-                                            span class=(FAINT) { "-" }
+                                            span class="text-muted" { "-" }
                                         }
                                     }
                                     td class=(TD) {
@@ -200,12 +196,14 @@ pub(super) fn render_calls_page(state: &AppState, user: &SessionUser, page: &Cal
                     }
                 }
             }
-            div class="mt-4 flex gap-4 text-sm" {
-                @if page.before.is_some() {
-                    a href=(calls_href(page, None)) class=(LINK) { "Newest" }
-                }
-                @if let Some(id) = page.older {
-                    a href=(calls_href(page, Some(id))) class=(LINK) { "Older" }
+            @if page.before.is_some() || page.older.is_some() {
+                div class="card-f gap-2" {
+                    @if page.before.is_some() {
+                        a href=(calls_href(page, None)) class=(LINK_BUTTON) { "Newest" }
+                    }
+                    @if let Some(id) = page.older {
+                        a href=(calls_href(page, Some(id))) class=(LINK_BUTTON) { "Older" }
+                    }
                 }
             }
         }
@@ -215,10 +213,8 @@ pub(super) fn render_calls_page(state: &AppState, user: &SessionUser, page: &Cal
 
 fn detail_row(label: &str, value: &Markup) -> Markup {
     html! {
-        tr {
-            th class=(TH) { (label) }
-            td class=(format!("{TD} break-all")) { (value) }
-        }
+        dt { (label) }
+        dd { (value) }
     }
 }
 
@@ -227,7 +223,7 @@ fn optional(value: Option<&str>) -> Markup {
         @if let Some(value) = value {
             (value)
         } @else {
-            span class=(FAINT) { "-" }
+            span class="text-muted" { "-" }
         }
     }
 }
@@ -240,28 +236,28 @@ pub(super) fn render_call_page(
 ) -> Markup {
     let call = &detail.call;
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin/tool-calls" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to tool calls" }
-            h1 class=(H1) { "Tool call " (call.id) }
-            div class=(TABLE_WRAP) {
-                table class=(TABLE) {
-                    tbody class=(TBODY) {
-                        (detail_row("Time", &html! { (time(call)) }))
-                        (detail_row("Principal", &html! { (call.principal_label) }))
-                        (detail_row("User id", &optional(call.user_id.map(|id| id.to_string()).as_deref())))
-                        (detail_row("Token id", &optional(call.token_id.map(|id| id.to_string()).as_deref())))
-                        (detail_row("Auth method", &html! { (call.auth_method) }))
-                        (detail_row("Backend", &html! { code class=(CODE) { (call.backend) } }))
-                        (detail_row("Tool", &html! { code class=(CODE) { (call.tool) } }))
-                        (detail_row("Outcome", &outcome_badge(&call.outcome)))
-                        (detail_row("Error code", &optional(call.error_code.map(|code| code.to_string()).as_deref())))
-                        (detail_row("Error message", &optional(call.error_message.as_deref())))
-                        (detail_row("Duration", &html! { (call.duration_ms) " ms" }))
-                        (detail_row("Trace id", &optional(call.trace_id.as_deref())))
-                        (detail_row("Client IP", &optional(call.client_ip.as_deref())))
-                        (detail_row("User agent", &optional(call.user_agent.as_deref())))
-                    }
-                }
+        div class="page-head" {
+            p { "Tool call " (call.id) }
+            span class="spacer" {}
+            a href="/ui/admin/tool-calls" class=(LINK_BUTTON) { "Back to tool calls" }
+        }
+        section class="card" {
+            div class="card-h" { h2 { "Details" } }
+            dl class="kv card-b" {
+                (detail_row("Time", &html! { (time(call)) }))
+                (detail_row("Principal", &html! { (call.principal_label) }))
+                (detail_row("User id", &optional(call.user_id.map(|id| id.to_string()).as_deref())))
+                (detail_row("Token id", &optional(call.token_id.map(|id| id.to_string()).as_deref())))
+                (detail_row("Auth method", &html! { (call.auth_method) }))
+                (detail_row("Backend", &html! { code class=(CODE) { (call.backend) } }))
+                (detail_row("Tool", &html! { code class=(CODE) { (call.tool) } }))
+                (detail_row("Outcome", &outcome_badge(&call.outcome)))
+                (detail_row("Error code", &optional(call.error_code.map(|code| code.to_string()).as_deref())))
+                (detail_row("Error message", &optional(call.error_message.as_deref())))
+                (detail_row("Duration", &html! { (call.duration_ms) " ms" }))
+                (detail_row("Trace id", &optional(call.trace_id.as_deref())))
+                (detail_row("Client IP", &optional(call.client_ip.as_deref())))
+                (detail_row("User agent", &optional(call.user_agent.as_deref())))
             }
         }
         (render_flash_area(false))
@@ -275,23 +271,25 @@ pub(super) fn render_call_page(
 /// The arguments block before the read: a button, or why there is nothing.
 pub(super) fn render_arguments_placeholder(call: &ToolCallRecord) -> Markup {
     html! {
-        section id="call-arguments" class=(CARD) {
-            h2 class=(HEADING) { "Arguments" }
+        section id="call-arguments" class="card" {
+            div class="card-h" { h2 { "Arguments" } }
             @if let Some(capture) = &call.arguments_capture {
-                p class=(format!("mt-1 {MUTED}")) {
+                p class=(EMPTY) {
                     "Stored " (capture) ". Showing them is recorded in the audit log."
                 }
-                button
-                    class=(format!("mt-4 {BUTTON}"))
-                    type="button"
-                    hx-post=(format!("/ui/actions/admin/tool-calls/{}/arguments", call.id))
-                    hx-target="#call-arguments"
-                    hx-swap="outerHTML"
-                {
-                    "Show arguments"
+                div class="card-f" {
+                    button
+                        class=(BUTTON)
+                        type="button"
+                        hx-post=(format!("/ui/actions/admin/tool-calls/{}/arguments", call.id))
+                        hx-target="#call-arguments"
+                        hx-swap="outerHTML"
+                    {
+                        "Show arguments"
+                    }
                 }
             } @else {
-                p class=(format!("mt-1 {MUTED}")) {
+                p class=(EMPTY) {
                     "No arguments are stored for this call: they were not captured, or are past their retention."
                 }
             }
@@ -304,12 +302,14 @@ pub(super) fn render_arguments_block(stored: &StoredArguments) -> Markup {
     let text = serde_json::to_string_pretty(&stored.arguments)
         .unwrap_or_else(|_| Value::to_string(&stored.arguments));
     html! {
-        section id="call-arguments" class=(CARD) {
-            h2 class=(HEADING) { "Arguments" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="call-arguments" class="card" {
+            div class="card-h" { h2 { "Arguments" } }
+            p class=(DESC) {
                 "Stored " (stored.capture) ". This read was recorded in the audit log."
             }
-            pre class=(ARGUMENTS) { (text) }
+            div class="card-b" {
+                pre class="code" { (text) }
+            }
         }
     }
 }
@@ -321,10 +321,8 @@ pub(super) fn render_settings_page(
     page: &SettingsPage,
 ) -> Markup {
     let content = html! {
-        section class=(CARD) {
-            a href="/ui/admin" class=(BACK_LINK) { (PreEscaped("&larr;")) " Back to admin" }
-            h1 class=(H1) { "Audit settings" }
-            p class=(format!("mt-2 {MUTED}")) {
+        div class="page-head" {
+            p {
                 "What the tool call audit keeps, and for how long. "
                 a href="/ui/admin/tool-calls" class=(LINK) { "Tool calls" }
             }
@@ -340,15 +338,15 @@ pub(super) fn render_settings_page(
 pub(super) fn render_retention_section(page: &SettingsPage, oob: bool) -> Markup {
     let settings = &page.settings;
     html! {
-        section id="audit-settings" class=(CARD) hx-swap-oob=[oob.then_some("true")] {
-            h2 class=(HEADING) { "Retention" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="audit-settings" class="card" hx-swap-oob=[oob.then_some("true")] {
+            div class="card-h" { h2 { "Retention" } }
+            p class=(EMPTY) {
                 "Arguments are kept for " (settings.arguments_retention_days) " days, call metadata for "
                 (settings.metadata_retention_days) " days. Older rows are deleted hourly."
             }
             @if page.manage {
                 form
-                    class=(FORM_ROW)
+                    class=(FORM_FOOT)
                     hx-post="/ui/actions/admin/audit-settings"
                     hx-target="#audit-settings"
                     hx-swap="outerHTML"
@@ -375,20 +373,20 @@ pub(super) fn render_retention_section(page: &SettingsPage, oob: bool) -> Markup
 /// The table of capture rules, with delete buttons for those who may manage.
 fn rules_table(page: &SettingsPage) -> Markup {
     html! {
-        div class=(TABLE_WRAP) {
+        div class="tbl-wrap mt-3 border-t border-border" {
             table class=(TABLE) {
-                thead class=(THEAD) {
+                thead {
                     tr {
-                        th class=(TH) { "Backend" }
-                        th class=(TH) { "Tool pattern" }
-                        th class=(TH) { "Capture" }
-                        th class=(TH) { "Dropped keys" }
+                        th { "Backend" }
+                        th { "Tool pattern" }
+                        th { "Capture" }
+                        th { "Dropped keys" }
                         @if page.manage {
-                            th class=(TH) { "Actions" }
+                            th { "Actions" }
                         }
                     }
                 }
-                tbody class=(TBODY) {
+                tbody {
                     @for rule in &page.rules {
                         tr {
                             td class=(TD) { code class=(CODE) { (rule.backend) } }
@@ -396,7 +394,7 @@ fn rules_table(page: &SettingsPage) -> Markup {
                             td class=(TD) { (mode_label(rule.mode)) }
                             td class=(TD) {
                                 @if rule.drop_keys.is_empty() {
-                                    span class=(FAINT) { "-" }
+                                    span class="text-muted" { "-" }
                                 } @else {
                                     code class=(CODE) { (rule.drop_keys.join(", ")) }
                                 }
@@ -426,31 +424,34 @@ fn rules_table(page: &SettingsPage) -> Markup {
 /// The capture rules and the create form, the swap target of the rule actions.
 pub(super) fn render_rules_section(page: &SettingsPage, oob: bool) -> Markup {
     html! {
-        section id="audit-rules" class=(CARD) hx-swap-oob=[oob.then_some("true")] {
-            h2 class=(HEADING) { "Capture rules" }
-            p class=(format!("mt-1 {MUTED}")) {
+        section id="audit-rules" class="card" hx-swap-oob=[oob.then_some("true")] {
+            div class="card-h" { h2 { "Capture rules" } }
+            p class=(DESC) {
                 "Without a rule, a tool annotated read-only is not captured and every other "
                 "tool is captured redacted: values under keys such as password, secret or "
                 "token are masked and long strings are cut. The most specific rule wins: an "
                 "exact backend over *, an exact tool name over a prefix, then the longer "
                 "pattern, then the newer rule."
             }
-            div class=(WARNING) {
-                strong { "Full capture needs a review first. " }
-                "It stores arguments exactly as sent, which are personal data (GDPR: purpose "
-                "limitation, retention, data-subject requests). Logging what employees do "
-                "with their tools is also subject to co-determination of the works council "
-                "(section 87(1) no. 6 BetrVG). Involve the works council and the data "
-                "protection officer before enabling it."
+            div class="banner mx-3.5 mt-3" {
+                span class="text-warn" { (icon("triangle-alert")) }
+                div {
+                    strong { "Full capture needs a review first. " }
+                    "It stores arguments exactly as sent, which are personal data (GDPR: purpose "
+                    "limitation, retention, data-subject requests). Logging what employees do "
+                    "with their tools is also subject to co-determination of the works council "
+                    "(section 87(1) no. 6 BetrVG). Involve the works council and the data "
+                    "protection officer before enabling it."
+                }
             }
             @if page.rules.is_empty() {
-                p class=(format!("mt-4 text-sm {FAINT}")) { "No rules yet." }
+                p class=(EMPTY) { "No rules yet." }
             } @else {
                 (rules_table(page))
             }
             @if page.manage {
                 form
-                    class=(FORM_ROW)
+                    class=(FORM_FOOT)
                     hx-post="/ui/actions/admin/audit-rules"
                     hx-target="#audit-rules"
                     hx-swap="outerHTML"
