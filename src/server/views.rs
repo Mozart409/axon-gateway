@@ -594,15 +594,13 @@ pub(super) fn render_my_tools_page(
                     "Hiding a tool or a backend only removes it from your own tool list. "
                     "Tools your admin marked mandatory stay visible, even when you hide their backend."
                 }
-                span class="spacer" {}
-                a class="btn sm ghost" href="/ui" { (PreEscaped("&larr;")) " Back to dashboard" }
             }
             section class="card" {
                 div class="card-h" {
                     (icon("users"))
                     h2 { "Your groups" }
                 }
-                ul class="card-b m-0 flex list-none flex-col gap-1 p-0" {
+                ul class="card-b m-0 flex list-none flex-col gap-2" {
                     @let policy = state.policy.current();
                     @for group in groups {
                         li {
@@ -618,7 +616,9 @@ pub(super) fn render_my_tools_page(
                 }
             }
             @if sections.is_empty() {
-                p class="muted" { "No tools are available yet." }
+                section class="card" {
+                    p class="card-b muted m-0" { "No tools are available yet." }
+                }
             }
             @for backend in sections {
                 (render_tool_backend_section(backend, effective, opt_outs))
