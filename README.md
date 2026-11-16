@@ -330,7 +330,14 @@ await fetch("/api/v1/admin/config/backends", {
 
 The OAuth connect discovers the mock off the backend's origin, which the egress
 guard refuses for loopback, so add `127.0.0.0/8` and `::1/128` to the personal
-backends `egress_allow` in the gateway settings first.
+backends `egress_allow` in the gateway settings first, then restart the gateway
+(bacon `F5`): the egress policy is built at startup.
+
+Both entries need a grant before their tools show up, for admins too: add one
+for the group `authenticated` on each under Grants on `/ui/admin`.
+Create `demo-passthrough` before you sign in, or sign in again afterwards: the
+login keeps the refresh token that passthrough exchanges only when a
+passthrough backend already uses that provider.
 
 The `whoami` tool of the demo backend shows the claims of the token that
 reached it (`aud` is the backend's resource URL for oauth, `axon-demo` for
