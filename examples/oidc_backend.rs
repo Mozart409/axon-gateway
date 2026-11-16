@@ -184,6 +184,7 @@ fn metadata(path: &'static str) -> MethodRouter {
         Json(json!({
             "resource": format!("{BASE_URL}{path}"),
             "authorization_servers": [ISSUER],
+            "scopes_supported": ["openid"],
             "bearer_methods_supported": ["header"],
         }))
     })
