@@ -138,7 +138,6 @@ crates under `tests/` allow them at crate level.
 - **UI**: maud, tailwindcss, htmx (+ htmx-ext-sse)
 - **Metrics**: metrics, metrics-exporter-prometheus
 - **Config watching**: notify (8)
-- **Caching**: moka
 - **Serialization**: serde, serde_json, toml
 - **Errors**: thiserror, color-eyre
 - **Logging**: tracing, tracing-subscriber

@@ -6,7 +6,6 @@ rust-version = "1.96.1"
 license = "MIT"
 description = "A high-performance MCP gateway that aggregates multiple Model Context Protocol servers behind a single endpoint"
 repository = "https://github.com/Mozart409/axon-gateway"
-homepage = "https://github.com/Mozart409/axon-gateway"
 authors = ["Mozart409"]
 keywords = ["mcp", "gateway", "model-context-protocol", "proxy", "aggregator"]
 categories = ["network-programming", "web-programming"]
@@ -34,7 +33,6 @@ kameo = "0.22.2"
 maud = "0.27"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-moka = { version = "0.12", features = ["future"] }
 notify = "8"
 oauth2 = { version = "5", default-features = false }
 # opentelemetry* must match the version tracing-opentelemetry links against
