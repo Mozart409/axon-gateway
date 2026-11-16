@@ -155,7 +155,7 @@ Section 4 describes each mitigation in detail.
 - IPv4-mapped, NAT64, 6to4 and Teredo addresses are checked by their embedded
   IPv4 address.
 - Host allow rules never open loopback, unspecified or link-local addresses.
-- DNS is resolved once and pinned for the connection. No redirects, no proxy.
+- DNS is resolved once and the connection is pinned to all the addresses checked. No redirects, no proxy.
 - Admin-configured backends, catalog entries and OIDC providers are trusted and
   not checked. An admin can point them anywhere.
 

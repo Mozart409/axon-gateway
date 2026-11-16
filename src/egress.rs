@@ -131,11 +131,13 @@ pub struct EgressPolicy {
     default_deny: Vec<IpNet>,
 }
 
-/// A checked URL with the one address the connection is pinned to
+/// A checked URL with the addresses the connection is pinned to: every
+/// address the host resolved to, all allowed, in resolver order
 #[derive(Debug, Clone)]
 pub struct PinnedTarget {
     pub host: String,
-    pub addr: SocketAddr,
+    /// Never empty
+    pub addrs: Vec<SocketAddr>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -184,8 +186,8 @@ impl EgressPolicy {
     }
 
     /// Parses the URL (http and https only, no userinfo), resolves the host
-    /// (IP literals skip DNS), checks every resolved address and returns the
-    /// first one to pin.
+    /// (IP literals skip DNS), checks every resolved address and returns all
+    /// of them to pin, so the client can fall back from one to the next.
     ///
     /// # Errors
     ///
@@ -219,9 +221,9 @@ impl EgressPolicy {
                 .collect();
             (host, addrs)
         };
-        let Some(first) = addrs.first().copied() else {
+        if addrs.is_empty() {
             return Err(EgressError::Resolve(format!("{host}: no addresses")));
-        };
+        }
         // One refused address refuses the URL: the client may pick any of them.
         if let Some(denied) = addrs.iter().find(|a| !self.allows(&host, a.ip())) {
             return Err(EgressError::Denied {
@@ -229,7 +231,7 @@ impl EgressPolicy {
                 ip: denied.ip(),
             });
         }
-        Ok(PinnedTarget { host, addr: first })
+        Ok(PinnedTarget { host, addrs })
     }
 
     /// The decision for one host and one of its addresses: a deny rule
@@ -306,8 +308,9 @@ fn embedded_ipv4(ip: IpAddr) -> Option<IpAddr> {
 }
 
 impl PinnedTarget {
-    /// A client that connects only to `addr` for `host`, follows no redirects
-    /// and gives up after `timeout`. It ignores proxy environment variables:
+    /// A client that connects only to `addrs` for `host` (trying them in
+    /// order, so an unreachable one falls back to the next), follows no
+    /// redirects and gives up after `timeout`. It ignores proxy environment variables:
     /// a proxy would resolve and connect on its own, past the pin.
     ///
     /// # Errors
@@ -315,7 +318,7 @@ impl PinnedTarget {
     /// [`EgressError::Client`] when reqwest cannot build the client.
     pub fn client(&self, timeout: Duration) -> Result<reqwest::Client, EgressError> {
         reqwest::Client::builder()
-            .resolve(&self.host, self.addr)
+            .resolve_to_addrs(&self.host, &self.addrs)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .timeout(timeout)
@@ -530,7 +533,7 @@ mod tests {
     async fn check_url_pins_a_public_literal() {
         let p = policy(&[], &[]);
         let target = p.check_url("https://1.1.1.1/mcp").await.unwrap();
-        assert_eq!(target.addr, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(target.addrs, vec!["1.1.1.1:443".parse().unwrap()]);
         assert_eq!(target.host, "1.1.1.1");
         target.client(Duration::from_secs(5)).unwrap();
     }
@@ -539,7 +542,19 @@ mod tests {
     async fn check_url_allow_rule_opens_a_private_literal() {
         let p = policy(&["10.0.0.0/8"], &[]);
         let target = p.check_url("http://10.1.2.3:9000/mcp").await.unwrap();
-        assert_eq!(target.addr, "10.1.2.3:9000".parse().unwrap());
+        assert_eq!(target.addrs, vec!["10.1.2.3:9000".parse().unwrap()]);
+    }
+
+    #[test]
+    fn client_builds_with_several_pinned_addresses() {
+        let target = PinnedTarget {
+            host: "localhost".to_owned(),
+            addrs: vec![
+                "[::1]:8080".parse().unwrap(),
+                "127.0.0.1:8080".parse().unwrap(),
+            ],
+        };
+        target.client(Duration::from_secs(5)).unwrap();
     }
 
     #[tokio::test]
