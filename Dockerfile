@@ -20,9 +20,9 @@ ARG REVISION=dev
 RUN AXON_GIT_SHA="$(printf '%.12s' "$REVISION")" cargo build --release --locked
 
 # Stage 2: Runtime (minimal Wolfi image)
-# Pinned by digest (the multi-arch index of `latest` on 2026-10-21) so a build
+# Pinned by digest (the multi-arch index of `latest` on 2026-11-16) so a build
 # is reproducible; bump it deliberately to pick up Wolfi package updates.
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:81211e15a86ea1d5357f284482af45730c51de45eaf10ad9ce205d6bfc2df323
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:2c12da5496e21e99003b3db3b9246f025e53d533c4df334205391260f1e8f85b
 
 ARG VERSION
 ARG REVISION
