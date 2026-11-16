@@ -2,6 +2,42 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.6.0 - 2026-11-16
+#### Features
+- (**axon**) add a property-based Playwright e2e suite for every UI page, with Node and Nix Chromium in the dev shell - (6b70fa3) - Amadeus Mader
+- (**axon**) port every UI page to the themed design with drawer forms, SVG usage charts and a grants matrix - (03677bd) - Amadeus Mader
+- (**axon**) add the themed sidebar shell with Geist fonts, Lucide icons and a theme cookie - (a257a4b) - Amadeus Mader
+- (**axon**) add a token-checking demo MCP backend for the dev OAuth and passthrough flows - (9addb90) - Amadeus Mader
+- (**axon**) run the dev gateway in database mode against the mock OIDC provider and drop config.toml - (42f7af7) - Amadeus Mader
+- (**axon**) add dev auto-consent flag and mock-OIDC compose stack - (1a33325) - Amadeus Mader
+- (**deps**) upgrade flake - (8c173b9) - Amadeus Mader
+#### Bug Fixes
+- (**axon**) bump the wolfi-base digest for the glibc and brotli CVE fixes - (f3d3e37) - Amadeus Mader
+- (**axon**) give the overview backend tile link a 24px tap target - (73cecca) - Amadeus Mader
+- (**axon**) cap the page width on wide screens and fix the accessibility findings of the e2e suite - (5d36ddd) - Amadeus Mader
+- (**axon**) scan only src for Tailwind classes so cargo builds no longer retrigger the css watcher - (d66ca74) - Amadeus Mader
+- (**axon**) pad the groups card and card the empty state on the my tools page - (99dfa0f) - Amadeus Mader
+- (**axon**) advertise the openid scope in the demo backend's resource metadata - (52a802a) - Amadeus Mader
+- (**axon**) pin every checked address so egress connections fall back from IPv6 to IPv4 - (5124627) - Amadeus Mader
+- (**axon**) mount the dev Postgres volume at /var/lib/postgresql and name the service that fails to start - (f8d6459) - Amadeus Mader
+- (**axon**) match the dockerfile rust image to the flake's 1.100.0 - (664f04a) - Amadeus Mader
+#### Documentation
+- (**axon**) note the grant, sign-in order and restart the demo backends need - (872caaf) - Amadeus Mader
+- (**vault**) fix markdownlint findings - (83933d2) - Amadeus Mader
+#### Tests
+- (**axon**) seed a backend, toolset and group for the e2e detail pages and check all drawers in one test - (13f1e7b) - Amadeus Mader
+#### Continuous Integration
+- (**axon**) run the CI workflow, e2e included, on pushes to main as well - (ab4d523) - Amadeus Mader
+- (**axon**) run the Playwright e2e suite against the compose stack on pull requests - (83a54f8) - Amadeus Mader
+#### Miscellaneous Chores
+- (**axon**) drop the unused moka dependency and the redundant homepage field - (bf305da) - Amadeus Mader
+- (**axon**) keep the e2e suite and its node_modules out of the docker build context - (ee63432) - Amadeus Mader
+- (**axon**) rebuild the Tailwind output for the redesigned pages - (93398a6) - Amadeus Mader
+- (**axon**) address the dev mock OIDC issuer as 127.0.0.1 - (d09b2f6) - Amadeus Mader
+- (**axon**) remove comments and local container dev build - (73af476) - Amadeus Mader
+- (**axon**) ignore .playwright-mcp - (a24b9e9) - Amadeus Mader
+
+- - -
 ## v0.5.3 - 2026-11-12
 #### Features
 - (**axon**) drop the gateway status button from the landing page and show the user's groups as pills in the user bar - (2491ddf) - Amadeus Mader
