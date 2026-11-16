@@ -1,4 +1,4 @@
-//! A small MCP server that only accepts JWTs issued by the dev mock OIDC
+//! A small MCP server that mostly accepts only JWTs issued by the dev mock OIDC
 //! provider (`http://127.0.0.1:4011/default`, see `example/compose.local.yml`),
 //! to test the gateway's `credential_mode = "oauth"` and `"passthrough"`
 //! (RFC 8693 token exchange) end to end. Dev only, nothing here is configurable.
@@ -6,7 +6,7 @@
 //! Run it with `cargo run --example oidc_backend`, or `just axon-oidc-backend`
 //! from the yggdrasil root. It listens on 127.0.0.1:3003 and serves the tools
 //! `whoami` (the endpoint and the verified claims of the calling token) and
-//! `echo` on two endpoints, each behind its own bearer gate:
+//! `echo` on three endpoints, two of them behind their own bearer gate:
 //!
 //! - `/oauth/mcp` needs `aud` to contain `http://127.0.0.1:3003/oauth/mcp`.
 //!   Add it to axon as a catalog entry with auth "oauth" and any client id (the
@@ -14,8 +14,9 @@
 //! - `/passthrough/mcp` needs `aud` to contain `axon-demo`. Add a backend with
 //!   `credential_mode = "passthrough"`, grant `token_exchange`, provider `sso`
 //!   and audience `axon-demo`.
+//! - `/open/mcp` takes no token at all, so `whoami` reports no claims there.
 //!
-//! Both check the signature against the mock's JWKS, `iss` and `exp`, and answer
+//! The gated two check the signature against the mock's JWKS, `iss` and `exp`, and answer
 //! 401 with a `WWW-Authenticate` header pointing at the protected resource
 //! metadata under `/.well-known/oauth-protected-resource/<endpoint>`.
 
@@ -56,6 +57,8 @@ const ENDPOINTS: [(&str, &str); 2] = [
     ("/oauth/mcp", "http://127.0.0.1:3003/oauth/mcp"),
     ("/passthrough/mcp", "axon-demo"),
 ];
+/// Endpoint without a token check, for a shared backend (the e2e suite registers one).
+const OPEN_PATH: &str = "/open/mcp";
 /// The claims `whoami` reports, when the token has them.
 const CLAIMS: [&str; 9] = [
     "sub",
@@ -305,6 +308,8 @@ async fn main() -> Result<()> {
         );
         info!("serving {BASE_URL}{path} (aud {audience})");
     }
+    router = router.nest_service(OPEN_PATH, service.clone());
+    info!("serving {BASE_URL}{OPEN_PATH} (no token)");
 
     let listener = TcpListener::bind(ADDR).await?;
     info!("listening on {ADDR}, trusting {ISSUER}");

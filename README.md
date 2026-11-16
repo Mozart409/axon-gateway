@@ -308,6 +308,8 @@ in; they are stored in the dev database.
 | `demo-oauth` | `http://127.0.0.1:3003/oauth/mcp` | catalog entry, auth `oauth`, any client id (the mock accepts any); press **Connect** on `/ui/catalog` |
 | `demo-passthrough` | `http://127.0.0.1:3003/passthrough/mcp` | backend with `credential_mode = "passthrough"`, grant `token_exchange`, provider `sso`, audience `axon-demo`; JSON API only, see below |
 
+`/open/mcp` takes no token; register it as a shared backend (`transport = "http"`, url `http://127.0.0.1:3003/open/mcp`) to see a connected backend without user credentials. The e2e suite does this as `e2e-open`.
+
 The backend form cannot set passthrough, so create `demo-passthrough` from the
 browser console on any signed-in `/ui` page:
 

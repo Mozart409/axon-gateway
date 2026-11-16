@@ -15,12 +15,22 @@ test.describe.configure({ mode: "parallel" });
 const DESKTOP = { width: 1280, height: 800 };
 const MOBILE = { width: 390, height: 844 };
 
-for (const route of ROUTES) {
-  test(`drawers on ${route.path}`, async ({ page, issues }) => {
-    test.setTimeout(120_000);
-    let opened = 0;
+test("every drawer on every page opens inside the viewport and closes with Escape", async ({
+  page,
+  issues,
+}) => {
+  test.setTimeout(900_000);
+  let checked = 0;
+  const failures: string[] = [];
+  for (const route of ROUTES) {
     for (const viewport of [MOBILE, DESKTOP]) {
-      await openPage(page, route.path, { viewport, theme: "system" });
+      const where = `${route.path} at ${viewport.width}x${viewport.height}`;
+      try {
+        await openPage(page, route.path, { viewport, theme: "system" });
+      } catch (error) {
+        failures.push(`${where}: page did not load: ${String(error)}`);
+        continue;
+      }
       const buttons = page.locator(
         'main button[popovertarget]:not([popovertargetaction="hide"])',
       );
@@ -31,44 +41,51 @@ for (const route of ROUTES) {
         if (id) ids.add(id);
       }
       for (const id of ids) {
-        const trigger = page
-          .locator(
-            `main button[popovertarget="${id}"]:not([popovertargetaction="hide"])`,
-          )
-          .locator("visible=true")
-          .first();
-        await trigger.click();
-        const popover = page.locator(`[id="${id}"]`);
-        await expect(popover, `${id} opens`).toBeVisible();
-        const box = await popover.boundingBox();
-        expect(box, `${id} has a box`).not.toBeNull();
-        if (box) {
-          const label = `${id} at ${viewport.width}x${viewport.height}`;
-          expect(box.x, `${label}: left edge`).toBeGreaterThanOrEqual(-1);
-          expect(box.y, `${label}: top edge`).toBeGreaterThanOrEqual(-1);
-          expect(box.x + box.width, `${label}: right edge`).toBeLessThanOrEqual(
-            viewport.width + 1,
+        const label = `${where}, drawer ${id}`;
+        try {
+          const trigger = page
+            .locator(
+              `main button[popovertarget="${id}"]:not([popovertargetaction="hide"])`,
+            )
+            .locator("visible=true")
+            .first();
+          await trigger.click();
+          const popover = page.locator(`[id="${id}"]`);
+          await expect(popover, `${id} opens`).toBeVisible();
+          const box = await popover.boundingBox();
+          expect(box, `${id} has a box`).not.toBeNull();
+          if (box) {
+            expect(box.x, `${id}: left edge`).toBeGreaterThanOrEqual(-1);
+            expect(box.y, `${id}: top edge`).toBeGreaterThanOrEqual(-1);
+            expect(box.x + box.width, `${id}: right edge`).toBeLessThanOrEqual(
+              viewport.width + 1,
+            );
+            expect(
+              box.y + box.height,
+              `${id}: bottom edge`,
+            ).toBeLessThanOrEqual(viewport.height + 1);
+          }
+          const focusable = popover.locator(
+            "a[href], button, input, select, textarea, [tabindex]:not([tabindex='-1'])",
           );
-          expect(box.y + box.height, `${label}: bottom edge`).toBeLessThanOrEqual(
-            viewport.height + 1,
-          );
+          expect(
+            await focusable.count(),
+            `${id} contains a focusable control`,
+          ).toBeGreaterThan(0);
+          await page.keyboard.press("Escape");
+          await expect(popover, `${id} closes on Escape`).toBeHidden();
+          checked += 1;
+        } catch (error) {
+          failures.push(`${label}: ${String(error).split("\n")[0]}`);
+          await page.keyboard.press("Escape").catch(() => undefined);
         }
-        const focusable = popover.locator(
-          "a[href], button, input, select, textarea, [tabindex]:not([tabindex='-1'])",
-        );
-        expect(
-          await focusable.count(),
-          `${id} contains a focusable control`,
-        ).toBeGreaterThan(0);
-        await page.keyboard.press("Escape");
-        await expect(popover, `${id} closes on Escape`).toBeHidden();
-        opened += 1;
       }
     }
-    expectClean(issues, route.path);
-    test.skip(opened === 0, `no drawers on ${route.path}`);
-  });
-}
+  }
+  expect(failures, `drawer failures:\n${failures.join("\n")}`).toEqual([]);
+  expect(checked, "no drawer found on any page").toBeGreaterThan(0);
+  expectClean(issues, "drawer pages");
+});
 
 test("the menu exposes every main navigation link on small screens", async ({
   page,

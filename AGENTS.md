@@ -172,11 +172,11 @@ Postgres on 127.0.0.1:5437 and a mock OIDC provider on 127.0.0.1:4011 whose
 `JSON_CONFIG` logs everyone in as `dev` in `axon-admins`. The env lives in
 bacon.toml's `run-long` job. `just axon-oidc-backend` runs
 examples/oidc_backend.rs on 127.0.0.1:3003 (accepts only mock-issued JWTs;
-`/oauth/mcp` and `/passthrough/mcp`); README "Demo backends" lists how to
+`/oauth/mcp`, `/passthrough/mcp`, and `/open/mcp` (no token)); README "Demo backends" lists how to
 register them. There is no dev config file and no seed script; `just axon-down`
 resets the database.
 
-E2E: `rust/axon-gateway/e2e` is a Playwright (TypeScript, Node from the root dev shell) suite that runs against a running `just axon-dev`: `just axon-e2e` (`E2E_RUNS`, `E2E_SEED` tune the fast-check runs; args go to `playwright test`). The tests check properties (no horizontal scroll, nothing outside the viewport, no overlapping blocks, reachable navigation, resolvable icons, axe rules, clean console and CSP) on every page in `e2e/lib/routes.ts` across fixed breakpoints and generated viewports and themes; they select by role, label and attribute, never by CSS class. A new page goes into `ROUTES` (the coverage test fails until it does). `@playwright/test` in `e2e/package.json` must stay at the nixpkgs Playwright version (`AXON_E2E_BROWSERS` in the root flake), or the browser revision will not be found.
+E2E: `rust/axon-gateway/e2e` is a Playwright (TypeScript, Node from the root dev shell) suite that runs against a running `just axon-dev`: `just axon-e2e` (`E2E_RUNS`, `E2E_SEED` tune the fast-check runs; args go to `playwright test`). A setup step seeds what the pages need through the admin API (shared backend `e2e-open` on the demo backend's `/open/mcp`, toolset `e2e-readers`, group `e2e-team`; idempotent), so `just axon-oidc-backend` must be running too. The tests check properties (no horizontal scroll, nothing outside the viewport, no overlapping blocks, reachable navigation, resolvable icons, axe rules, clean console and CSP) on every page in `e2e/lib/routes.ts` across fixed breakpoints and generated viewports and themes; they select by role, label and attribute, never by CSS class. A new page goes into `ROUTES` (the coverage test fails until it does). `@playwright/test` in `e2e/package.json` must stay at the nixpkgs Playwright version (`AXON_E2E_BROWSERS` in the root flake), or the browser revision will not be found.
 
 ## Rust Versions
 - **Toolchain** (dev shell, local builds): fenix stable from `flake.lock`, no

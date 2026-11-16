@@ -20,10 +20,16 @@ export default defineConfig({
   projects: [
     { name: "setup", testMatch: /auth\.setup\.ts/ },
     {
+      name: "seed",
+      testMatch: /seed\.setup\.ts/,
+      dependencies: ["setup"],
+      use: { storageState: "./.auth/dev.json" },
+    },
+    {
       name: "chromium",
       use: { ...devices["Desktop Chrome"], storageState: "./.auth/dev.json" },
-      dependencies: ["setup"],
-      testIgnore: /auth\.setup\.ts/,
+      dependencies: ["seed"],
+      testIgnore: /\.setup\.ts$/,
     },
   ],
 });
