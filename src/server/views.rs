@@ -751,7 +751,7 @@ pub(super) fn render_backend_row(backend: &BackendInfo) -> Markup {
                 span class={"dot " (tone)} {}
                 a
                     href=(format!("/ui/backends/{}", backend.name))
-                    class="mono min-w-0 truncate font-medium"
+                    class="mono min-w-0 truncate py-1 font-medium"
                 {
                     (backend.name)
                 }
