@@ -12,10 +12,12 @@ skip_ci = "[skip ci]"
 skip_untracked = false
 pre_bump_hooks = [
     # Sync the [package] version in Cargo.toml to the version cog computed,
-    # then refresh the lockfile entry. cog stages and commits both files as
-    # part of the bump commit.
+    # then refresh the lockfile entry and the Helm chart's version and
+    # appVersion. cog stages and commits the changed files as part of the
+    # bump commit.
     "cargo set-version --package axon-gateway {{version}}",
     "cargo update --offline --package axon-gateway --precise {{version}}",
+    "sed -i -e 's/^version: .*/version: {{version}}/' -e 's/^appVersion: .*/appVersion: \"{{version}}\"/' deploy/helm/axon-gateway/Chart.yaml",
 ]
 post_bump_hooks = []
 pre_package_bump_hooks = []

@@ -198,6 +198,13 @@ The dashboard has a `DS_PROMETHEUS` data source variable plus `job` and
 | `grafanaDashboard.folder` | `""` | `grafana_folder` annotation |
 | `nodeSelector`, `tolerations`, `affinity`, `topologySpreadConstraints` | empty | Scheduling passthrough |
 
+## Versioning
+
+The chart's `version` and `appVersion` track the gateway version exactly
+(`image.tag` defaults to `appVersion`). A `cog bump` keeps them in sync on
+every release through the sed `pre_bump_hook` in `cog.toml`, and `just
+axon-deploy-check` fails when they drift.
+
 ## Validate
 
 From the repo root: `just axon-deploy-check` (helm lint and template with
