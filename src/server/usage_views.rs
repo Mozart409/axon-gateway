@@ -376,6 +376,49 @@ fn usage_body(report: &UsageReport) -> Markup {
     }
 }
 
+/// The live region for the signed-in user's own usage: refetches the body on
+/// `usage_changed` SSE events.
+pub(super) fn my_usage_region(days: i32, report: &UsageReport) -> Markup {
+    html! {
+        div hx-ext="sse" sse-connect="/ui/events" {
+            div id="my-usage-region"
+                hx-get=(format!("/ui/partials/usage?days={days}"))
+                hx-trigger="sse:usage_changed"
+                hx-swap="outerHTML" {
+                (usage_body(report))
+            }
+        }
+    }
+}
+
+/// The live region for the users-by-calls table: refetches on `usage_changed`.
+pub(super) fn users_usage_region(days: i32, rows: &[UserUsageRow]) -> Markup {
+    html! {
+        div hx-ext="sse" sse-connect="/ui/events" {
+            div id="users-usage-region"
+                hx-get=(format!("/ui/partials/admin/usage?days={days}"))
+                hx-trigger="sse:usage_changed"
+                hx-swap="outerHTML" {
+                (users_table(days, rows))
+            }
+        }
+    }
+}
+
+/// The live region for one user's usage: refetches on `usage_changed`.
+pub(super) fn user_usage_region(user_id: Uuid, days: i32, report: &UsageReport) -> Markup {
+    html! {
+        div hx-ext="sse" sse-connect="/ui/events" {
+            div id="user-usage-region"
+                hx-get=(format!("/ui/partials/admin/usage/{user_id}?days={days}"))
+                hx-trigger="sse:usage_changed"
+                hx-swap="outerHTML" {
+                (usage_body(report))
+            }
+        }
+    }
+}
+
 /// The signed-in user's own usage (`GET /ui/me/usage`).
 pub(super) fn render_my_usage_page(
     state: &AppState,
@@ -388,7 +431,7 @@ pub(super) fn render_my_usage_page(
     };
     let content = html! {
         (page_head(&lead, "/ui/me/usage", report.days))
-        (usage_body(report))
+        (my_usage_region(report.days, report))
     };
     render_layout(state, user, "My usage", Nav::Usage, &content)
 }
@@ -459,7 +502,7 @@ pub(super) fn render_users_usage_page(
     };
     let content = html! {
         (page_head(&lead, "/ui/admin/usage", days))
-        (users_table(days, rows))
+        (users_usage_region(days, rows))
     };
     render_layout(state, user, "Usage", Nav::Admin, &content)
 }
@@ -484,7 +527,7 @@ pub(super) fn render_user_usage_page(
     };
     let content = html! {
         (page_head(&lead, &format!("/ui/admin/usage/{user_id}"), report.days))
-        (usage_body(report))
+        (user_usage_region(user_id, report.days, report))
     };
     render_layout(state, user, "Usage", Nav::Admin, &content)
 }
@@ -651,5 +694,39 @@ mod tests {
         let html = users_table(7, &[]).into_string();
         assert!(html.contains("No calls in the last 7 days."));
         assert!(!html.contains("<table"));
+    }
+
+    #[test]
+    fn my_usage_region_has_expected_wiring() {
+        let html = my_usage_region(7, &report(12_345)).into_string();
+        assert!(html.contains("sse-connect=\"/ui/events\""));
+        assert!(html.contains("id=\"my-usage-region\""));
+        assert!(html.contains("hx-get=\"/ui/partials/usage?days=7\""));
+        assert!(html.contains("hx-trigger=\"sse:usage_changed\""));
+        assert!(html.contains("hx-swap=\"outerHTML\""));
+    }
+
+    #[test]
+    fn users_usage_region_has_expected_wiring() {
+        let rows = [row("alice", Some("a@example.com"))];
+        let html = users_usage_region(30, &rows).into_string();
+        assert!(html.contains("sse-connect=\"/ui/events\""));
+        assert!(html.contains("id=\"users-usage-region\""));
+        assert!(html.contains("hx-get=\"/ui/partials/admin/usage?days=30\""));
+        assert!(html.contains("hx-trigger=\"sse:usage_changed\""));
+        assert!(html.contains("hx-swap=\"outerHTML\""));
+    }
+
+    #[test]
+    fn user_usage_region_has_expected_wiring() {
+        let html = user_usage_region(Uuid::nil(), 7, &report(5)).into_string();
+        assert!(html.contains("sse-connect=\"/ui/events\""));
+        assert!(html.contains("id=\"user-usage-region\""));
+        assert!(html.contains(&format!(
+            "hx-get=\"/ui/partials/admin/usage/{}?days=7\"",
+            Uuid::nil()
+        )));
+        assert!(html.contains("hx-trigger=\"sse:usage_changed\""));
+        assert!(html.contains("hx-swap=\"outerHTML\""));
     }
 }

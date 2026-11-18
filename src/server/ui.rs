@@ -463,6 +463,7 @@ fn ui_event_name(event: &UiEvent) -> &'static str {
         UiEvent::BackendStatusChanged(_) => "backend_status_changed",
         UiEvent::ConfigReloaded { .. } => "config_reloaded",
         UiEvent::Flash(_) => "flash",
+        UiEvent::UsageChanged => "usage_changed",
     }
 }
 
@@ -496,6 +497,7 @@ fn ui_event_to_sse(event: UiEvent) -> Event {
         UiEvent::Flash(flash) => Event::default()
             .event("flash")
             .data(views::render_flash(&flash).into_string()),
+        UiEvent::UsageChanged => Event::default().event("usage_changed").data("changed"),
     }
 }
 
@@ -658,6 +660,16 @@ mod tests {
         });
 
         assert_eq!(ui_event_name(&flash), "flash");
+    }
+
+    #[test]
+    fn usage_changed_event_name_is_stable() {
+        assert_eq!(ui_event_name(&UiEvent::UsageChanged), "usage_changed");
+    }
+
+    #[test]
+    fn usage_changed_event_maps_to_sse_event() {
+        let _ev = ui_event_to_sse(UiEvent::UsageChanged);
     }
 
     #[test]

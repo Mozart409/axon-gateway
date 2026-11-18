@@ -309,6 +309,37 @@ pub fn spawn_change_listener(
     });
 }
 
+const USAGE_TAIL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Polls the audit log's latest id and announces when it advances
+pub fn spawn_usage_tail(store: Store, ui_events: broadcast::Sender<UiEvent>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(USAGE_TAIL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last: Option<i64> = None;
+        loop {
+            interval.tick().await;
+            match store.usage_epoch().await {
+                Ok(Some(epoch)) => match last {
+                    Some(prev) if epoch > prev => {
+                        last = Some(epoch);
+                        let _ = ui_events.send(UiEvent::UsageChanged);
+                    }
+                    None | Some(_) => {
+                        last = Some(epoch);
+                    }
+                },
+                Ok(None) => {
+                    last = None;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to read the usage epoch from the database");
+                }
+            }
+        }
+    });
+}
+
 /// Compares the stored configuration's version with the applied one every
 /// [`CONFIG_POLL_INTERVAL`], for notifications that were missed
 fn spawn_config_poll(config: Arc<ConfigApplier>) {

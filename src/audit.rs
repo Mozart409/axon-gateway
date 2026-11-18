@@ -25,6 +25,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 use uuid::Uuid;
@@ -32,6 +33,7 @@ use uuid::Uuid;
 use crate::authz::tool_matches_pattern;
 use crate::jobs;
 use crate::metrics;
+use crate::server::UiEvent;
 use crate::store::Store;
 
 /// Events the queue holds before [`AuditSink::record`] starts dropping.
@@ -514,10 +516,15 @@ pub struct AuditSink {
 impl AuditSink {
     /// Starts the writer task and returns the handle to feed it. The task ends
     /// when the last handle is dropped, after writing what is queued.
-    pub fn spawn(store: Store) -> AuditSink {
+    pub fn spawn(store: Store, ui_events: broadcast::Sender<UiEvent>) -> AuditSink {
         metrics::describe_audit_metrics();
         let (sink, rx) = Self::channel(CHANNEL_CAPACITY);
-        tokio::spawn(run_writer(store, rx, Arc::clone(&sink.rules_dirty)));
+        tokio::spawn(run_writer(
+            store,
+            rx,
+            Arc::clone(&sink.rules_dirty),
+            ui_events,
+        ));
         sink
     }
 
@@ -552,12 +559,16 @@ async fn reload_rules(store: &Store, rules: &mut Vec<CaptureRule>) {
     }
 }
 
-async fn write_batch(store: &Store, rules: &[CaptureRule], events: Vec<ToolCallEvent>) {
+async fn write_batch(store: &Store, rules: &[CaptureRule], events: Vec<ToolCallEvent>) -> bool {
     let rows = build_rows(events, rules);
-    if let Err(error) = store.insert_tool_calls(&rows).await {
-        // Never log the rows: they carry arguments.
-        tracing::error!(%error, events = rows.len(), "Failed to write tool call audit rows");
-        metrics::record_audit_write_error();
+    match store.insert_tool_calls(&rows).await {
+        Ok(()) => true,
+        Err(error) => {
+            // Never log the rows: they carry arguments.
+            tracing::error!(%error, events = rows.len(), "Failed to write tool call audit rows");
+            metrics::record_audit_write_error();
+            false
+        }
     }
 }
 
@@ -567,6 +578,7 @@ async fn run_writer(
     store: Store,
     mut rx: mpsc::Receiver<ToolCallEvent>,
     rules_dirty: Arc<AtomicBool>,
+    ui_events: broadcast::Sender<UiEvent>,
 ) {
     let mut rules: Vec<CaptureRule> = Vec::new();
     let mut refresh = tokio::time::interval(RULES_REFRESH);
@@ -596,7 +608,10 @@ async fn run_writer(
                 if rules_dirty.swap(false, Ordering::AcqRel) {
                     reload_rules(&store, &mut rules).await;
                 }
-                write_batch(&store, &rules, batch).await;
+                let ok = write_batch(&store, &rules, batch).await;
+                if ok {
+                    let _ = ui_events.send(UiEvent::UsageChanged);
+                }
                 if !open {
                     return;
                 }

@@ -85,13 +85,14 @@ async fn start_store_tasks(
     store: Option<&store::Store>,
     has_oidc: bool,
     policy: &Arc<rbac::PolicyHandle>,
+    ui_events: broadcast::Sender<crate::server::UiEvent>,
 ) -> Option<audit::AuditSink> {
     if let Some(store) = store {
         spawn_purges(store);
     }
     let audit = store.map(|store| {
         audit::spawn_audit_purge(store.clone());
-        audit::AuditSink::spawn(store.clone())
+        audit::AuditSink::spawn(store.clone(), ui_events.clone())
     });
     if let (Some(store), true) = (store, has_oidc) {
         // An empty policy until the database answers; the refresh task retries,
@@ -294,7 +295,8 @@ async fn main() -> Result<()> {
     let changes = ChangeBus::new();
     let policy = Arc::new(rbac::PolicyHandle::new().with_change_bus(changes.clone()));
 
-    let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy).await;
+    let ui_events = broadcast::channel(256).0;
+    let audit = start_store_tasks(store.as_ref(), oidc.is_some(), &policy, ui_events.clone()).await;
     let personal = setup_personal(
         &config,
         store.as_ref(),
@@ -331,8 +333,6 @@ async fn main() -> Result<()> {
 
     await_gateway_ready(&gateway).await;
 
-    let ui_events = broadcast::channel(256).0;
-
     // Database changes (policy, users, the catalog, the configuration) reach this
     // replica here
     if let (Some(store), Some(providers)) = (&store, &oidc) {
@@ -358,6 +358,12 @@ async fn main() -> Result<()> {
                 config,
             },
         );
+    }
+
+    // The usage tail also runs without an OIDC provider (break-glass only):
+    // the usage pages need it for calls the other replicas wrote.
+    if let Some(store) = &store {
+        fanout::spawn_usage_tail(store.clone(), ui_events.clone());
     }
 
     // Start config file watcher for hot reload; database mode has no file

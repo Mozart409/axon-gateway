@@ -116,6 +116,17 @@ fn window(today: NaiveDate, days: i32) -> (i32, NaiveDate, DateTime<Utc>) {
 }
 
 impl Store {
+    /// The latest tool-call id, or `None` when the audit table is empty.
+    ///
+    /// # Errors
+    /// Fails when the query fails.
+    pub async fn usage_epoch(&self) -> Result<Option<i64>, StoreError> {
+        let epoch = sqlx::query_scalar::<_, Option<i64>>("SELECT max(id) FROM tool_calls")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(epoch)
+    }
+
     /// A user's usage over the last `days` days (clamped to 1..=90).
     ///
     /// # Errors
@@ -456,5 +467,14 @@ mod tests {
         let user = store.usage_user(alice).await.unwrap().unwrap();
         assert_eq!(user.label(), "Alice");
         assert_eq!(store.usage_user(Uuid::new_v4()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn usage_epoch_is_none_when_empty() {
+        let Some(store) = test_store("axon_store_usage_epoch").await else {
+            return;
+        };
+        let epoch = store.usage_epoch().await.unwrap();
+        assert_eq!(epoch, None);
     }
 }

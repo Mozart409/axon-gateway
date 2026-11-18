@@ -92,6 +92,10 @@ Section 4 describes each mitigation in detail.
 - A new login deletes the previous session. Logout deletes the row. Disabling a
   user ends their sessions.
 - The OIDC `id_token` kept for logout is sealed with the KEK.
+- The dashboard broadcasts a data-free `usage_changed` ping to signed-in
+  sessions when tool calls are written; it discloses only that calls occurred
+  recently, carries no usage data, and each page refetches its own fragment,
+  which re-checks permissions.
 
 ### CSRF
 

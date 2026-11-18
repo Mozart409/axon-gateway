@@ -154,6 +154,7 @@ pub enum UiEvent {
         errors: Vec<String>,
     },
     Flash(FlashMessage),
+    UsageChanged,
 }
 
 #[derive(Clone, Debug, Serialize)]
