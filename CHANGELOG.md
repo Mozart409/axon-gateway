@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.7.0 - 2026-11-18
+#### Features
+- (**axon**) broadcast a usage_changed SSE ping with live usage regions and a cross-replica audit-tail poller - (ef30dea) - Amadeus Mader
+- (**deps**) upgrade flake - (1d2c04c) - Amadeus Mader
+#### Miscellaneous Chores
+- (**deps**) ignore RUSTSEC-2026-0543 (unmaintained chrono) in deny configs - (34aeab6) - Amadeus Mader
+- (**axon**) bump the helm chart to 0.6.0 and keep it in sync with releases via a cog pre-bump hook and an axon-deploy-check guard - (537c7e2) - Amadeus Mader
+
+- - -
 ## v0.6.0 - 2026-11-16
 #### Features
 - (**axon**) add a property-based Playwright e2e suite for every UI page, with Node and Nix Chromium in the dev shell - (6b70fa3) - Amadeus Mader
