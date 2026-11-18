@@ -9,7 +9,12 @@ feature-depth = 1
 [advisories]
 yanked = "deny"
 unmaintained = "all"
+# RUSTSEC-2026-0543 (chrono, unmaintained): every version is affected and no
+# safe upgrade exists; chrono stays in the tree through our own use and
+# sqlx/rmcp/oauth2/schemars. Revisit when the advisory is withdrawn or those
+# move to jiff/time.
 ignore = [
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
