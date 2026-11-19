@@ -297,6 +297,10 @@ completes the OAuth flow unattended. All values are public dev values, so keep
 the stack on localhost. `podman compose -f example/compose.local.yml down -v`
 resets the database.
 
+The full walkthrough of the development environment — prerequisites, the dev
+stack, the ports, demo backends, the gates, the e2e suite, the link check and
+the CSS pipeline — is in `docs/setup.md`.
+
 ### Demo backends
 
 `cargo run --example oidc_backend` runs a demo MCP backend on 127.0.0.1:3003 that

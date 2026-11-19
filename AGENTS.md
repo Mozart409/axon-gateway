@@ -163,7 +163,8 @@ consumes it as a subflake with `nixpkgs`/`fenix`/`flake-parts` following its
 own, so its toolchain is yggdrasil's one stable Rust (`rust/toolchain.nix`), and
 `nix eval .#legacyPackages.x86_64-linux.rust-toolchain-sync` fails if the
 component lists drift. `cog.toml` and `release.sh` stay because the exported
-repo releases with them.
+repo releases with them. A walkthrough of standing the environment up —
+prerequisites, dev stack, ports, gates, e2e, link check — is in `docs/setup.md`.
 
 Dev stack: `just axon-dev` (or `just axon-up`, then `bacon run-long`) runs the
 gateway on the host in database mode against `example/compose.local.yml`:
