@@ -1,0 +1,13 @@
+# Link-check configuration for the `axon-links` recipe of the surrounding
+# repository's justfile, which runs lychee over this project's docs, examples
+# and workflows. Plain mode: no cache, a fresh run every time.
+cache = false
+max_retries = 2
+timeout = 20
+
+# The docs deliberately link to the local dev stack (`http://127.0.0.1:8080`,
+# the demo backend on 3003, the mock OIDC provider on 4011) and to
+# `localhost`/`example.com` placeholders. Those hosts answer nothing from a
+# link checker, so skip every private address; only real external URLs are
+# checked.
+exclude_all_private = true
