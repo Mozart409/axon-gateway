@@ -62,11 +62,11 @@ backend = "files"
 include = ["*"]
 
 [[rbac.roles]]
-name = "auditor"
+name = "log-reader"
 permissions = ["audit.read"]
 
 [[rbac.role_bindings]]
-role = "auditor"
+role = "log-reader"
 group = "auditors"
 "#;
 
@@ -209,13 +209,15 @@ fn location(resp: &Response) -> String {
 }
 
 fn cookie_pair(resp: &Response, name: &str) -> Option<String> {
+    // The callback answers with several Set-Cookie headers (it expires the
+    // login cookie and opens the session), so every header is looked at.
     resp.headers()
         .get_all(SET_COOKIE)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .find_map(|v| v.split(';').next())
-        .filter(|pair| pair.starts_with(&format!("{name}=")))
-        .map(ToOwned::to_owned)
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&format!("{name}=")))
+        .and_then(|header| header.split(';').next())
+        .map(str::to_string)
 }
 
 fn csrf_token(html: &str) -> String {
@@ -232,7 +234,9 @@ async fn usage_partials_and_pages_for_non_audit_user() {
         return;
     };
 
-    let session = h.login_as("alice", "alice@example.com", &["users"]).await;
+    let session = h
+        .login_as("alice", "alice@example.com", &["users-claim"])
+        .await;
 
     // GET /ui/partials/usage?days=7 -> 200 with region wiring
     let resp = h
@@ -248,10 +252,10 @@ async fn usage_partials_and_pages_for_non_audit_user() {
     assert!(body.contains("hx-get=\"/ui/partials/usage?days=7\""));
     assert!(body.contains("hx-trigger=\"sse:usage_changed\""));
 
-    // GET /ui/me/usage contains the same region
+    // GET /ui/me/usage?days=7 contains the same region
     let resp = h
         .client
-        .get(h.url("/ui/me/usage"))
+        .get(h.url("/ui/me/usage?days=7"))
         .header(COOKIE, &session.cookie)
         .send()
         .await
@@ -289,7 +293,7 @@ async fn usage_admin_partials_for_audit_user() {
     };
 
     let session = h
-        .login_as("bob", "bob@example.com", &["users", "auditors"])
+        .login_as("bob", "bob@example.com", &["users-claim", "auditors-claim"])
         .await;
 
     // /ui/partials/admin/usage?days=7 -> 200 with users-usage-region wiring
@@ -350,7 +354,11 @@ async fn usage_partials_reject_bad_days() {
     };
 
     let session = h
-        .login_as("carol", "carol@example.com", &["users", "auditors"])
+        .login_as(
+            "carol",
+            "carol@example.com",
+            &["users-claim", "auditors-claim"],
+        )
         .await;
 
     // own
@@ -380,7 +388,9 @@ async fn usage_changed_event_is_emitted_after_tool_call() {
         return;
     };
 
-    let session = h.login_as("dave", "dave@example.com", &["users"]).await;
+    let session = h
+        .login_as("dave", "dave@example.com", &["users-claim"])
+        .await;
 
     // Create a PAT for MCP calls (need to use API; reuse pattern from tool_call_audit)
     // Create PAT via API

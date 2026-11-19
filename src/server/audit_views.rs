@@ -208,7 +208,7 @@ pub(super) fn render_calls_page(state: &AppState, user: &SessionUser, page: &Cal
             }
         }
     };
-    render_layout(state, user, "Tool calls", Nav::Admin, &content)
+    render_layout(state, user, "Tool calls", Nav::AdminToolCalls, &content)
 }
 
 fn detail_row(label: &str, value: &Markup) -> Markup {
@@ -265,7 +265,7 @@ pub(super) fn render_call_page(
             (render_arguments_placeholder(call))
         }
     };
-    render_layout(state, user, "Tool call", Nav::Admin, &content)
+    render_layout(state, user, "Tool call", Nav::AdminToolCalls, &content)
 }
 
 /// The arguments block before the read: a button, or why there is nothing.
@@ -331,7 +331,13 @@ pub(super) fn render_settings_page(
         (render_retention_section(page, false))
         (render_rules_section(page, false))
     };
-    render_layout(state, user, "Audit settings", Nav::Admin, &content)
+    render_layout(
+        state,
+        user,
+        "Audit settings",
+        Nav::AdminAuditSettings,
+        &content,
+    )
 }
 
 /// The retention form, the swap target of the settings action.

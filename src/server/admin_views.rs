@@ -39,19 +39,11 @@ pub(super) const LINK: &str =
 
 /// What the signed-in user may do on the admin pages
 #[derive(Debug, Clone, Copy)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "one flag per permission the pages check"
-)]
 pub(super) struct Access {
     /// Create and edit groups and grants (`groups.manage`)
     pub manage_groups: bool,
     /// Edit role bindings (`roles.manage`)
     pub manage_roles: bool,
-    /// Read the audit log (`audit.read`)
-    pub read_audit: bool,
-    /// Manage service accounts and their tokens (`service_accounts.manage`)
-    pub manage_service_accounts: bool,
     /// Disable and re-enable users (`users.manage`)
     pub manage_users: bool,
 }
@@ -61,8 +53,6 @@ impl Access {
         Self {
             manage_groups: permissions.has(Permission::GroupsManage),
             manage_roles: permissions.has(Permission::RolesManage),
-            read_audit: permissions.has(Permission::AuditRead),
-            manage_service_accounts: permissions.has(Permission::ServiceAccountsManage),
             manage_users: permissions.has(Permission::UsersManage),
         }
     }
@@ -215,34 +205,6 @@ pub(super) fn render_admin_page(
     let content = html! {
         div class="page-head" {
             p { "Groups, grants and role bindings." }
-            span class="spacer" {}
-            nav class="flex flex-wrap gap-2" aria-label="Admin pages" {
-                @if overview.access.read_audit {
-                    a href="/ui/admin/audit" class=(LINK_BUTTON) { "Audit log" }
-                    a href="/ui/admin/tool-calls" class=(LINK_BUTTON) { "Tool calls" }
-                    a href="/ui/admin/usage" class=(LINK_BUTTON) { "Usage" }
-                    a href="/ui/admin/audit-settings" class=(LINK_BUTTON) { "Audit settings" }
-                }
-                @if overview.access.manage_users {
-                    a href="/ui/admin/users" class=(LINK_BUTTON) { "Users" }
-                    @if overview.access.manage_groups {
-                        a href="/ui/admin/scim" class=(LINK_BUTTON) { "SCIM provisioning" }
-                    }
-                    @if state.personal.is_some() {
-                        a href="/ui/admin/personal-backends" class=(LINK_BUTTON) { "Personal MCP servers" }
-                    }
-                }
-                @if overview.access.manage_service_accounts {
-                    a href="/ui/admin/service-accounts" class=(LINK_BUTTON) { "Service accounts" }
-                }
-                a href="/ui/admin/roles" class=(LINK_BUTTON) { "Roles" }
-                @if state.db_config.is_some() {
-                    a href="/ui/admin/config/backends" class=(LINK_BUTTON) { "Backends" }
-                    a href="/ui/admin/config/toolsets" class=(LINK_BUTTON) { "Toolsets" }
-                    a href="/ui/admin/config/oidc-providers" class=(LINK_BUTTON) { "OIDC providers" }
-                    a href="/ui/admin/config/settings" class=(LINK_BUTTON) { "Gateway settings" }
-                }
-            }
         }
         (render_flash_area(false))
         (render_groups_section(overview, false))
@@ -680,7 +642,7 @@ pub(super) fn render_roles_page(state: &AppState, user: &SessionUser, page: &Rol
         (render_flash_area(false))
         (render_roles_section(page))
     };
-    render_layout(state, user, "Roles", Nav::Admin, &content)
+    render_layout(state, user, "Roles", Nav::AdminRoles, &content)
 }
 
 /// One checkbox per permission, named `permissions`; the ones in `selected` start checked.
@@ -1041,7 +1003,7 @@ pub(super) fn render_users_page(state: &AppState, user: &SessionUser, page: &Use
         (render_flash_area(false))
         (render_users_section(page))
     };
-    render_layout(state, user, "Users", Nav::Admin, &content)
+    render_layout(state, user, "Users", Nav::AdminUsers, &content)
 }
 
 fn user_state_badge(disabled: bool) -> Markup {
@@ -1205,7 +1167,7 @@ pub(super) fn render_audit_page(
             }
         }
     };
-    render_layout(state, user, "Audit log", Nav::Admin, &content)
+    render_layout(state, user, "Audit log", Nav::AdminAudit, &content)
 }
 
 #[cfg(test)]
@@ -1284,16 +1246,12 @@ mod tests {
     const FULL: Access = Access {
         manage_groups: true,
         manage_roles: true,
-        read_audit: true,
-        manage_service_accounts: true,
         manage_users: true,
     };
 
     const AUDITOR: Access = Access {
         manage_groups: false,
         manage_roles: false,
-        read_audit: true,
-        manage_service_accounts: false,
         manage_users: false,
     };
 
@@ -1377,7 +1335,6 @@ mod tests {
 
         assert!(html.contains("<option value=\"log-reader\">log-reader</option>"));
         assert_eq!(html.matches("unknown role").count(), 1);
-        assert!(html.contains("href=\"/ui/admin/roles\""));
     }
 
     fn roles_page(access: Access) -> RolesPage {
@@ -1470,7 +1427,6 @@ mod tests {
 
         assert!(html.contains("Operations"));
         assert!(html.contains("files"));
-        assert!(html.contains("href=\"/ui/admin/audit\""));
         assert!(!html.contains("hx-post"));
         assert!(!html.contains("<select"));
         assert!(!html.contains("Actions"));

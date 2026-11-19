@@ -504,7 +504,7 @@ pub(super) fn render_users_usage_page(
         (page_head(&lead, "/ui/admin/usage", days))
         (users_usage_region(days, rows))
     };
-    render_layout(state, user, "Usage", Nav::Admin, &content)
+    render_layout(state, user, "Usage", Nav::AdminUsage, &content)
 }
 
 /// One user's usage as an audit reader sees it (`GET /ui/admin/usage/{user_id}`).
@@ -529,7 +529,7 @@ pub(super) fn render_user_usage_page(
         (page_head(&lead, &format!("/ui/admin/usage/{user_id}"), report.days))
         (user_usage_region(user_id, report.days, report))
     };
-    render_layout(state, user, "Usage", Nav::Admin, &content)
+    render_layout(state, user, "Usage", Nav::AdminUsage, &content)
 }
 
 #[cfg(test)]

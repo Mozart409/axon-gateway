@@ -508,7 +508,13 @@ pub(super) fn render_service_accounts_page(
         (render_flash_area(false))
         (render_service_accounts_section(overview, None))
     };
-    render_layout(state, user, "Service accounts", Nav::Tokens, &content)
+    render_layout(
+        state,
+        user,
+        "Service accounts",
+        Nav::AdminServiceAccounts,
+        &content,
+    )
 }
 
 #[cfg(test)]

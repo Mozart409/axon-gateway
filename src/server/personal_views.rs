@@ -939,7 +939,13 @@ pub(super) fn render_admin_page(
         (render_flash_area(false))
         (render_admin_section(backends))
     };
-    render_layout(state, user, "Personal MCP servers", Nav::Admin, &content)
+    render_layout(
+        state,
+        user,
+        "Personal MCP servers",
+        Nav::AdminPersonalBackends,
+        &content,
+    )
 }
 
 #[cfg(test)]

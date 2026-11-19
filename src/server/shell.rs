@@ -196,7 +196,17 @@ pub(super) enum Nav {
     Toolsets,
     MyServers,
     Catalog,
+    /// Admin overview: groups, grants and role bindings
     Admin,
+    AdminRoles,
+    AdminUsers,
+    AdminServiceAccounts,
+    AdminScim,
+    AdminPersonalBackends,
+    AdminAudit,
+    AdminToolCalls,
+    AdminUsage,
+    AdminAuditSettings,
     Config,
 }
 
@@ -211,11 +221,26 @@ fn nav_item(active: Nav, nav: Nav, href: &str, icon_name: &str, label: &str) -> 
 }
 
 /// What the sidebar of one user shows.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per permission the sidebar gates"
+)]
 struct NavAccess {
     /// "My MCP servers" and the catalog
     personal: bool,
-    /// The admin pages
-    admin: bool,
+    /// The admin overview and the roles page, which list groups, grants or
+    /// bindings (`groups.manage`, `roles.manage` or `audit.read`)
+    listing: bool,
+    /// The users page (`users.manage` or `groups.manage`)
+    manage_users: bool,
+    /// Half of the SCIM page's `users.manage` and `groups.manage`
+    manage_groups: bool,
+    /// The service accounts page (`service_accounts.manage`)
+    manage_service_accounts: bool,
+    /// The audit pages (`audit.read`)
+    read_audit: bool,
+    /// The admin's view of everybody's personal servers
+    personal_admin: bool,
     /// The first configuration page the user may open
     config_href: Option<&'static str>,
 }
@@ -252,14 +277,70 @@ fn nav_contents(state: &AppState, access: &NavAccess, active: Nav, in_drawer: bo
             (nav_item(active, Nav::MyServers, "/ui/me/backends", "server", "My MCP servers"))
             (nav_item(active, Nav::Catalog, "/ui/catalog", "library", "Catalog"))
         }
-        @if access.admin || access.config_href.is_some() {
+        @if access.listing
+            || access.manage_users
+            || access.manage_groups
+            || access.manage_service_accounts
+            || access.personal_admin
+        {
             div class="nav-label" { "Admin" }
-            @if access.admin {
+            @if access.listing {
                 (nav_item(active, Nav::Admin, "/ui/admin", "shield", "Admin"))
+                (nav_item(active, Nav::AdminRoles, "/ui/admin/roles", "badge-check", "Roles"))
             }
-            @if let Some(href) = access.config_href {
-                (nav_item(active, Nav::Config, href, "sliders-horizontal", "Config"))
+            @if access.manage_users || access.manage_groups {
+                (nav_item(active, Nav::AdminUsers, "/ui/admin/users", "users", "Users"))
             }
+            @if access.manage_service_accounts {
+                (nav_item(
+                    active,
+                    Nav::AdminServiceAccounts,
+                    "/ui/admin/service-accounts",
+                    "bot",
+                    "Service accounts",
+                ))
+            }
+            @if access.manage_users && access.manage_groups {
+                (nav_item(
+                    active,
+                    Nav::AdminScim,
+                    "/ui/admin/scim",
+                    "refresh-cw",
+                    "SCIM provisioning",
+                ))
+            }
+            @if access.personal_admin {
+                (nav_item(
+                    active,
+                    Nav::AdminPersonalBackends,
+                    "/ui/admin/personal-backends",
+                    "plug",
+                    "Personal MCP servers",
+                ))
+            }
+        }
+        @if access.read_audit {
+            div class="nav-label" { "Audit" }
+            (nav_item(active, Nav::AdminAudit, "/ui/admin/audit", "scroll-text", "Audit log"))
+            (nav_item(
+                active,
+                Nav::AdminToolCalls,
+                "/ui/admin/tool-calls",
+                "list",
+                "Tool calls",
+            ))
+            (nav_item(active, Nav::AdminUsage, "/ui/admin/usage", "activity", "Usage"))
+            (nav_item(
+                active,
+                Nav::AdminAuditSettings,
+                "/ui/admin/audit-settings",
+                "settings",
+                "Audit settings",
+            ))
+        }
+        @if let Some(href) = access.config_href {
+            div class="nav-label" { "Config" }
+            (nav_item(active, Nav::Config, href, "sliders-horizontal", "Config"))
         }
         div class="side-foot" {
             span class="mono muted" { (build_fingerprint(state)) }
@@ -300,11 +381,20 @@ pub(super) fn render_shell(
     } else {
         None
     };
+    // Each entry mirrors the permission its page's handler requires (rbac and
+    // the page modules), so nothing is listed the user may not open.
+    let manage_users = permissions.has(Permission::UsersManage);
+    let manage_groups = permissions.has(Permission::GroupsManage);
     let access = NavAccess {
         personal: state.personal.is_some(),
-        admin: permissions.has(Permission::GroupsManage)
+        listing: manage_groups
             || permissions.has(Permission::RolesManage)
             || permissions.has(Permission::AuditRead),
+        manage_users,
+        manage_groups,
+        manage_service_accounts: permissions.has(Permission::ServiceAccountsManage),
+        read_audit: permissions.has(Permission::AuditRead),
+        personal_admin: manage_users && state.personal.is_some(),
         config_href,
     };
     let name = user

@@ -153,7 +153,7 @@
 
   /* ---------- Shell ---------- */
   .shell { display: flex; min-height: 100vh; }
-  .side { width: 232px; flex: none; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 12px 10px; gap: 2px; }
+  .side { width: 232px; flex: none; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 12px 10px; gap: 2px; overflow-y: auto; }
   .brand { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 8px; margin-bottom: 8px; font-weight: 650; font-size: 14px; letter-spacing: -.01em; }
   .brand-mark { width: 24px; height: 24px; border-radius: 6px; background: var(--accent); color: var(--accent-fg); display: grid; place-items: center; }
   .nav-label { font-size: 11px;font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); padding: 14px 10px 4px; }

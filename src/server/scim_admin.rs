@@ -442,7 +442,7 @@ fn render_scim_page(
     let content = html! {
         (render_panel(rows, issued))
     };
-    render_layout(state, user, "SCIM provisioning", Nav::Admin, &content)
+    render_layout(state, user, "SCIM provisioning", Nav::AdminScim, &content)
 }
 
 #[cfg(test)]
