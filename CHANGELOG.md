@@ -2,6 +2,23 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.8.0 - 2026-11-19
+#### Features
+- (**axon**) confirm a backend credential mode switch in a dialog and refuse an unconfirmed one - (f83c9b5) - Amadeus Mader
+- (**axon**) guide first-run setup in the dashboard and edit every backend credential mode in the form - (d2408fe) - Amadeus Mader
+- (**axon**) list every admin and audit page in the sidebar instead of a button row - (ed29607) - Amadeus Mader
+- (**axon**) add the axon-prod-setup skill for repo users - (0057fcd) - Amadeus Mader
+#### Bug Fixes
+- (**axon**) make the access matrix cells links to their grant or a prefilled add form instead of toggle look-alikes - (81929df) - Amadeus Mader
+- (**axon**) skip homelab, tailscale and cluster hosts in the link check - (d1783fa) - Amadeus Mader
+- (**axon**) add the lychee config the links recipe expects - (7bebf34) - Amadeus Mader
+#### Documentation
+- (**axon**) ship the setup skill to operators under skills/ with install steps in the README - (e630be1) - Amadeus Mader
+- (**axon**) extend the setup skill with discovery, IdP checklist, client setup, verification and troubleshooting - (58194ef) - Amadeus Mader
+- (**axon**) fix the dead rmcp and spec links in goals - (3fcca1b) - Amadeus Mader
+- (**axon**) add the dev setup guide for humans and agents - (34238b2) - Amadeus Mader
+
+- - -
 ## v0.7.0 - 2026-11-18
 #### Features
 - (**axon**) broadcast a usage_changed SSE ping with live usage regions and a cross-replica audit-tail poller - (ef30dea) - Amadeus Mader
