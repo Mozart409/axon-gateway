@@ -1,7 +1,7 @@
 # `admin import-config` and the TOML surface
 
-Source: `src/admin_cli.rs` (CLI), `src/import.rs` (the import), `src/config.rs`
-(types). The same TOML is what a standalone gateway reads, minus the sections a
+Source: README (sections "Configuration", "Authentication", "RBAC") and
+`axon-gateway admin import-config --help`. The same TOML is what a standalone gateway reads, minus the sections a
 standalone file refuses (`[database]`, `[[auth.oidc]]`, `[rbac]`, per-user
 backends).
 

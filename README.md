@@ -1838,6 +1838,39 @@ migrations/
 └── 0010_personal_backends.sql
 ```
 
+## Installing the operator skill
+
+`skills/axon-prod-setup/` is an [Agent Skill](https://agentskills.io) that
+walks an agent through deploying and running axon-gateway: bootstrap, IdP
+registration, RBAC, backends, connecting clients, verification and
+troubleshooting. It is a plain `<name>/SKILL.md` folder and works without the
+source checkout.
+
+```sh
+git clone --depth 1 https://github.com/Mozart409/axon-gateway
+```
+
+| Agent | Personal | Per project |
+| --- | --- | --- |
+| Claude Code | `~/.claude/skills/` | `<project>/.claude/skills/` |
+| opencode | `~/.config/opencode/skills/` | `<project>/.opencode/skills/` |
+
+```sh
+# Claude Code, personal
+mkdir -p ~/.claude/skills
+cp -r axon-gateway/skills/axon-prod-setup ~/.claude/skills/
+# or keep it updatable with git pull
+ln -s "$PWD/axon-gateway/skills/axon-prod-setup" ~/.claude/skills/axon-prod-setup
+
+# opencode, personal
+mkdir -p ~/.config/opencode/skills
+cp -r axon-gateway/skills/axon-prod-setup ~/.config/opencode/skills/
+```
+
+Other agents that read Agent Skills: point them at the
+`skills/axon-prod-setup` folder. Then ask the agent to "set up axon-gateway"
+or "connect Claude Code to axon".
+
 ## License
 
 MIT

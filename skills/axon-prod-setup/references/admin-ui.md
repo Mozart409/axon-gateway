@@ -1,10 +1,7 @@
 # Admin UI and API: day-2 configuration
 
-Sources: `e2e/lib/routes.ts` (the page list the coverage test enforces),
-`src/server/admin_views.rs`, `config_views.rs`, `audit_views.rs`,
-`usage_views.rs`, `personal_views.rs`, `tokens_views.rs`, `scim_admin.rs`, and
-the `config_api.rs`/`admin_api.rs` route tables. The README documents the API
-in full; this is the map.
+Sources: the README of the running version documents the API in full; this is
+the map.
 
 ## Admin pages (`/ui/admin` …)
 
@@ -15,7 +12,7 @@ The "Admin" link in the user bar is shown to users with `groups.manage` or
 | --- | --- | --- |
 | `/ui/admin` | Hub: groups (detail `/ui/admin/groups/{name}`), grants, role bindings, audit log links | `groups.manage` / `audit.read` to see; writes `groups.manage` |
 | `/ui/admin/roles` | Custom roles and bindings | reads `groups.manage`/`roles.manage`/`audit.read`; writes `roles.manage` + the role's permissions |
-| `/ui/admin/users` | Disable/enable users | `users.manage` |
+| `/ui/admin/users` | Disable/enable users; flags "issuer not configured" and "duplicate" | `users.manage` |
 | `/ui/admin/service-accounts` | Service accounts, their tokens, JWT bindings | `service_accounts.manage` |
 | `/ui/admin/scim` | SCIM tokens per provider (shown once, rotated by re-creating) | `users.manage` + `groups.manage` + every permission of any role bound to a group (an admin holds all) |
 | `/ui/admin/personal-backends` | List/disable/delete anyone's personal servers | `users.manage` |
@@ -23,14 +20,18 @@ The "Admin" link in the user bar is shown to users with `groups.manage` or
 | `/ui/admin/tool-calls` (+ detail) | Tool-call records | `audit.read`; stored arguments need `audit.read_sensitive` |
 | `/ui/admin/usage` (+ per-user) | Usage views | `audit.read` |
 | `/ui/admin/audit-settings` | Retention (1–3650 days), capture rules | `audit.read` to see, `gateway.admin` to change |
-| `/ui/admin/config/backends` (+ detail) | Shared backends and catalog entries | write `backends.manage`, read `backends.view`/`backends.manage` |
-| `/ui/admin/config/toolsets` | Gateway toolsets (`[[toolsets]]`) | as the backends |
-| `/ui/admin/config/oidc-providers` | OIDC providers | `gateway.admin` |
+| `/ui/admin/config/backends` (+ detail) | Shared backends and catalog entries, Mode column; the form edits every credential mode | write `backends.manage`, read `backends.view`/`backends.manage` |
+| `/ui/admin/config/toolsets` | Gateway toolsets (`[[toolsets]]`), tab "Gateway toolsets" | as the backends |
+| `/ui/admin/config/oidc-providers` | OIDC providers; shows "Values for your identity provider" (redirect URI, post-logout redirect URI, upstream OAuth callback) with copy buttons | `gateway.admin` |
 | `/ui/admin/config/settings` | Gateway settings (`rate_limit_per_minute`, `allowed_hosts`, `idle_timeout_secs`, `[personal_backends]`) | `gateway.admin` |
 
-Users' own pages (no permission needed, just a session): `/ui` (dashboard),
-`/ui/tools`, `/ui/toolsets`, `/ui/catalog`, `/ui/tokens`,
-`/ui/me/apps` (connected apps), `/ui/me/backends`, `/ui/me/usage`.
+Users' own pages (no permission needed, just a session): `/ui` (Overview; for
+gateway admins it starts with the "Set up the gateway" checklist: sign-in
+provider, admin group, first backend, first grant, connect a client, shown
+until all five are done), `/ui/tools` ("My tools"), `/ui/toolsets` ("My
+toolsets"), `/ui/catalog`, `/ui/tokens`, `/ui/me/apps` (connected apps),
+`/ui/me/backends`, `/ui/me/usage` ("My usage"). The admin usage page is "All
+usage" in the sidebar.
 
 ## Config API (`/api/v1/admin/config/...`)
 
@@ -92,21 +93,30 @@ MCP servers). The ones you will reach for most:
 All of these need the dashboard session cookie and, for writes, the
 `X-CSRF-Token` header from the session; they answer 404 outside database mode.
 
-## UI gotchas to tell users
+## UI notes to tell users
 
-- There are two "Toolsets" pages: `/ui/toolsets` holds a user's own toolsets,
-  which narrow their tokens; `/ui/admin/config/toolsets` holds the gateway
-  toolsets served at `/mcp/toolset/{name}`.
-- There are two "Usage" pages: `/ui/me/usage` (your own) and `/ui/admin/usage`
-  (everyone, needs `audit.read`).
+- There are two toolset pages: "My toolsets" (`/ui/toolsets`) holds a user's
+  own toolsets, which narrow their tokens; the config tab "Gateway toolsets"
+  (`/ui/admin/config/toolsets`) holds the toolsets served at
+  `/mcp/toolset/{name}`.
+- There are two usage pages: "My usage" (`/ui/me/usage`) and "All usage"
+  (`/ui/admin/usage`, needs `audit.read`).
 - The config pages live under the single sidebar entry "Config", with the tabs
-  Backends, Toolsets, OIDC providers and Settings.
+  Backends, "Gateway toolsets", OIDC providers and Settings.
 - The bootstrap provider from `AXON_OIDC_*` is listed with source `env` and is
   read-only.
-- Admin via `admin_groups` is not a role binding: the `admin` role shows
-  Bindings 0 and "Your groups" on `/ui/tools` does not list it. The `admin`
-  badge in the header and the ADMIN column on `/ui/admin/users` are the signs.
-- The OIDC provider page does not show the redirect URI to register; tell the
-  user `{base_url}/auth/callback`.
-- The token form's backend list is a multi-select (Ctrl/Cmd-click); none
-  selected means all backends the user may use.
+- Admin via `admin_groups` is decided at login and is not a stored role
+  binding. It shows as the `admin` badge in the header, the ADMIN column on
+  Users, "admin - from your identity provider" under "Your groups" on "My
+  tools", and the providers' admin groups under the `admin` role's bindings on
+  Roles.
+- An admin still needs a grant to see a backend's tools. "My tools" says "No
+  grant yet" with an "Add a grant" link to `/ui/admin#grants`.
+- The Users page marks users whose issuer is no longer configured ("issuer not
+  configured") and the same email under two issuers ("duplicate"); the
+  explanation next to the flag says what to do. Users are never merged
+  automatically.
+- The token form lists backends as checkboxes; none checked means all backends
+  the user may use.
+- Changing where a backend connects (transport, URL, command) requires its
+  stored secrets re-entered or cleared in the same save.

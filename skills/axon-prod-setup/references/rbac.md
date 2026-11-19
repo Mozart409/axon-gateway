@@ -1,7 +1,6 @@
 # RBAC: groups, roles, permissions
 
-Source: `src/policy.rs` (`Permission`, `Role`), `src/rbac.rs` (the admin
-service behind `/api/v1` and the admin pages), `README.md` section "RBAC".
+Source: README section "RBAC" of the running version.
 
 ## The model
 
@@ -26,7 +25,7 @@ service behind `/api/v1` and the admin pages), `README.md` section "RBAC".
 | `auditor` | `audit.read`, `backends.view` |
 | `member` | `personal_backends.create` |
 
-## All permissions (`Permission::ALL`, `as_str()` names)
+## All permissions
 
 | Permission | Allows |
 | --- | --- |

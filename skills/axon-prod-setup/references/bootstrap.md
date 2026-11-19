@@ -1,15 +1,15 @@
 # Bootstrap: the environment of database mode
 
-Source: `src/bootstrap.rs` (and `crypto.rs` for the KEK). Database mode is
-selected by `AXON_DATABASE_URL` being set; the gateway then reads no config
-file and exits with an error if one is named.
+Database mode is selected by `AXON_DATABASE_URL` being set; the gateway then
+reads no config file and exits with an error if one is named. Source: the
+README of the running version (sections "Quick Start", "Authentication").
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `AXON_DATABASE_URL` | none | Postgres URL; setting it selects database mode |
 | `AXON_KEK_FILE` or `AXON_KEK` | none, required | key-encryption key, a path or the text; secrets in the database are sealed with it. One line per KEK, `[id:]secret`, first line active, at least 32 characters; generate with `pwgen -s 48 1` |
 | `AXON_BIND` | `0.0.0.0:8080` | listen address |
-| `AXON_BASE_URL` | `http://localhost:8080` | public URL; OIDC redirects, session cookie (`__Host-` needs HTTPS), OAuth issuer/resource, links |
+| `AXON_BASE_URL` | `http://localhost:8080` | public URL; OIDC redirects, session cookie (`Secure`, so HTTPS), OAuth issuer/resource, links |
 | `AXON_ALLOW_STDIO` | off | `true` or `1` lets stdio backends run; the only switch for it, the dashboard and API cannot |
 | `AXON_OIDC_ISSUER` | none | with it, a bootstrap OIDC provider is configured (listed first, read-only in the UI, source `env`) |
 | `AXON_OIDC_CLIENT_ID` | none | required when the issuer is set (else startup fails) |
@@ -50,17 +50,17 @@ axon-gateway
 
 ## Container and Compose shape
 
-`example/compose.yml` runs the published image
-(`ghcr.io/mozart409/axon-gateway:latest`) with the config file mounted
-read-only at `/app/config.toml` and passed as the command — that is standalone
-mode. For database mode: mount no config, drop the `command`, and pass the
-environment above instead (the Kubernetes Helm chart does exactly this; see
-`deploy/helm/axon-gateway/README.md`).
+The repo's `example/compose.yml` runs the published image
+(`ghcr.io/mozart409/axon-gateway`; pin a version tag) with the config file
+mounted read-only at `/app/config.toml` and passed as the command. That is
+standalone mode. For database mode: mount no config, drop the `command`, and
+pass the environment above instead (the Kubernetes Helm chart does exactly
+this; see `deploy/helm/axon-gateway/README.md` in the repo).
 
-- **Healthcheck:** the runtime image is the minimal Chainguard `wolfi-base`,
-  which ships no HTTP client. The `compose.yml` healthcheck probes `/health`
-  with `wget`, so the Dockerfile installs `apk add --no-cache wget`; keep that
-  line in sync with the `healthcheck:` block if you edit either.
+- **Healthcheck:** the runtime image is minimal and may ship no `curl`. Probe
+  `/health` (liveness) or `/readyz` (database reachable) from outside, with
+  the orchestrator's HTTP probe, or copy the `healthcheck:` block of
+  `example/compose.yml`.
 - **DNS:** the container fixes `/etc/resolv.conf` at start; pin a resolver
   (`dns:` in Compose or `--dns=<ip>`) or restart the container after the host's
   DNS setup changes, or hostname backends fail with name-resolution errors.

@@ -144,6 +144,7 @@ crates under `tests/` allow them at crate level.
 - **Utils**: dashmap, futures, chrono, uuid
 
 ## Important Notes
+- `skills/axon-prod-setup/` is the operator skill shipped to users; keep it in sync when setup, env vars, admin pages or the config surface change.
 - Edition 2024 is used
 - No lib.rs - this is a binary-only crate
 - Backend actors use real rmcp client connections (not mocks)
