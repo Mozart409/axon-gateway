@@ -13,6 +13,7 @@ use maud::{Markup, html};
 use uuid::Uuid;
 
 use super::AppState;
+use super::audit_views::encode_component;
 use super::shell::{Nav, icon, render_shell};
 use crate::policy::{
     GrantView, GroupView, Permission, Permissions, RoleBinding, RoleSource, RoleSubject, RoleView,
@@ -99,6 +100,8 @@ pub(super) struct AdminOverview {
     pub backends: Vec<String>,
     /// Users a role binding may name; empty without the permission to list them
     pub users: Vec<User>,
+    /// Group and backend the add grant form starts with, from a matrix cell link
+    pub grant_prefill: Option<(String, String)>,
 }
 
 /// Everything `/ui/admin/roles` shows
@@ -363,16 +366,44 @@ fn matrix_cell(overview: &AdminOverview, group: &str, backend: &str) -> Markup {
             format!("{group} may use some tools of {backend} (include, exclude or read-only)"),
         )
     };
-    html! {
-        span class="cell cursor-default" data-state=(state) role="img" aria-label=(title) title=(title) {
-            @if full {
-                (icon("check"))
-            } @else if read_only {
-                "ro"
-            } @else if state == "partial" {
-                "sel"
-            }
+    let content = html! {
+        @if full {
+            (icon("check"))
+        } @else if read_only {
+            "ro"
+        } @else if state == "partial" {
+            "sel"
         }
+    };
+    if !matching.is_empty() {
+        // A grant from the bootstrap has no id and no row to jump to
+        let Some(id) = matching.iter().find_map(|view| view.id) else {
+            return html! {
+                span class="cell" data-state=(state) role="img" aria-label=(title) title=(title) {
+                    (content)
+                }
+            };
+        };
+        let title = format!("{title} \u{2014} show the grant");
+        return html! {
+            a class="cell" href=(format!("#grant-{id}")) data-state=(state) aria-label=(title) title=(title) {
+                (content)
+            }
+        };
+    }
+    if overview.access.manage_groups && !overview.backends.is_empty() {
+        let title = format!("{group} has no grant on {backend} \u{2014} add one");
+        let href = format!(
+            "?group={}&backend={}#add-grant",
+            encode_component(group),
+            encode_component(backend)
+        );
+        return html! {
+            a class="cell" href=(href) data-state="none" aria-label=(title) title=(title) {}
+        };
+    }
+    html! {
+        span class="cell" data-state=(state) role="img" aria-label=(title) title=(title) {}
     }
 }
 
@@ -382,6 +413,13 @@ fn grants_matrix(overview: &AdminOverview) -> Markup {
     html! {
         @if !groups.is_empty() && !backends.is_empty() {
             div class="section-t px-3.5 pt-3" { "Access matrix" }
+            p class=(DESC) {
+                @if overview.access.manage_groups {
+                    "Select a cell to open its grant, or an empty cell to add one."
+                } @else {
+                    "Select a cell to open its grant."
+                }
+            }
             div class="tbl-wrap mt-2 border-t border-border" tabindex="0" role="region" aria-label="Access matrix" {
                 table class="tbl matrix" {
                     thead {
@@ -454,7 +492,7 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                         }
                         tbody {
                             @for view in &overview.grants {
-                                tr {
+                                tr id=[view.id.map(|id| format!("grant-{id}"))] {
                                     td class=(TD) { code class=(CODE) { (view.grant.group) } }
                                     td class=(TD) { code class=(CODE) { (view.grant.backend) } }
                                     td class=(TD) { (globs(&view.grant.include)) }
@@ -487,7 +525,9 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                 @if overview.backends.is_empty() {
                     p class=(EMPTY) { "No backends are configured, so there is nothing to grant." }
                 } @else {
+                    @let prefill = overview.grant_prefill.as_ref();
                     form
+                        id="add-grant"
                         class=(FORM_FOOT)
                         hx-post="/ui/actions/admin/grants"
                         hx-target="#admin-grants"
@@ -497,7 +537,7 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                             "Group"
                             select class=(INPUT) name="group" required {
                                 @for group in &overview.group_names {
-                                    option value=(group) { (group) }
+                                    option value=(group) selected[prefill.is_some_and(|(g, _)| g == group)] { (group) }
                                 }
                             }
                         }
@@ -505,7 +545,7 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                             "Backend"
                             select class=(INPUT) name="backend" required {
                                 @for backend in &overview.backends {
-                                    option value=(backend) { (backend) }
+                                    option value=(backend) selected[prefill.is_some_and(|(_, b)| b == backend)] { (backend) }
                                 }
                             }
                         }
@@ -1395,6 +1435,7 @@ mod tests {
             ],
             backends: vec![String::from("files")],
             users: vec![user(1, "bob@example.com")],
+            grant_prefill: None,
         }
     }
 
@@ -1423,6 +1464,38 @@ mod tests {
         for anchor in ["groups", "grants", "role-bindings"] {
             assert!(html.contains(&format!("id=\"{anchor}\"")));
         }
+    }
+
+    #[tokio::test]
+    async fn matrix_cells_link_to_the_grant_or_to_the_add_form() {
+        let html = page(&overview(FULL));
+
+        // A cell with a grant jumps to its row, which carries the id.
+        assert!(html.contains("href=\"#grant-5\""));
+        assert!(html.contains("href=\"#grant-7\""));
+        assert!(html.contains("<tr id=\"grant-5\">"));
+        assert!(html.contains("<tr id=\"grant-7\">"));
+        // `authenticated` has no grant: its cell opens the add form.
+        assert!(html.contains("href=\"?group=authenticated&amp;backend=files#add-grant\""));
+        assert!(html.contains("id=\"add-grant\""));
+
+        let html = page(&overview(AUDITOR));
+
+        assert!(html.contains("href=\"#grant-5\""));
+        assert!(!html.contains("#add-grant"));
+        assert!(!html.contains("Select a cell to open its grant, or"));
+    }
+
+    #[tokio::test]
+    async fn a_prefill_selects_the_group_and_backend() {
+        let mut overview = overview(FULL);
+        overview.grant_prefill = Some((String::from("devs"), String::from("files")));
+        let html = page(&overview);
+
+        assert!(html.contains("<option value=\"devs\" selected>devs</option>"));
+        assert!(html.contains("<option value=\"files\" selected>files</option>"));
+        assert!(!html.contains("<option value=\"ops\" selected>"));
+        assert!(!page(&self::overview(FULL)).contains("selected"));
     }
 
     #[tokio::test]

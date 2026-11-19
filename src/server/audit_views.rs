@@ -57,7 +57,7 @@ pub(super) struct SettingsPage {
 }
 
 /// Percent-encodes a query value.
-fn encode_component(value: &str) -> String {
+pub(super) fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {

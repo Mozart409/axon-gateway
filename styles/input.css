@@ -313,12 +313,18 @@
   .wf-track > span { position: absolute; top: 0; bottom: 0; border-radius: 3px; background: var(--accent); min-width: 3px; }
 
   /* ---------- Admin bits ---------- */
-  .cell { width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); display: inline-grid; place-items: center; cursor: pointer; color: var(--accent-fg); font: inherit; font-size: 11px; font-weight: 600; padding: 0; }
+  .cell { width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); display: inline-grid; place-items: center; cursor: default; color: var(--accent-fg); font: inherit; font-size: 11px; font-weight: 600; padding: 0; }
+  a.cell { cursor: pointer; text-decoration: none; color: var(--accent-fg); }
+  a.cell[data-state="partial"] { color: var(--text); }
+  a.cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .cell[data-state="full"] { background: var(--accent); border-color: var(--accent); }
   .cell[data-state="partial"] { background: color-mix(in srgb, var(--accent) 20%, transparent); border-color: var(--accent); color: var(--text); }
   .cell[aria-current="true"] { outline: 2px solid var(--text); outline-offset: 1px; }
+  .matrix tbody tr:hover { background: transparent; }
   .matrix th, .matrix td { text-align: center; }
   .matrix th:first-child, .matrix td:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); }
+  #admin-grants tr:target { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  #add-grant, [id^="grant-"] { scroll-margin-top: 16px; }
 
   .switch { width: 34px; height: 20px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); position: relative; flex: none; cursor: pointer; padding: 0; }
   .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--muted); transition: left .15s; }

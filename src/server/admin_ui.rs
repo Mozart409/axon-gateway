@@ -286,6 +286,7 @@ async fn load_overview(
         group_names,
         backends: backend_names(state).await,
         users: load_users(admin).await?,
+        grant_prefill: None,
     })
 }
 
@@ -345,17 +346,31 @@ async fn group_fragment(
     }
 }
 
+/// `GET /ui/admin?group=&backend=`: the add grant form opens with these selected
+#[derive(Debug, Deserialize)]
+pub(super) struct AdminQuery {
+    group: Option<String>,
+    backend: Option<String>,
+}
+
 /// Handle GET /ui/admin - groups, grants and role bindings
 pub(super) async fn handle_admin(
     State(state): State<AppState>,
     user: Option<Extension<SessionUser>>,
+    Query(query): Query<AdminQuery>,
 ) -> Response {
     let (session, admin) = match admin_for(&state, user).await {
         Ok(pair) => pair,
         Err(response) => return *response,
     };
     match load_overview(&state, &session, &admin).await {
-        Ok(overview) => {
+        Ok(mut overview) => {
+            if let (Some(group), Some(backend)) = (query.group, query.backend)
+                && overview.group_names.contains(&group)
+                && overview.backends.contains(&backend)
+            {
+                overview.grant_prefill = Some((group, backend));
+            }
             Html(admin_views::render_admin_page(&state, &session, &overview).into_string())
                 .into_response()
         }
