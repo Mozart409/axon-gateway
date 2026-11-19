@@ -902,6 +902,28 @@ impl<'a> ConfigCtx<'a> {
         Ok(views)
     }
 
+    /// The ids of the OIDC providers, for the passthrough choice of the backend
+    /// form. Readable with the backends, unlike the providers themselves.
+    ///
+    /// # Errors
+    /// Fails without `backends.view` or `backends.manage`, or when the query fails.
+    pub(super) async fn provider_ids(&self) -> Result<Vec<String>, ConfigApiError> {
+        self.require_read(Area::Backends)?;
+        let mut ids: Vec<String> = self
+            .db
+            .bootstrap
+            .oidc
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect();
+        for row in self.store.list_oidc_providers().await? {
+            if !ids.contains(&row.id) {
+                ids.push(row.id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// One provider.
     ///
     /// # Errors

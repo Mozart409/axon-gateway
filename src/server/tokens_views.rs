@@ -24,6 +24,7 @@ const MUTED: &str = "text-sm text-muted";
 const FAINT: &str = "text-muted";
 const CODE: &str = "font-mono";
 const FORM_ROW: &str = "mt-4 flex flex-wrap items-end gap-3";
+const CHECKBOX: &str = "flex items-center gap-2 text-sm";
 const LABEL: &str = "field";
 const INPUT: &str = "input";
 const BUTTON: &str = "btn primary";
@@ -189,7 +190,7 @@ fn render_token_table(
     }
 }
 
-/// The form that issues a token. The backends are a multi-select (the
+/// The form that issues a token. The backends are checkboxes (the
 /// `scope_backends` key repeats), the tool globs one comma separated field. With
 /// `toolsets` there is a select to pin the token to one of them.
 fn render_token_form(
@@ -208,7 +209,7 @@ fn render_token_form(
         {
             label class=(LABEL) {
                 "Name"
-                input class=(INPUT) type="text" name="name" maxlength="100" placeholder="laptop" required;
+                input class=(INPUT) type="text" name="name" maxlength="100" placeholder="e.g. laptop" required;
             }
             label class=(LABEL) {
                 "Expires in (days)"
@@ -221,18 +222,19 @@ fn render_token_form(
                     value=(lifetime_days(DEFAULT_TOKEN_LIFETIME));
             }
             @if !backends.is_empty() {
-                label class=(LABEL) {
-                    "Backends (none selected: all you may use)"
-                    select class=(INPUT) name="scope_backends" multiple size=(backends.len().min(4)) {
-                        @for backend in backends {
-                            option value=(backend) { (backend) }
+                fieldset class=(LABEL) {
+                    "Backends (none ticked: all you may use)"
+                    @for backend in backends {
+                        label class=(CHECKBOX) {
+                            input type="checkbox" name="scope_backends" value=(backend);
+                            (backend)
                         }
                     }
                 }
             }
             label class=(LABEL) {
                 "Tool globs (comma separated, optional)"
-                input class=(format!("{INPUT} w-72")) type="text" name="scope_tools" placeholder="files_read_*, prom_*";
+                input class=(format!("{INPUT} w-72")) type="text" name="scope_tools" placeholder="e.g. files_read_*, prom_*";
             }
             @if !toolsets.is_empty() {
                 label class=(LABEL) {
@@ -485,7 +487,7 @@ pub(super) fn render_service_accounts_section(
                 {
                     label class=(LABEL) {
                         "Name"
-                        input class=(INPUT) type="text" name="name" placeholder="ci-agent" required;
+                        input class=(INPUT) type="text" name="name" placeholder="e.g. ci-agent" required;
                     }
                     label class=(LABEL) {
                         "Description"
@@ -603,8 +605,23 @@ mod tests {
         assert!(html.contains(">active<"));
         assert!(html.contains(">expired<"));
         assert!(html.contains(">revoked<"));
-        // No granted backend, no backend select.
+        // No granted backend, no backend checkboxes.
         assert!(!html.contains("scope_backends"));
+    }
+
+    #[tokio::test]
+    async fn the_token_form_offers_backends_as_checkboxes() {
+        let backends = [String::from("files"), String::from("prom")];
+        let html = render_tokens_section(&[], &backends, &[], None).into_string();
+
+        assert_eq!(
+            html.matches("type=\"checkbox\" name=\"scope_backends\"")
+                .count(),
+            2
+        );
+        assert!(html.contains("value=\"prom\""));
+        assert!(html.contains("none ticked: all you may use"));
+        assert!(!html.contains("<select class=\"input\" name=\"scope_backends\""));
     }
 
     #[tokio::test]

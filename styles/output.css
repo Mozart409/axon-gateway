@@ -2043,6 +2043,15 @@
   .field:has(:user-invalid) .input {
     border-color: var(--err);
   }
+  .mode-section {
+    display: none;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+  }
+  form:has(select[name="credential_mode"] option[value="per_user"]:checked) .mode-per_user, form:has(select[name="credential_mode"] option[value="oauth"]:checked) .mode-oauth, form:has(select[name="credential_mode"] option[value="passthrough"]:checked) .mode-passthrough {
+    display: flex;
+  }
   textarea.input {
     height: auto;
     padding: 6px 10px;

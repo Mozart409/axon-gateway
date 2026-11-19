@@ -168,7 +168,7 @@ fn header_rows() -> Markup {
                         class="input mono"
                         type="text"
                         name="header_name"
-                        placeholder="Authorization"
+                        placeholder="e.g. Authorization"
                         aria-label="Header name"
                         autocomplete="off";
                     input
@@ -267,7 +267,7 @@ fn render_add_server() -> Markup {
             name="prefix"
             maxlength="31"
             pattern=(PREFIX_PATTERN)
-            placeholder="work"
+            placeholder="e.g. work"
             autocomplete="off"
             required;
     };
@@ -285,7 +285,7 @@ fn render_add_server() -> Markup {
                         "The server is tested when you add it and is kept whatever the test finds."
                     }
                     (field("Prefix", "add-server-prefix", &prefix, None, Some(PREFIX_ERROR)))
-                    (url_field("add-server-url", "", "https://mcp.example.com/mcp"))
+                    (url_field("add-server-url", "", "e.g. https://mcp.example.com/mcp"))
                     div class="section-t" { "Headers" }
                     p class="hint" { "Headers sent with every request, such as Authorization (optional):" }
                     (header_rows())
@@ -362,9 +362,6 @@ pub(super) fn render_backends_page(
     backends: &[PersonalBackend],
 ) -> Markup {
     let content = html! {
-        div class="page-head" {
-            h1 { "My MCP servers" }
-        }
         (render_flash_area(false))
         (render_backends_section(backends, None))
     };
@@ -849,9 +846,6 @@ pub(super) fn render_catalog_page(
     manage: bool,
 ) -> Markup {
     let content = html! {
-        div class="page-head" {
-            h1 { "Catalog" }
-        }
         (render_flash_area(false))
         (render_catalog_section(entries, manage))
     };
@@ -933,9 +927,6 @@ pub(super) fn render_admin_page(
     backends: &[AdminPersonalBackend],
 ) -> Markup {
     let content = html! {
-        div class="page-head" {
-            h1 { "Personal MCP servers" }
-        }
         (render_flash_area(false))
         (render_admin_section(backends))
     };

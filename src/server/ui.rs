@@ -25,7 +25,8 @@ use crate::gateway::{
     Caller, DisableBackendMsg, EnableBackendMsg, ForceBackendReconnect, GetDetailedStatus,
     HandleRequest, ReloadConfig,
 };
-use crate::policy::{OptOuts, ToolRef};
+use crate::policy::{OptOuts, Permission, ToolRef};
+use crate::rbac::resolve;
 use crate::store::{SessionUser, Store};
 use crate::types::{JsonRpcRequest, PromptDefinition, ResourceDefinition};
 
@@ -52,8 +53,45 @@ pub(super) async fn handle_ui(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let page = views::render_ui_page(&status, &state, user.as_ref().map(|axum::Extension(u)| u));
+    let session = user.as_ref().map(|axum::Extension(u)| u);
+    let setup = if let Some(session) = session {
+        setup_status(&state, session).await
+    } else {
+        None
+    };
+
+    let page = views::render_ui_page(&status, &state, session, setup);
     Ok(Html(page.into_string()))
+}
+
+/// The setup checklist's state, for gateway admins in database mode; `None` for
+/// everyone else and when the counts cannot be read.
+async fn setup_status(state: &AppState, session: &SessionUser) -> Option<views::SetupStatus> {
+    let (store, providers) = state.multi_user()?;
+    let (_, permissions) = resolve(&state.policy.current(), session);
+    if !permissions.has(Permission::GatewayAdmin) {
+        return None;
+    }
+    let counts = match store.setup_counts().await {
+        Ok(counts) => counts,
+        Err(error) => {
+            tracing::warn!(%error, "could not count the setup steps");
+            return None;
+        }
+    };
+    let env_admin_groups = state
+        .db_config
+        .as_ref()
+        .and_then(|context| context.bootstrap.oidc.as_ref())
+        .is_some_and(|provider| !provider.admin_groups.is_empty());
+
+    Some(views::SetupStatus {
+        provider: !providers.is_empty(),
+        admin_group: env_admin_groups || counts.admin_group_providers > 0,
+        backend: counts.backends > 0,
+        grant: counts.grants > 0,
+        client: counts.clients > 0,
+    })
 }
 
 /// Handle GET /ui/backends/{name} - backend detail page
@@ -224,8 +262,13 @@ pub(super) async fn handle_ui_tool_opt_out(
         Ok(opt_outs) => opt_outs,
         Err(response) => return *response,
     };
-    Html(views::render_tool_backend_section(backend, &effective, &opt_outs).into_string())
-        .into_response()
+    let can_grant = policy
+        .permissions_for(session.user.id, &groups, session.user.is_admin)
+        .has(Permission::GroupsManage);
+    Html(
+        views::render_tool_backend_section(backend, &effective, &opt_outs, can_grant).into_string(),
+    )
+    .into_response()
 }
 
 /// Handle GET /ui/partials/backends - HTML fragment for backend list
@@ -826,7 +869,90 @@ mod tests {
         assert!(html.contains("Open Dashboard"));
         assert!(html.contains("Copy MCP URL"));
         assert!(html.contains("http://127.0.0.1:8080/mcp"));
-        assert!(html.contains("started:"));
+        assert!(html.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+        assert!(!html.contains("pid:"));
+        assert!(!html.contains("started:"));
+    }
+
+    #[tokio::test]
+    async fn fingerprints_split_build_from_runtime() {
+        let state = test_state();
+        let build = views::build_fingerprint(&state);
+        assert!(build.starts_with(concat!("v", env!("CARGO_PKG_VERSION"), " | ")));
+        assert!(!build.contains("pid:"));
+        assert!(!build.contains("started:"));
+
+        let runtime = views::runtime_fingerprint(&state);
+        assert!(runtime.starts_with(&format!("pid:{} | started:", state.process_id)));
+        assert!(runtime.ends_with(" UTC"));
+    }
+
+    fn empty_status() -> crate::gateway::DetailedGatewayStatus {
+        crate::gateway::DetailedGatewayStatus {
+            backend_count: 0,
+            backends: Vec::new(),
+        }
+    }
+
+    fn render_overview(setup: Option<views::SetupStatus>) -> String {
+        views::render_ui_page(
+            &empty_status(),
+            &test_state(),
+            Some(&test_session_user(true)),
+            setup,
+        )
+        .into_string()
+    }
+
+    #[tokio::test]
+    async fn setup_checklist_is_hidden_without_a_status() {
+        let html = render_overview(None);
+        assert!(!html.contains("Set up the gateway"));
+        assert!(html.contains("Connect your client"));
+    }
+
+    #[tokio::test]
+    async fn setup_checklist_counts_done_steps() {
+        let html = render_overview(Some(views::SetupStatus {
+            provider: true,
+            backend: true,
+            ..views::SetupStatus::default()
+        }));
+        assert!(html.contains("Set up the gateway"));
+        assert!(html.contains("2 of 5 done"));
+        assert!(html.contains("Register http://127.0.0.1:8080/auth/callback as the redirect URI"));
+        assert!(html.contains("Add http://127.0.0.1:8080/mcp to Claude Code"));
+        assert!(html.contains("href=\"/ui/admin/config/oidc-providers\""));
+        assert!(html.contains("href=\"/ui/admin/config/backends\""));
+        assert!(html.contains("href=\"/ui/admin#grants\""));
+        assert!(html.contains("href=\"/ui/tokens\""));
+        // The checklist comes first
+        let setup = html.find("Set up the gateway").expect("checklist");
+        let connect = html.find("Connect your client").expect("connect card");
+        assert!(setup < connect);
+    }
+
+    #[tokio::test]
+    async fn setup_checklist_is_hidden_once_everything_is_done() {
+        let html = render_overview(Some(views::SetupStatus {
+            provider: true,
+            admin_group: true,
+            backend: true,
+            grant: true,
+            client: true,
+        }));
+        assert!(!html.contains("Set up the gateway"));
+        assert!(!html.contains("of 5 done"));
+    }
+
+    #[tokio::test]
+    async fn overview_explains_backend_health_and_links_the_tool_pages() {
+        let html = render_overview(None);
+        assert!(html.contains("Your MCP endpoint and the health of the shared backends."));
+        assert!(html.contains("0 running"));
+        assert!(html.contains("href=\"/ui/tools\""));
+        assert!(html.contains("href=\"/ui/catalog\""));
+        assert!(html.contains("No backends currently connected."));
     }
 
     #[tokio::test]
@@ -977,7 +1103,7 @@ mod tests {
     fn render_section(backend: &BackendInfo, opt_outs: &OptOuts) -> String {
         let policy = tools_policy();
         let groups = policy.groups_for(uuid::Uuid::nil(), "pocket", &[String::from("it-claim")]);
-        views::render_tool_backend_section(backend, &policy.effective(&groups), opt_outs)
+        views::render_tool_backend_section(backend, &policy.effective(&groups), opt_outs, false)
             .into_string()
     }
 
@@ -1003,9 +1129,13 @@ mod tests {
         // For a user outside `it`, the same tool is simply not covered.
         let policy = tools_policy();
         let effective = policy.effective(&policy.groups_for(uuid::Uuid::nil(), "pocket", &[]));
-        let html =
-            views::render_tool_backend_section(&files_backend(), &effective, &OptOuts::default())
-                .into_string();
+        let html = views::render_tool_backend_section(
+            &files_backend(),
+            &effective,
+            &OptOuts::default(),
+            false,
+        )
+        .into_string();
         assert!(html.contains("not included by the grant of group authenticated"));
         assert!(!html.contains("group it"));
     }
@@ -1061,8 +1191,49 @@ mod tests {
         let html = render_section(&backend, &OptOuts::default());
         assert!(html.contains("No access"));
         assert!(html.contains("ask an admin"));
+        assert!(!html.contains("Add a grant"));
         assert!(!html.contains("<table"));
         assert!(!html.contains("name=\"backend\""));
+    }
+
+    #[test]
+    fn backend_without_a_grant_offers_group_managers_a_grant_link() {
+        let backend = backend_with("mail", vec![tool("mail", "send", false)]);
+        let policy = tools_policy();
+        let effective = policy.effective(&policy.groups_for(uuid::Uuid::nil(), "pocket", &[]));
+        let html =
+            views::render_tool_backend_section(&backend, &effective, &OptOuts::default(), true)
+                .into_string();
+        assert!(html.contains("No grant yet"));
+        assert!(html.contains("href=\"/ui/admin#grants\""));
+        assert!(html.contains("Add a grant"));
+        assert!(!html.contains("ask an admin"));
+    }
+
+    #[tokio::test]
+    async fn my_tools_page_explains_admin_rights_to_admins_only() {
+        let state = test_state();
+        let policy = state.policy.current();
+        let render = |is_admin: bool| {
+            let user = test_session_user(is_admin);
+            let groups = policy.groups_for(user.user.id, "pocket", &[]);
+            views::render_my_tools_page(
+                &state,
+                &user,
+                &groups,
+                &[],
+                &policy.effective(&groups),
+                &OptOuts::default(),
+            )
+            .into_string()
+        };
+
+        let html = render(true);
+        assert!(html.contains("from your identity provider"));
+        assert!(html.contains("not from a group here"));
+
+        let html = render(false);
+        assert!(!html.contains("from your identity provider"));
     }
 
     #[tokio::test]

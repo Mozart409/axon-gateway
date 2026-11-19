@@ -24,12 +24,13 @@ use super::AppState;
 use super::admin_ui::{AdminForm, error_response, flash_response, fragment, not_found, page_error};
 use super::config_api::{Area, BackendInput, ConfigApiError, ConfigCtx, ProviderInput};
 use super::config_views::{
-    PageCtx, render_backend_edit, render_backend_page, render_backends_page, render_provider_edit,
-    render_provider_page, render_providers_page, render_settings_page, render_settings_section,
-    render_toolset_edit, render_toolset_page, render_toolsets_page,
+    FormEnv, PageCtx, render_backend_edit, render_backend_page, render_backends_page,
+    render_provider_edit, render_provider_page, render_providers_page, render_settings_page,
+    render_settings_section, render_toolset_edit, render_toolset_page, render_toolsets_page,
 };
 use crate::config::{
-    BackendConfig, GatewaySettings, OidcProviderConfig, ToolsetConfig, TransportType,
+    BackendConfig, CredentialField, CredentialMode, GatewaySettings, OidcProviderConfig,
+    PassthroughConfig, PassthroughGrant, ToolsetConfig, TransportType, UpstreamOAuthConfig,
 };
 use crate::rbac::AdminError;
 use crate::store::SessionUser;
@@ -195,8 +196,119 @@ fn secret_rows_of(
     Ok(rows)
 }
 
-/// The fields of the backend form onto `config`. Fields the form does not have
-/// (credential mode, OAuth client, passthrough, credential fields) stay as they are.
+/// The credential fields of a per-user backend (`credential_name`,
+/// `credential_label`, `credential_header`, `credential_prefix`); rows with
+/// nothing in them are the empty ones of the form. The prefix keeps its
+/// spaces, as in `Bearer `.
+fn credential_fields_of(pairs: &[(String, String)]) -> Result<Vec<CredentialField>, AdminError> {
+    let rows = all(pairs, "credential_name")
+        .zip(all(pairs, "credential_label"))
+        .zip(all(pairs, "credential_header"))
+        .zip(all(pairs, "credential_prefix"));
+    let mut fields: Vec<CredentialField> = Vec::new();
+    for (((name, label), header), prefix) in rows {
+        let (name, label, header) = (name.trim(), label.trim(), header.trim());
+        if [name, label, header, prefix]
+            .iter()
+            .all(|cell| cell.is_empty())
+        {
+            continue;
+        }
+        if name.is_empty() || header.is_empty() {
+            return Err(AdminError::Invalid(String::from(
+                "a credential field needs a name and a header",
+            )));
+        }
+        if fields.iter().any(|field| field.name == name) {
+            return Err(AdminError::Invalid(format!(
+                "the credential field {name:?} is listed twice"
+            )));
+        }
+        fields.push(CredentialField {
+            name: name.to_owned(),
+            label: (!label.is_empty()).then(|| label.to_owned()),
+            header: header.to_owned(),
+            prefix: (!prefix.is_empty()).then(|| prefix.to_owned()),
+        });
+    }
+    Ok(fields)
+}
+
+/// The credential mode and the section of the selected mode onto `config`; the
+/// sections of the other modes are dropped. A form without a mode leaves all of
+/// it as it is.
+fn apply_credential_mode(
+    config: &mut BackendConfig,
+    pairs: &[(String, String)],
+) -> Result<(), AdminError> {
+    let Some(mode) = first(pairs, "credential_mode") else {
+        return Ok(());
+    };
+    let stored_oauth = config.oauth.take();
+    config.passthrough = None;
+    config.credential_fields = Vec::new();
+    config.credential_mode = match mode {
+        "shared" => CredentialMode::Shared,
+        "per_user" => {
+            config.credential_fields = credential_fields_of(pairs)?;
+            CredentialMode::PerUser
+        }
+        "oauth" => {
+            let scopes = lines_of(pairs, "oauth_scopes");
+            config.oauth = match text(pairs, "oauth_client_id") {
+                Some(client_id) => Some(UpstreamOAuthConfig {
+                    client_id,
+                    // Not on the form: the environment variable of a file config
+                    client_secret_env: stored_oauth.and_then(|oauth| oauth.client_secret_env),
+                    client_secret: None,
+                    scopes,
+                }),
+                None if scopes.is_empty() => None,
+                None => {
+                    return Err(AdminError::Invalid(String::from(
+                        "OAuth scopes need a client ID; leave both empty to register dynamically",
+                    )));
+                }
+            };
+            CredentialMode::OAuth
+        }
+        "passthrough" => {
+            let grant = match first(pairs, "passthrough_grant").unwrap_or("token_exchange") {
+                "token_exchange" => PassthroughGrant::TokenExchange,
+                "entra_obo" => PassthroughGrant::EntraObo,
+                other => {
+                    return Err(AdminError::Invalid(format!(
+                        "the grant {other:?} is not token_exchange or entra_obo"
+                    )));
+                }
+            };
+            let Some(provider) = text(pairs, "passthrough_provider") else {
+                return Err(AdminError::Invalid(String::from(
+                    "identity passthrough needs the OIDC provider that issued the user's token",
+                )));
+            };
+            config.passthrough = Some(PassthroughConfig {
+                grant,
+                provider,
+                audience: text(pairs, "passthrough_audience"),
+                scope: text(pairs, "passthrough_scope"),
+                resource: text(pairs, "passthrough_resource"),
+                assertion_scope: text(pairs, "passthrough_assertion_scope"),
+            });
+            CredentialMode::Passthrough
+        }
+        other => {
+            return Err(AdminError::Invalid(format!(
+                "the credential mode {other:?} is not shared, per_user, oauth or passthrough"
+            )));
+        }
+    };
+    Ok(())
+}
+
+/// The fields of the backend form onto `config`. A form without a credential
+/// mode leaves the mode and its sections (credential fields, OAuth client,
+/// passthrough) as they are.
 fn apply_backend_form(
     config: &mut BackendConfig,
     pairs: &[(String, String)],
@@ -234,7 +346,7 @@ fn apply_backend_form(
         config.circuit_breaker_cooldown_secs = value;
     }
     config.idle_timeout_secs = number(pairs, "idle_timeout_secs", "the idle timeout")?;
-    Ok(())
+    apply_credential_mode(config, pairs)
 }
 
 /// The backend form as input: the config as `config` holds it with the form's
@@ -361,11 +473,16 @@ async fn handle_backends(
         Ok(pair) => pair,
         Err(response) => return *response,
     };
+    let providers = match ctx.provider_ids().await {
+        Ok(providers) => providers,
+        Err(error) => return page_failure(&state, &session, &error),
+    };
     match ctx.list_backends().await {
         Ok(list) => page_response(render_backends_page(
             &state,
             &session,
             page_ctx(&ctx, Area::Backends),
+            FormEnv::new(&state.base_url, &providers),
             &list,
         )),
         Err(error) => page_failure(&state, &session, &error),
@@ -382,11 +499,16 @@ async fn handle_backend(
         Ok(pair) => pair,
         Err(response) => return *response,
     };
+    let providers = match ctx.provider_ids().await {
+        Ok(providers) => providers,
+        Err(error) => return page_failure(&state, &session, &error),
+    };
     match ctx.get_backend(&name).await {
         Ok(view) => page_response(render_backend_page(
             &state,
             &session,
             page_ctx(&ctx, Area::Backends),
+            FormEnv::new(&state.base_url, &providers),
             &view,
         )),
         Err(error) => page_failure(&state, &session, &error),
@@ -439,10 +561,15 @@ async fn handle_backend_update(
         Ok(input) => input,
         Err(error) => return error_response(&error),
     };
+    let providers = match ctx.provider_ids().await {
+        Ok(providers) => providers,
+        Err(error) => return action_error(&error),
+    };
     match ctx.update_backend(&name, input).await {
         Ok(view) => fragment(&render_backend_edit(
             &view,
             page_ctx(&ctx, Area::Backends),
+            FormEnv::new(&state.base_url, &providers),
             true,
         )),
         Err(error) => action_error(&error),
@@ -830,11 +957,151 @@ mod tests {
         );
     }
 
+    fn oauth_form() -> FormPairs {
+        pairs(&[
+            ("transport", "http"),
+            ("url", "http://localhost:9000/mcp"),
+            ("credential_mode", "oauth"),
+            ("oauth_client_id", "axon-client"),
+            ("oauth_client_secret", ""),
+            ("oauth_scopes", "read\n\n write \n"),
+        ])
+    }
+
+    #[test]
+    fn an_oauth_form_builds_the_static_client_and_keeps_the_secret() {
+        let stored = BackendConfig {
+            name: "wiki".to_owned(),
+            passthrough: Some(PassthroughConfig {
+                grant: PassthroughGrant::TokenExchange,
+                provider: "pocket".to_owned(),
+                audience: None,
+                scope: None,
+                resource: None,
+                assertion_scope: None,
+            }),
+            ..BackendConfig::default()
+        };
+        let input = backend_input_of(stored, &oauth_form()).unwrap();
+        assert_eq!(input.config.credential_mode, CredentialMode::OAuth);
+        let oauth = input.config.oauth.unwrap();
+        assert_eq!(oauth.client_id, "axon-client");
+        assert_eq!(oauth.scopes, ["read", "write"]);
+        assert!(input.config.passthrough.is_none());
+        // Empty keeps the stored secret, a typed one sets it, "clear" clears it
+        assert_eq!(input.oauth_client_secret, None);
+        let mut typed = oauth_form();
+        typed.retain(|(key, _)| key != "oauth_client_secret");
+        typed.push(("oauth_client_secret".to_owned(), "shh".to_owned()));
+        let input = backend_input_of(BackendConfig::default(), &typed).unwrap();
+        assert_eq!(input.oauth_client_secret.as_deref(), Some("shh"));
+        let mut cleared = oauth_form();
+        cleared.push(("clear_oauth_secret".to_owned(), "true".to_owned()));
+        let input = backend_input_of(BackendConfig::default(), &cleared).unwrap();
+        assert_eq!(input.oauth_client_secret, Some(String::new()));
+    }
+
+    #[test]
+    fn an_oauth_form_without_a_client_registers_dynamically() {
+        let form = pairs(&[("credential_mode", "oauth"), ("oauth_client_id", "")]);
+        let input = backend_input_of(BackendConfig::default(), &form).unwrap();
+        assert_eq!(input.config.credential_mode, CredentialMode::OAuth);
+        assert!(input.config.oauth.is_none());
+        let scoped = pairs(&[("credential_mode", "oauth"), ("oauth_scopes", "read")]);
+        assert!(backend_input_of(BackendConfig::default(), &scoped).is_err());
+    }
+
+    #[test]
+    fn a_per_user_form_builds_the_credential_fields() {
+        let form = pairs(&[
+            ("credential_mode", "per_user"),
+            ("credential_name", "token"),
+            ("credential_label", "API token"),
+            ("credential_header", "Authorization"),
+            ("credential_prefix", "Bearer "),
+            ("credential_name", ""),
+            ("credential_label", ""),
+            ("credential_header", ""),
+            ("credential_prefix", ""),
+        ]);
+        let stored = BackendConfig {
+            oauth: Some(UpstreamOAuthConfig {
+                client_id: "old".to_owned(),
+                client_secret_env: None,
+                client_secret: None,
+                scopes: Vec::new(),
+            }),
+            ..BackendConfig::default()
+        };
+        let input = backend_input_of(stored, &form).unwrap();
+        assert_eq!(input.config.credential_mode, CredentialMode::PerUser);
+        assert_eq!(
+            input.config.credential_fields,
+            [CredentialField {
+                name: "token".to_owned(),
+                label: Some("API token".to_owned()),
+                header: "Authorization".to_owned(),
+                prefix: Some("Bearer ".to_owned()),
+            }]
+        );
+        assert!(input.config.oauth.is_none());
+        let headerless = pairs(&[
+            ("credential_mode", "per_user"),
+            ("credential_name", "token"),
+            ("credential_label", ""),
+            ("credential_header", ""),
+            ("credential_prefix", ""),
+        ]);
+        assert!(backend_input_of(BackendConfig::default(), &headerless).is_err());
+    }
+
+    #[test]
+    fn a_passthrough_form_builds_the_exchange() {
+        let form = pairs(&[
+            ("credential_mode", "passthrough"),
+            ("passthrough_grant", "entra_obo"),
+            ("passthrough_provider", "pocket"),
+            ("passthrough_audience", ""),
+            ("passthrough_scope", "api://wiki/.default"),
+            ("passthrough_resource", ""),
+            ("passthrough_assertion_scope", ""),
+        ]);
+        let input = backend_input_of(BackendConfig::default(), &form).unwrap();
+        assert_eq!(input.config.credential_mode, CredentialMode::Passthrough);
+        let passthrough = input.config.passthrough.unwrap();
+        assert_eq!(passthrough.grant, PassthroughGrant::EntraObo);
+        assert_eq!(passthrough.provider, "pocket");
+        assert_eq!(passthrough.scope.as_deref(), Some("api://wiki/.default"));
+        assert_eq!(passthrough.audience, None);
+        let no_provider = pairs(&[("credential_mode", "passthrough")]);
+        assert!(backend_input_of(BackendConfig::default(), &no_provider).is_err());
+    }
+
+    #[test]
+    fn a_shared_form_drops_the_other_sections() {
+        let stored = BackendConfig {
+            credential_mode: CredentialMode::PerUser,
+            credential_fields: vec![CredentialField {
+                name: "token".to_owned(),
+                label: None,
+                header: "Authorization".to_owned(),
+                prefix: None,
+            }],
+            ..BackendConfig::default()
+        };
+        let form = pairs(&[("credential_mode", "shared")]);
+        let input = backend_input_of(stored, &form).unwrap();
+        assert_eq!(input.config.credential_mode, CredentialMode::Shared);
+        assert_eq!(input.config.credential_fields.len(), 0);
+        let unknown = pairs(&[("credential_mode", "magic")]);
+        assert!(backend_input_of(BackendConfig::default(), &unknown).is_err());
+    }
+
     #[test]
     fn the_backend_form_keeps_the_fields_it_does_not_have() {
         let mut config = BackendConfig {
             name: "wiki".to_owned(),
-            credential_mode: crate::config::CredentialMode::PerUser,
+            credential_mode: CredentialMode::PerUser,
             ..BackendConfig::default()
         };
         let form = pairs(&[
@@ -844,10 +1111,7 @@ mod tests {
             ("timeout_secs", "45"),
         ]);
         apply_backend_form(&mut config, &form).unwrap();
-        assert_eq!(
-            config.credential_mode,
-            crate::config::CredentialMode::PerUser
-        );
+        assert_eq!(config.credential_mode, CredentialMode::PerUser);
         assert_eq!(config.url.as_deref(), Some("http://localhost:9000/mcp"));
         assert_eq!(config.timeout_secs, 45);
         assert!(config.enabled);

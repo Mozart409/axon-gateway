@@ -7,6 +7,8 @@
 //! Forms and buttons only render for users who hold the permission, the
 //! service layer in `rbac` still decides.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use maud::{Markup, html};
 use uuid::Uuid;
 
@@ -58,12 +60,22 @@ impl Access {
     }
 }
 
+/// A configured sign-in provider, as far as the admin pages need it
+pub(super) struct ProviderInfo {
+    pub id: String,
+    pub issuer: String,
+    /// Group values that make a user an admin
+    pub admin_groups: Vec<String>,
+}
+
 /// Everything `/ui/admin/users` shows
 pub(super) struct UsersPage {
     pub access: Access,
     /// The signed-in user, who cannot disable themselves
     pub viewer: Uuid,
     pub users: Vec<ManagedUser>,
+    /// The configured providers, to spot users of an issuer none of them has
+    pub providers: Vec<ProviderInfo>,
 }
 
 /// A group and how many users were added to it by hand
@@ -93,6 +105,8 @@ pub(super) struct AdminOverview {
 pub(super) struct RolesPage {
     pub access: Access,
     pub roles: Vec<RoleEntry>,
+    /// The configured providers; their `admin_groups` give the built-in `admin` role
+    pub providers: Vec<ProviderInfo>,
 }
 
 /// Everything `/ui/admin/groups/{name}` shows
@@ -219,7 +233,7 @@ pub(super) fn render_admin_page(
 pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Markup {
     html! {
         section id="admin-groups" class="card" hx-swap-oob=[oob.then_some("true")] {
-            div class="card-h" { h2 { "Groups" } }
+            div class="card-h" { h2 id="groups" { "Groups" } }
             p class=(DESC) {
                 "Users join a group through an IdP mapping or by being added by hand. "
                 "Everyone is also in the built-in authenticated group."
@@ -275,7 +289,7 @@ pub(super) fn render_groups_section(overview: &AdminOverview, oob: bool) -> Mark
                 {
                     label class=(LABEL) {
                         "Name"
-                        input class=(INPUT) type="text" name="name" placeholder="it" required;
+                        input class=(INPUT) type="text" name="name" placeholder="e.g. platform-team" required;
                     }
                     label class=(LABEL) {
                         "Description"
@@ -415,7 +429,7 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
 
     html! {
         section id="admin-grants" class="card" hx-swap-oob=[oob.then_some("true")] {
-            div class="card-h" { h2 { "Grants" } }
+            div class="card-h" { h2 id="grants" { "Grants" } }
             p class=(DESC) {
                 "A grant lets a group use a backend's tools. Include and exclude are globs over the tool's original name."
             }
@@ -501,7 +515,7 @@ pub(super) fn render_grants_section(overview: &AdminOverview, oob: bool) -> Mark
                         }
                         label class=(LABEL) {
                             "Exclude"
-                            input class=(INPUT) type="text" name="exclude" placeholder="delete_*, drop_*";
+                            input class=(INPUT) type="text" name="exclude" placeholder="e.g. delete_*, drop_*";
                         }
                         label class="flex items-center gap-2 pb-2 text-sm text-text" {
                             input class="accent-accent" type="checkbox" name="read_only" value="true";
@@ -527,7 +541,7 @@ pub(super) fn render_bindings_section(overview: &AdminOverview, oob: bool) -> Ma
 
     html! {
         section id="admin-bindings" class="card" hx-swap-oob=[oob.then_some("true")] {
-            div class="card-h" { h2 { "Role bindings" } }
+            div class="card-h" { h2 id="role-bindings" { "Role bindings" } }
             p class=(DESC) {
                 "A role binding gives a role to every member of a group, or to one user. "
                 "A role you do not hold every permission of cannot be given away."
@@ -709,7 +723,17 @@ pub(super) fn render_roles_section(page: &RolesPage) -> Markup {
                                         }
                                     }
                                 }
-                                td class="align-top" { (entry.bindings) }
+                                td class="align-top" {
+                                    (entry.bindings)
+                                    @if role.name == "admin" {
+                                        @for provider in page.providers.iter().filter(|provider| !provider.admin_groups.is_empty()) {
+                                            div class="text-xs text-muted" {
+                                                "+ admin groups of " (provider.id) ": "
+                                                (provider.admin_groups.join(", "))
+                                            }
+                                        }
+                                    }
+                                }
                                 @if manage {
                                     td class="align-top" {
                                         @if role.source == RoleSource::Local {
@@ -738,7 +762,7 @@ pub(super) fn render_roles_section(page: &RolesPage) -> Markup {
                                     class=(INPUT)
                                     type="text"
                                     name="name"
-                                    placeholder="log-reader"
+                                    placeholder="e.g. log-reader"
                                     pattern="[a-z0-9][a-z0-9_\\-]{0,62}"
                                     required;
                             }
@@ -1006,6 +1030,29 @@ pub(super) fn render_users_page(state: &AppState, user: &SessionUser, page: &Use
     render_layout(state, user, "Users", Nav::AdminUsers, &content)
 }
 
+/// An issuer for comparing: a trailing slash does not make another one.
+fn issuer_key(issuer: &str) -> &str {
+    issuer.trim_end_matches('/')
+}
+
+/// The emails (lowercased) that appear under more than one issuer spelling; a
+/// trailing slash counts, since it makes another user
+fn duplicate_emails(users: &[ManagedUser]) -> Vec<String> {
+    let mut seen: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for row in users {
+        let email = row.user.email.as_deref().map(str::trim).unwrap_or_default();
+        if !email.is_empty() {
+            seen.entry(email.to_lowercase())
+                .or_default()
+                .insert(row.user.issuer.as_str());
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, issuers)| issuers.len() > 1)
+        .map(|(email, _)| email)
+        .collect()
+}
+
 fn user_state_badge(disabled: bool) -> Markup {
     html! {
         @if disabled {
@@ -1018,12 +1065,29 @@ fn user_state_badge(disabled: bool) -> Markup {
 
 /// The users table, the swap target of the disable and enable actions.
 pub(super) fn render_users_section(page: &UsersPage) -> Markup {
+    let duplicates = duplicate_emails(&page.users);
     html! {
         section id="admin-users" class="card" {
             div class="card-h" { h2 { "Users" } }
             p class=(DESC) {
                 "A disabled user cannot log in, their sessions end and their tokens stop working. "
                 "Service accounts are on their own page."
+            }
+            @if !duplicates.is_empty() {
+                div class="banner mx-3.5 mt-3" {
+                    span class="text-warn" { (icon("triangle-alert")) }
+                    div {
+                        @if duplicates.len() == 1 {
+                            "1 person appears"
+                        } @else {
+                            (duplicates.len()) " people appear"
+                        }
+                        " under more than one issuer. Users are identified by "
+                        "issuer and subject, so a changed issuer spelling creates new, empty "
+                        "users. Set the provider's issuer back to the old spelling, or disable "
+                        "the stale rows."
+                    }
+                }
             }
             @if page.users.is_empty() {
                 p class=(EMPTY) { "No users yet." }
@@ -1044,7 +1108,7 @@ pub(super) fn render_users_section(page: &UsersPage) -> Markup {
                         }
                         tbody {
                             @for row in &page.users {
-                                (render_user_row(page, row))
+                                (render_user_row(page, row, &duplicates))
                             }
                         }
                     }
@@ -1054,8 +1118,20 @@ pub(super) fn render_users_section(page: &UsersPage) -> Markup {
     }
 }
 
-fn render_user_row(page: &UsersPage, row: &ManagedUser) -> Markup {
+fn render_user_row(page: &UsersPage, row: &ManagedUser, duplicates: &[String]) -> Markup {
     let user = &row.user;
+    // Without any provider there is nothing to compare against, and `axon:`
+    // issuers (the break-glass user) belong to no provider by design.
+    let configured = page.providers.is_empty()
+        || user.issuer.starts_with("axon:")
+        || page
+            .providers
+            .iter()
+            .any(|provider| issuer_key(&provider.issuer) == issuer_key(&user.issuer));
+    let duplicate = user
+        .email
+        .as_deref()
+        .is_some_and(|email| duplicates.contains(&email.trim().to_lowercase()));
     let (action, label, button) = if row.disabled {
         ("enable", "Enable", BUTTON_SMALL)
     } else {
@@ -1069,7 +1145,29 @@ fn render_user_row(page: &UsersPage, row: &ManagedUser) -> Markup {
                     (user_label(user))
                 }
             }
-            td class=(TD) { code class=(CODE) { (user.issuer) } }
+            td class=(TD) {
+                code class=(CODE) { (user.issuer) }
+                @if !configured || duplicate {
+                    div class="mt-1 flex flex-wrap gap-1" {
+                        @if !configured {
+                            span
+                                class="pill warn"
+                                title="No sign-in provider uses this issuer any more; this user cannot log in."
+                            {
+                                "issuer not configured"
+                            }
+                        }
+                        @if duplicate {
+                            span
+                                class="pill warn"
+                                title="The same email also appears under another issuer."
+                            {
+                                "duplicate"
+                            }
+                        }
+                    }
+                }
+            }
             td class=(TD) {
                 @if let Some(at) = row.last_login_at {
                     (at.format("%Y-%m-%d %H:%M UTC"))
@@ -1321,6 +1419,10 @@ mod tests {
         assert!(html.contains("/ui/actions/admin/role-bindings/9/delete"));
         // Subjects are named by email when the user is known.
         assert!(html.contains("bob@example.com"));
+        // Other pages link to the sections by these anchors.
+        for anchor in ["groups", "grants", "role-bindings"] {
+            assert!(html.contains(&format!("id=\"{anchor}\"")));
+        }
     }
 
     #[tokio::test]
@@ -1348,7 +1450,91 @@ mod tests {
                 entry("auditor", RoleSource::Builtin, 2),
                 entry("log-reader", RoleSource::Local, 3),
             ],
+            providers: Vec::new(),
         }
+    }
+
+    fn provider(id: &str, issuer: &str, admin_groups: &[&str]) -> ProviderInfo {
+        ProviderInfo {
+            id: id.to_owned(),
+            issuer: issuer.to_owned(),
+            admin_groups: admin_groups
+                .iter()
+                .map(|group| (*group).to_owned())
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_admin_role_row_lists_the_admin_groups_of_the_providers() {
+        let mut page = roles_page(AUDITOR);
+        page.roles.push(RoleEntry {
+            role: role_view("admin", RoleSource::Builtin, &[Permission::AuditRead]),
+            bindings: 0,
+        });
+        let html = body(&render_roles_page(&test_state(), &session(false), &page).into_string());
+        assert!(!html.contains("admin groups of"));
+
+        page.providers = vec![
+            provider("sso", "https://idp.example", &["axon-admins", "ops"]),
+            provider("other", "https://other.example", &[]),
+        ];
+        let html = body(&render_roles_page(&test_state(), &session(false), &page).into_string());
+        assert_eq!(html.matches("admin groups of").count(), 1);
+        assert!(html.contains("+ admin groups of sso: axon-admins, ops"));
+    }
+
+    fn managed(id: u128, email: &str, issuer: &str) -> ManagedUser {
+        let mut user = user(id, email);
+        user.issuer = issuer.to_owned();
+        ManagedUser {
+            user,
+            last_login_at: None,
+            disabled: false,
+        }
+    }
+
+    fn users_page(users: Vec<ManagedUser>, providers: Vec<ProviderInfo>) -> UsersPage {
+        UsersPage {
+            access: AUDITOR,
+            viewer: Uuid::nil(),
+            users,
+            providers,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_users_page_flags_an_issuer_no_provider_has() {
+        let page = users_page(
+            vec![
+                managed(1, "bob@example.com", "https://idp.example"),
+                managed(2, "eve@example.com", "https://gone.example"),
+            ],
+            // A trailing slash does not make another issuer.
+            vec![provider("sso", "https://idp.example/", &[])],
+        );
+        let html = body(&render_users_page(&test_state(), &session(true), &page).into_string());
+
+        assert_eq!(html.matches("issuer not configured").count(), 1);
+        assert!(html.contains("this user cannot log in"));
+        assert!(!html.contains("more than one issuer"));
+    }
+
+    #[tokio::test]
+    async fn the_users_page_warns_about_one_email_under_two_issuers() {
+        let page = users_page(
+            vec![
+                managed(1, "bob@example.com", "https://idp.example"),
+                managed(2, "Bob@example.com", "https://idp.example/"),
+                managed(3, "eve@example.com", "https://idp.example"),
+            ],
+            vec![provider("sso", "https://idp.example", &[])],
+        );
+        let html = body(&render_users_page(&test_state(), &session(true), &page).into_string());
+
+        assert!(html.contains("1 person appears under more than one issuer"));
+        assert_eq!(html.matches(">duplicate<").count(), 2);
+        assert!(!html.contains("issuer not configured"));
     }
 
     #[tokio::test]

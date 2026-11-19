@@ -24,9 +24,11 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use super::admin_views::{
-    self, Access, AdminOverview, GroupDetail, GroupRow, RolesPage, UsersPage, render_flash_area,
+    self, Access, AdminOverview, GroupDetail, GroupRow, ProviderInfo, RolesPage, UsersPage,
+    render_flash_area,
 };
 use super::{AppState, FlashLevel, FlashMessage, views};
+use crate::config::OidcProviderConfig;
 use crate::gateway::GetDetailedStatus;
 use crate::policy::{AUTHENTICATED_GROUP, GrantConfig, RoleSubject};
 use crate::rbac::{Admin, AdminError, resolve};
@@ -387,10 +389,44 @@ async fn load_users_page(
         access: access_of(state, session),
         viewer: session.user.id,
         users: admin.managed_users(USERS_LIMIT).await?,
+        providers: load_provider_infos(state).await?,
     })
 }
 
-fn load_roles_page(
+/// The sign-in providers: the environment one, then the stored ones by position.
+/// A stored provider that does not parse is left out.
+async fn load_provider_infos(state: &AppState) -> Result<Vec<ProviderInfo>, AdminError> {
+    let Some((store, _)) = state.multi_user() else {
+        return Ok(Vec::new());
+    };
+    let mut configs: Vec<OidcProviderConfig> = Vec::new();
+    if let Some(oidc) = state
+        .db_config
+        .as_ref()
+        .and_then(|context| context.bootstrap.oidc.clone())
+    {
+        configs.push(oidc);
+    }
+    for row in store.list_oidc_providers().await? {
+        if configs.iter().any(|config| config.id == row.id) {
+            continue;
+        }
+        if let Ok(mut config) = serde_json::from_value::<OidcProviderConfig>(row.spec) {
+            config.id = row.id;
+            configs.push(config);
+        }
+    }
+    Ok(configs
+        .into_iter()
+        .map(|config| ProviderInfo {
+            id: config.id,
+            issuer: config.issuer,
+            admin_groups: config.admin_groups,
+        })
+        .collect())
+}
+
+async fn load_roles_page(
     state: &AppState,
     session: &SessionUser,
     admin: &Admin<'_>,
@@ -398,13 +434,14 @@ fn load_roles_page(
     Ok(RolesPage {
         access: access_of(state, session),
         roles: admin.roles()?,
+        providers: load_provider_infos(state).await?,
     })
 }
 
 /// The answer to an action on `/ui/admin/roles`: the re-rendered roles section, or
 /// the error.
-fn roles_fragment(state: &AppState, session: &SessionUser, admin: &Admin<'_>) -> Response {
-    match load_roles_page(state, session, admin) {
+async fn roles_fragment(state: &AppState, session: &SessionUser, admin: &Admin<'_>) -> Response {
+    match load_roles_page(state, session, admin).await {
         Ok(page) => fragment(&admin_views::render_roles_section(&page)),
         Err(error) => error_response(&error),
     }
@@ -419,7 +456,7 @@ pub(super) async fn handle_admin_roles(
         Ok(pair) => pair,
         Err(response) => return *response,
     };
-    match load_roles_page(&state, &session, &admin) {
+    match load_roles_page(&state, &session, &admin).await {
         Ok(page) => Html(admin_views::render_roles_page(&state, &session, &page).into_string())
             .into_response(),
         Err(error) => page_error(&state, &session, &error),
@@ -886,7 +923,7 @@ pub(super) async fn handle_admin_role_create(
     {
         return error_response(&error);
     }
-    roles_fragment(&state, &session, &admin)
+    roles_fragment(&state, &session, &admin).await
 }
 
 /// Handle POST /ui/actions/admin/roles/{name}/update - replace the description and
@@ -908,7 +945,7 @@ pub(super) async fn handle_admin_role_update(
     {
         return error_response(&error);
     }
-    roles_fragment(&state, &session, &admin)
+    roles_fragment(&state, &session, &admin).await
 }
 
 /// Handle POST /ui/actions/admin/roles/{name}/delete - delete a role, and its
@@ -927,5 +964,5 @@ pub(super) async fn handle_admin_role_delete(
     if let Err(error) = admin.delete_role(&name, form.force).await {
         return error_response(&error);
     }
-    roles_fragment(&state, &session, &admin)
+    roles_fragment(&state, &session, &admin).await
 }

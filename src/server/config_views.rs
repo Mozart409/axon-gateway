@@ -25,9 +25,11 @@ use super::admin_views::{render_flash_area, render_layout};
 use super::config_api::{BackendView, ProviderSource, ProviderView, ToolsetView};
 use super::shell::{Nav, icon};
 use crate::config::{
-    BackendConfig, GatewaySettings, OidcProviderConfig, ToolsetConfig, TransportType,
+    BackendConfig, CredentialField, CredentialMode, GatewaySettings, OidcProviderConfig,
+    PassthroughConfig, PassthroughGrant, ToolsetConfig, TransportType,
 };
 use crate::store::SessionUser;
+use crate::upstream_oauth::redirect_uri;
 
 const EDIT: &str = "#config-edit";
 const SETTINGS: &str = "#config-settings";
@@ -42,6 +44,24 @@ const STORED_ROW: &str = "grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto] item
 const NEW_ROW: &str = "grid grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-2";
 /// The body of a card that holds a form
 const FORM_BODY: &str = "card-b flex flex-col gap-4";
+
+/// What the backend forms need besides the backend itself
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FormEnv<'a> {
+    /// The gateway's public URL, for the addresses the OAuth section names
+    base_url: &'a str,
+    /// The ids of the configured OIDC providers, the choices of passthrough
+    providers: &'a [String],
+}
+
+impl<'a> FormEnv<'a> {
+    pub(super) fn new(base_url: &'a str, providers: &'a [String]) -> Self {
+        Self {
+            base_url,
+            providers,
+        }
+    }
+}
 
 /// The pages the sub-navigation links to
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +113,26 @@ fn set_badge(set: bool) -> Markup {
 /// One entry per line of a list field
 fn lines(items: &[String]) -> String {
     items.join("\n")
+}
+
+/// The value of a credential mode, as the form and the JSON API spell it
+fn mode_value(mode: CredentialMode) -> &'static str {
+    match mode {
+        CredentialMode::Shared => "shared",
+        CredentialMode::PerUser => "per_user",
+        CredentialMode::OAuth => "oauth",
+        CredentialMode::Passthrough => "passthrough",
+    }
+}
+
+/// The credential mode as a table cell and a note read it
+fn mode_name(mode: CredentialMode) -> &'static str {
+    match mode {
+        CredentialMode::Shared => "shared",
+        CredentialMode::PerUser => "per user",
+        CredentialMode::OAuth => "OAuth",
+        CredentialMode::Passthrough => "passthrough",
+    }
 }
 
 fn transport_name(transport: TransportType) -> &'static str {
@@ -237,6 +277,27 @@ fn check_field(label: &str, name: &str, checked: bool) -> Markup {
     }
 }
 
+/// A select over `(value, label)` options
+fn select_field(
+    scope: &str,
+    label: &str,
+    name: &str,
+    options: &[(&str, &str)],
+    selected: &str,
+) -> Markup {
+    let id = format!("{scope}-{name}");
+    html! {
+        div class="field" {
+            label for=(id) { (label) }
+            select class="input" id=(id) name=(name) {
+                @for (value, text) in options {
+                    option value=(value) selected[*value == selected] { (text) }
+                }
+            }
+        }
+    }
+}
+
 /// A password input for a secret whose stored value is never shown: empty keeps
 /// it, and a "clear" checkbox appears while one is stored
 fn secret_field(scope: &str, label: &str, name: &str, clear_name: &str, set: bool) -> Markup {
@@ -298,7 +359,7 @@ fn secret_rows(prefix: &str, placeholder: &str, existing: &[String]) -> Markup {
                         class="input mono"
                         type="text"
                         name=(name_key)
-                        placeholder=(placeholder)
+                        placeholder=(format!("e.g. {placeholder}"))
                         aria-label="Name"
                         autocomplete="off";
                     input
@@ -327,7 +388,11 @@ fn page(
     let mut links = Vec::new();
     if ctx.read_backends {
         links.push((Section::Backends, "/ui/admin/config/backends", "Backends"));
-        links.push((Section::Toolsets, "/ui/admin/config/toolsets", "Toolsets"));
+        links.push((
+            Section::Toolsets,
+            "/ui/admin/config/toolsets",
+            "Gateway toolsets",
+        ));
     }
     if ctx.read_gateway {
         links.push((
@@ -340,7 +405,6 @@ fn page(
     let content = html! {
         div class="page-head" {
             div class="flex min-w-0 flex-1 flex-col gap-1" {
-                h1 { (title) }
                 p { (intro) }
             }
         }
@@ -375,13 +439,150 @@ fn saved_note() -> Markup {
     }
 }
 
-const JSON_ONLY: &str = "Per-user, OAuth and passthrough backends, credential fields and the \
-                         OAuth client are edited through the JSON API \
-                         (PUT /api/v1/admin/config/backends/{name}); saving here keeps them.";
-
 // -- backends -----------------------------------------------------------------
 
-fn backend_fields(view: Option<&BackendView>, ctx: PageCtx) -> Markup {
+/// One row of the credential fields of a per-user backend: its key, label,
+/// header and prefix. Unlike header values these are not secret, so the stored
+/// rows show them.
+fn credential_row(field: Option<&CredentialField>) -> Markup {
+    let name = field.map_or("", |field| field.name.as_str());
+    let label = field
+        .and_then(|field| field.label.as_deref())
+        .unwrap_or_default();
+    let header = field.map_or("", |field| field.header.as_str());
+    let prefix = field
+        .and_then(|field| field.prefix.as_deref())
+        .unwrap_or_default();
+    html! {
+        div class="form-grid" {
+            input
+                class="input mono"
+                type="text"
+                name="credential_name"
+                value=(name)
+                placeholder="e.g. api_key"
+                aria-label="Key"
+                autocomplete="off";
+            input
+                class="input"
+                type="text"
+                name="credential_label"
+                value=(label)
+                placeholder="e.g. API key"
+                aria-label="Label"
+                autocomplete="off";
+            input
+                class="input mono"
+                type="text"
+                name="credential_header"
+                value=(header)
+                placeholder="e.g. Authorization"
+                aria-label="Header"
+                autocomplete="off";
+            input
+                class="input mono"
+                type="text"
+                name="credential_prefix"
+                value=(prefix)
+                placeholder="e.g. Bearer "
+                aria-label="Prefix"
+                autocomplete="off";
+        }
+    }
+}
+
+/// The credential mode select and the section of each mode. Only the section
+/// of the selected mode shows (a `:has()` rule in the stylesheet, no script);
+/// all of them are in the form, and the server reads only the selected one.
+fn credential_fields(
+    scope: &str,
+    view: Option<&BackendView>,
+    config: &BackendConfig,
+    env: FormEnv<'_>,
+) -> Markup {
+    let passthrough = config.passthrough.as_ref();
+    let oauth = config.oauth.as_ref();
+    let provider = passthrough.map_or("", |passthrough| passthrough.provider.as_str());
+    let mut providers: Vec<(&str, &str)> = vec![("", "Choose a provider")];
+    providers.extend(env.providers.iter().map(|id| (id.as_str(), id.as_str())));
+    if !provider.is_empty() && !env.providers.iter().any(|id| id == provider) {
+        providers.push((provider, provider));
+    }
+    let grant = match passthrough.map(|passthrough| passthrough.grant) {
+        Some(PassthroughGrant::EntraObo) => "entra_obo",
+        _ => "token_exchange",
+    };
+    let passthrough_text = |pick: fn(&PassthroughConfig) -> Option<&str>| {
+        passthrough.and_then(pick).unwrap_or_default().to_owned()
+    };
+    let callback = redirect_uri(env.base_url);
+    html! {
+        (select_field(
+            scope,
+            "Credential mode",
+            "credential_mode",
+            &[
+                ("shared", "Shared (one connection with the backend's token and headers)"),
+                ("per_user", "Per user (each user stores their own credential)"),
+                ("oauth", "OAuth (each user connects their account)"),
+                ("passthrough", "Identity passthrough (the gateway exchanges the user's sign-in)"),
+            ],
+            mode_value(config.credential_mode),
+        ))
+        fieldset class="mode-section mode-per_user" {
+            legend class="section-t" { "Per-user credential" }
+            p class="hint" {
+                "Each user enters a value per key. The gateway sends it in the header, "
+                "after the prefix. Empty rows are ignored."
+            }
+            @for field in &config.credential_fields {
+                (credential_row(Some(field)))
+            }
+            @for _ in 0..SECRET_ROWS {
+                (credential_row(None))
+            }
+        }
+        fieldset class="mode-section mode-oauth" {
+            legend class="section-t" { "OAuth client" }
+            p class="muted" {
+                "Leave the client empty to use the gateway's client metadata document or dynamic registration. "
+                "Users are sent back to " span class="mono" { (callback) } "."
+            }
+            (text_field(scope, "Client ID", "oauth_client_id", oauth.map_or("", |oauth| oauth.client_id.as_str()), NO_RULE))
+            (secret_field(
+                scope,
+                "Client secret (empty for a public client)",
+                "oauth_client_secret",
+                "clear_oauth_secret",
+                view.is_some_and(|view| view.oauth_client_secret_set),
+            ))
+            (lines_field(scope, "Scopes (empty uses the ones the backend advertises)", "oauth_scopes", oauth.map_or(&[], |oauth| oauth.scopes.as_slice())))
+        }
+        fieldset class="mode-section mode-passthrough" {
+            legend class="section-t" { "Identity passthrough" }
+            p class="hint" {
+                "The gateway trades the user's sign-in token from this provider for one the backend accepts."
+            }
+            (select_field(
+                scope,
+                "Grant",
+                "passthrough_grant",
+                &[
+                    ("token_exchange", "Token exchange (RFC 8693)"),
+                    ("entra_obo", "Entra on-behalf-of"),
+                ],
+                grant,
+            ))
+            (select_field(scope, "OIDC provider", "passthrough_provider", &providers, provider))
+            (text_field(scope, "Audience", "passthrough_audience", &passthrough_text(|passthrough| passthrough.audience.as_deref()), NO_RULE))
+            (text_field(scope, "Scope", "passthrough_scope", &passthrough_text(|passthrough| passthrough.scope.as_deref()), NO_RULE))
+            (text_field(scope, "Resource", "passthrough_resource", &passthrough_text(|passthrough| passthrough.resource.as_deref()), NO_RULE))
+            (text_field(scope, "Assertion scope (Entra; default: the gateway's own API)", "passthrough_assertion_scope", &passthrough_text(|passthrough| passthrough.assertion_scope.as_deref()), NO_RULE))
+        }
+    }
+}
+
+fn backend_fields(view: Option<&BackendView>, ctx: PageCtx, env: FormEnv<'_>) -> Markup {
     let defaults = BackendConfig {
         transport: TransportType::Http,
         ..BackendConfig::default()
@@ -434,6 +635,7 @@ fn backend_fields(view: Option<&BackendView>, ctx: PageCtx) -> Markup {
             (number_field(scope, "Breaker cooldown (s)", "circuit_breaker_cooldown_secs", Some(config.circuit_breaker_cooldown_secs)))
             (number_field(scope, "Idle timeout (s, empty = gateway default)", "idle_timeout_secs", config.idle_timeout_secs))
         }
+        (credential_fields(scope, view, config, env))
         (secret_field(
             scope,
             "Auth token (Bearer)",
@@ -450,15 +652,6 @@ fn backend_fields(view: Option<&BackendView>, ctx: PageCtx) -> Markup {
             h3 class="section-t" { "Environment (stdio)" }
             p class="hint" { "Values are secret. Empty rows are ignored." }
             div class="mt-1" { (secret_rows("env", "API_KEY", env_names)) }
-        }
-        @if config.oauth.is_some() {
-            (secret_field(
-                scope,
-                "OAuth client secret",
-                "oauth_client_secret",
-                "clear_oauth_secret",
-                view.is_some_and(|view| view.oauth_client_secret_set),
-            ))
         }
     }
 }
@@ -477,6 +670,7 @@ fn backend_row(view: &BackendView) -> Markup {
                     (config.name)
                 }
             }
+            td { (mode_name(config.credential_mode)) }
             td { (transport_name(config.transport)) }
             td { span class="mono" { (target) } }
             td { (enabled_badge(config.enabled)) }
@@ -491,6 +685,7 @@ pub(super) fn render_backends_page(
     state: &AppState,
     user: &SessionUser,
     ctx: PageCtx,
+    env: FormEnv<'_>,
     backends: &[BackendView],
 ) -> Markup {
     let body = html! {
@@ -503,7 +698,6 @@ pub(super) fn render_backends_page(
                     (drawer_trigger("new-backend", "Add a backend"))
                 }
             }
-            div class="card-b" { p class="hint" { (JSON_ONLY) } }
             @if backends.is_empty() {
                 div class="card-b muted" { "No backends in the database yet." }
             } @else {
@@ -512,6 +706,7 @@ pub(super) fn render_backends_page(
                         thead {
                             tr {
                                 th { "Name" }
+                                th { "Mode" }
                                 th { "Transport" }
                                 th { "Target" }
                                 th { "State" }
@@ -536,7 +731,7 @@ pub(super) fn render_backends_page(
                     hx-post="/ui/actions/admin/config/backends"
                     hx-swap="none"
                 {
-                    div class="drawer-b" { (backend_fields(None, ctx)) }
+                    div class="drawer-b" { (backend_fields(None, ctx, env)) }
                     (drawer_foot("new-backend", "Create backend"))
                 }
             }
@@ -554,7 +749,12 @@ pub(super) fn render_backends_page(
 }
 
 /// The edit section of a backend, also the fragment a save answers with
-pub(super) fn render_backend_edit(view: &BackendView, ctx: PageCtx, saved: bool) -> Markup {
+pub(super) fn render_backend_edit(
+    view: &BackendView,
+    ctx: PageCtx,
+    env: FormEnv<'_>,
+    saved: bool,
+) -> Markup {
     let config = &view.config;
     let base = format!("/ui/actions/admin/config/backends/{}", config.name);
     html! {
@@ -566,16 +766,15 @@ pub(super) fn render_backend_edit(view: &BackendView, ctx: PageCtx, saved: bool)
             div class="card-b flex flex-col gap-2" {
                 p class="muted" {
                     "Created " (when(view.created_at)) ", changed " (when(view.updated_at)) ". "
-                    "Credential mode: " span class="mono" { (format!("{:?}", config.credential_mode)) } "."
+                    "Credential mode: " span class="mono" { (mode_name(config.credential_mode)) } "."
                 }
-                p class="hint" { (JSON_ONLY) }
             }
             @if saved {
                 (saved_note())
             }
             @if ctx.can_write {
                 form hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
-                    div class=(FORM_BODY) { (backend_fields(Some(view), ctx)) }
+                    div class=(FORM_BODY) { (backend_fields(Some(view), ctx, env)) }
                     div class="card-f" {
                         button class="btn primary" type="submit" { "Save backend" }
                     }
@@ -602,11 +801,12 @@ pub(super) fn render_backend_page(
     state: &AppState,
     user: &SessionUser,
     ctx: PageCtx,
+    env: FormEnv<'_>,
     view: &BackendView,
 ) -> Markup {
     let body = html! {
         (back_to("/ui/admin/config/backends", "All backends"))
-        (render_backend_edit(view, ctx, false))
+        (render_backend_edit(view, ctx, env, false))
     };
     page(
         state,
@@ -654,7 +854,7 @@ pub(super) fn render_toolsets_page(
     let body = html! {
         section class="card" {
             div class="card-h" {
-                h2 { "Toolsets" }
+                h2 { "Gateway toolsets" }
                 span class="muted" { (toolsets.len()) }
                 span class="spacer" {}
                 @if ctx.can_write {
@@ -669,7 +869,7 @@ pub(super) fn render_toolsets_page(
             @if toolsets.is_empty() {
                 div class="card-b muted" { "No toolsets in the database yet." }
             } @else {
-                div class="tbl-wrap" tabindex="0" role="region" aria-label="Toolsets" {
+                div class="tbl-wrap" tabindex="0" role="region" aria-label="Gateway toolsets" {
                     table class="tbl" {
                         thead {
                             tr {
@@ -716,7 +916,7 @@ pub(super) fn render_toolsets_page(
         user,
         ctx,
         Section::Toolsets,
-        "Toolsets",
+        "Gateway toolsets",
         "Gateway toolsets, as opposed to the toolsets people make for themselves.",
         &body,
     )
@@ -846,6 +1046,61 @@ fn source_badge(source: ProviderSource) -> Markup {
     }
 }
 
+/// One address to register at the identity provider, with its copy button
+fn copy_value(label: &str, hint: &str, value: &str) -> Markup {
+    html! {
+        div class="flex flex-col gap-1" {
+            p class="section-t" { (label) }
+            div class="copyline" {
+                code class="mono" { (value) }
+                button
+                    class="btn sm ghost"
+                    type="button"
+                    data-copy=(value)
+                    aria-label=(format!("Copy the {}", label.to_lowercase()))
+                {
+                    "Copy"
+                }
+            }
+            p class="hint" { (hint) }
+        }
+    }
+}
+
+/// The card with the addresses the identity provider must be told about
+fn idp_values(base_url: &str) -> Markup {
+    let base = base_url.trim_end_matches('/');
+    html! {
+        section class="card" {
+            div class="card-h" { h2 { "Values for your identity provider" } }
+            div class=(FORM_BODY) {
+                (copy_value(
+                    "Redirect URI",
+                    "Where the provider sends users after they sign in.",
+                    &format!("{base}/auth/callback"),
+                ))
+                (copy_value(
+                    "Post-logout redirect URI",
+                    "Where the provider sends users after they sign out.",
+                    &format!("{base}/"),
+                ))
+                (copy_value(
+                    "Upstream OAuth callback",
+                    "For OAuth backends; register it with the backend's authorization server.",
+                    &redirect_uri(base_url),
+                ))
+                p class="muted" {
+                    "Keep each issuer URL exactly as the provider writes it in its tokens. "
+                    "Users are identified by issuer and subject, so a changed spelling "
+                    "(localhost vs 127.0.0.1, a trailing slash) creates new, empty users."
+                }
+                p class="hint" id="copy-feedback" aria-live="polite" { "" }
+            }
+        }
+        script src="/static/copy-url.js" defer {}
+    }
+}
+
 /// `GET /ui/admin/config/oidc-providers`
 pub(super) fn render_providers_page(
     state: &AppState,
@@ -854,6 +1109,7 @@ pub(super) fn render_providers_page(
     providers: &[ProviderView],
 ) -> Markup {
     let body = html! {
+        (idp_values(&state.base_url))
         section class="card" {
             div class="card-h" {
                 h2 { "OIDC providers" }
@@ -882,6 +1138,8 @@ pub(super) fn render_providers_page(
                                 th { "Source" }
                                 th { "Issuer" }
                                 th { "Client ID" }
+                                th { "Scopes" }
+                                th { "Admin groups" }
                                 th { "Secret" }
                             }
                         }
@@ -896,6 +1154,8 @@ pub(super) fn render_providers_page(
                                     td { (source_badge(view.source)) }
                                     td { span class="mono" { (view.config.issuer) } }
                                     td { span class="mono" { (view.config.client_id) } }
+                                    td { span class="mono" { (view.config.scopes.join(" ")) } }
+                                    td { (view.config.admin_groups.join(", ")) }
                                     td { (set_badge(view.client_secret_set)) }
                                 }
                             }
@@ -1093,8 +1353,12 @@ pub(super) fn render_settings_page(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::config::UpstreamOAuthConfig;
+    use crate::server::tests::test_state;
+    use crate::store::User;
 
     const CTX: PageCtx = PageCtx {
         read_backends: true,
@@ -1102,6 +1366,44 @@ mod tests {
         can_write: true,
         allow_stdio: false,
     };
+
+    const BASE: &str = "https://axon.example.com";
+
+    fn env(providers: &[String]) -> FormEnv<'_> {
+        FormEnv::new(BASE, providers)
+    }
+
+    fn session() -> SessionUser {
+        SessionUser {
+            user: User {
+                id: Uuid::nil(),
+                issuer: String::from("https://idp.example"),
+                subject: String::from("sub-1"),
+                email: None,
+                display_name: None,
+                groups: Vec::new(),
+                is_admin: true,
+            },
+            provider_id: String::from("pocket"),
+            csrf_token: String::from("tok-123"),
+        }
+    }
+
+    fn provider(id: &str) -> ProviderView {
+        ProviderView {
+            source: ProviderSource::Database,
+            config: OidcProviderConfig {
+                id: id.to_owned(),
+                issuer: String::from("https://idp.example"),
+                client_id: String::from("axon"),
+                admin_groups: vec![String::from("axon-admins")],
+                ..OidcProviderConfig::default()
+            },
+            client_secret_set: true,
+            position: Some(0),
+            updated_at: None,
+        }
+    }
 
     fn view() -> BackendView {
         BackendView {
@@ -1122,7 +1424,7 @@ mod tests {
 
     #[test]
     fn the_backend_form_keeps_secrets_unless_typed_or_cleared() {
-        let html = render_backend_edit(&view(), CTX, false).into_string();
+        let html = render_backend_edit(&view(), CTX, env(&[]), false).into_string();
         assert!(html.contains("name=\"clear_auth_token\""));
         assert!(html.contains("stored; leave empty to keep it"));
         assert!(html.contains("name=\"header_remove\" value=\"X-Key\""));
@@ -1131,8 +1433,121 @@ mod tests {
 
     #[test]
     fn the_create_form_says_when_stdio_is_off() {
-        let html = backend_fields(None, CTX).into_string();
+        let html = backend_fields(None, CTX, env(&[])).into_string();
         assert!(html.contains("stdio backends are off"));
         assert!(html.contains("name=\"name\""));
+    }
+
+    #[test]
+    fn the_backend_form_has_the_mode_select_and_a_section_per_mode() {
+        let providers = vec![String::from("pocket")];
+        let html = backend_fields(None, CTX, env(&providers)).into_string();
+        assert!(html.contains("name=\"credential_mode\""));
+        for mode in ["shared", "per_user", "oauth", "passthrough"] {
+            assert!(
+                html.contains(&format!("<option value=\"{mode}\"")),
+                "{mode}"
+            );
+        }
+        for section in ["mode-per_user", "mode-oauth", "mode-passthrough"] {
+            assert!(html.contains(&format!("fieldset class=\"mode-section {section}\"")));
+        }
+        assert!(html.contains("name=\"credential_header\""));
+        assert!(html.contains("name=\"oauth_client_secret\""));
+        assert!(html.contains("<option value=\"pocket\""));
+        assert!(html.contains("Users are sent back to"));
+        assert!(html.contains("https://axon.example.com/oauth/upstream/callback"));
+        assert!(!html.contains("JSON API"));
+    }
+
+    #[test]
+    fn the_backend_form_shows_the_stored_mode_and_its_values() {
+        let mut view = view();
+        view.config.credential_mode = CredentialMode::OAuth;
+        view.config.oauth = Some(UpstreamOAuthConfig {
+            client_id: String::from("axon-client"),
+            client_secret_env: None,
+            client_secret: None,
+            scopes: vec![String::from("read"), String::from("write")],
+        });
+        view.oauth_client_secret_set = true;
+        view.config.credential_fields = vec![CredentialField {
+            name: String::from("token"),
+            label: Some(String::from("API token")),
+            header: String::from("Authorization"),
+            prefix: Some(String::from("Bearer ")),
+        }];
+        let html = render_backend_edit(&view, CTX, env(&[]), false).into_string();
+        assert!(html.contains("<option value=\"oauth\" selected"));
+        assert!(html.contains("value=\"axon-client\""));
+        assert!(html.contains("read\nwrite"));
+        assert!(html.contains("name=\"clear_oauth_secret\""));
+        assert!(html.contains("value=\"Bearer \""));
+    }
+
+    #[tokio::test]
+    async fn the_backends_table_has_a_mode_column() {
+        let mut oauth = view();
+        oauth.config.credential_mode = CredentialMode::PerUser;
+        let html =
+            render_backends_page(&test_state(), &session(), CTX, env(&[]), &[oauth]).into_string();
+        assert!(html.contains("<th>Mode</th>"));
+        assert!(html.contains("<td>per user</td>"));
+    }
+
+    #[tokio::test]
+    async fn the_providers_page_lists_the_values_for_the_identity_provider() {
+        let html = render_providers_page(&test_state(), &session(), CTX, &[provider("pocket")])
+            .into_string();
+        assert!(html.contains("Values for your identity provider"));
+        assert!(html.contains("http://127.0.0.1:8080/auth/callback"));
+        assert!(html.contains("<code class=\"mono\">http://127.0.0.1:8080/</code>"));
+        assert!(html.contains("http://127.0.0.1:8080/oauth/upstream/callback"));
+        assert!(html.contains("data-copy=\"http://127.0.0.1:8080/auth/callback\""));
+        assert!(html.contains("Keep each issuer URL exactly as the provider writes it"));
+        assert!(html.contains("<th>Admin groups</th>"));
+        assert!(html.contains("axon-admins"));
+    }
+
+    #[tokio::test]
+    async fn every_config_page_has_exactly_one_h1() {
+        let h1s = |html: String| html.matches("<h1").count();
+        let providers = [provider("pocket")];
+        assert_eq!(
+            h1s(render_providers_page(&test_state(), &session(), CTX, &providers).into_string()),
+            1
+        );
+        assert_eq!(
+            h1s(
+                render_backends_page(&test_state(), &session(), CTX, env(&[]), &[view()])
+                    .into_string()
+            ),
+            1
+        );
+        assert_eq!(
+            h1s(
+                render_backend_page(&test_state(), &session(), CTX, env(&[]), &view())
+                    .into_string()
+            ),
+            1
+        );
+        assert_eq!(
+            h1s(render_toolsets_page(&test_state(), &session(), CTX, &[]).into_string()),
+            1
+        );
+        assert_eq!(
+            h1s(
+                render_settings_page(&test_state(), &session(), CTX, &GatewaySettings::default())
+                    .into_string()
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_toolsets_tab_is_called_gateway_toolsets() {
+        let html = render_toolsets_page(&test_state(), &session(), CTX, &[]).into_string();
+        assert!(html.contains("Gateway toolsets"));
+        assert!(!html.contains(">Toolsets<"));
     }
 }

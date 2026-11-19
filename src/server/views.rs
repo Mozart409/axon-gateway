@@ -10,7 +10,10 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use super::shell::{Nav, current_theme, icon, render_shell};
 use super::{AppState, FlashLevel, FlashMessage};
 use crate::gateway::DetailedGatewayStatus;
-use crate::policy::{AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, ToolRef};
+use crate::policy::{
+    AUTHENTICATED_GROUP, EffectivePolicy, Explanation, Miss, OptOuts, Permission, ToolRef,
+};
+use crate::rbac::resolve;
 use crate::store::SessionUser;
 use crate::types::{
     BackendInfo, BackendState, NamespacedTool, PromptDefinition, ResourceDefinition,
@@ -160,17 +163,115 @@ pub(super) fn csrf_hx_headers(user: &SessionUser) -> String {
     serde_json::json!({ "X-CSRF-Token": user.csrf_token }).to_string()
 }
 
-/// Full dashboard page (`GET /ui`).
+/// Which steps of the first-run setup are done (database mode, gateway admins).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools, reason = "one flag per checklist step")]
+pub(super) struct SetupStatus {
+    /// At least one OIDC provider is configured
+    pub provider: bool,
+    /// Some provider has `admin_groups`
+    pub admin_group: bool,
+    /// At least one shared or catalog backend is configured
+    pub backend: bool,
+    /// At least one grant exists
+    pub grant: bool,
+    /// A token or an MCP OAuth grant exists
+    pub client: bool,
+}
+
+impl SetupStatus {
+    fn done_count(self) -> usize {
+        [
+            self.provider,
+            self.admin_group,
+            self.backend,
+            self.grant,
+            self.client,
+        ]
+        .into_iter()
+        .filter(|done| *done)
+        .count()
+    }
+}
+
+/// One row of the setup checklist.
+fn render_setup_step(done: bool, title: &str, text: &str, href: &str) -> Markup {
+    html! {
+        a class="row" href=(href) {
+            @if done {
+                span class="text-ok" role="img" aria-label="done" { (icon("check")) }
+            } @else {
+                span class="muted" role="img" aria-label="not done" { (icon("clock")) }
+            }
+            div class="row-main" {
+                span class="font-medium" { (title) }
+                span class="row-sub whitespace-normal" { (text) }
+            }
+        }
+    }
+}
+
+/// The "Set up the gateway" card of the overview; callers hide it once every
+/// step is done.
+fn render_setup_card(state: &AppState, setup: SetupStatus) -> Markup {
+    let base_url = state.base_url.trim_end_matches('/');
+
+    html! {
+        section class="card" {
+            div class="card-h" {
+                (icon("list"))
+                h2 { "Set up the gateway" }
+                span class="pill" { (setup.done_count()) " of 5 done" }
+            }
+            div class="list" {
+                (render_setup_step(
+                    setup.provider,
+                    "Sign-in provider",
+                    &format!("Register {base_url}/auth/callback as the redirect URI at your identity provider."),
+                    "/ui/admin/config/oidc-providers",
+                ))
+                (render_setup_step(
+                    setup.admin_group,
+                    "Admin group",
+                    "Members of these IdP groups become admins at login. Without one, only a break-glass link gets you in.",
+                    "/ui/admin/config/oidc-providers",
+                ))
+                (render_setup_step(
+                    setup.backend,
+                    "First backend",
+                    "Add the MCP servers the gateway should aggregate.",
+                    "/ui/admin/config/backends",
+                ))
+                (render_setup_step(
+                    setup.grant,
+                    "First grant",
+                    "Tools show up only through a grant, for admins too. A grant for the group authenticated covers everyone.",
+                    "/ui/admin#grants",
+                ))
+                (render_setup_step(
+                    setup.client,
+                    "Connect a client",
+                    &format!("Add {base_url}/mcp to Claude Code or another MCP client, or create a token for scripts."),
+                    "/ui/tokens",
+                ))
+            }
+        }
+    }
+}
+
+/// Full dashboard page (`GET /ui`). `setup` is `Some` only for gateway admins
+/// in database mode; the checklist disappears once every step is done.
 pub(super) fn render_ui_page(
     status: &DetailedGatewayStatus,
     state: &AppState,
     user: Option<&SessionUser>,
+    setup: Option<SetupStatus>,
 ) -> Markup {
     let mcp_server_url = build_mcp_server_url(&state.base_url);
     let content = html! {
         div class="flex flex-col gap-4" {
             div class="page-head" {
-                p { "Live backend health, with SSE updates and HTMX actions." }
+                p { "Your MCP endpoint and the health of the shared backends." }
                 // Database mode has no config file to reload
                 @if state.config_path.is_some() {
                     span class="spacer" {}
@@ -183,6 +284,9 @@ pub(super) fn render_ui_page(
                         (icon("refresh-cw")) "Reload Config"
                     }
                 }
+            }
+            @if let Some(setup) = setup.filter(|setup| setup.done_count() < 5) {
+                (render_setup_card(state, setup))
             }
             section class="card" {
                 div class="card-h" {
@@ -512,11 +616,13 @@ fn render_tool_row(
 }
 
 /// One backend's section of the "My tools" page, also the htmx swap target of
-/// the hide/show forms (`hx-target="closest section"`).
+/// the hide/show forms (`hx-target="closest section"`). `can_grant` (the viewer
+/// holds `groups.manage`) turns the "ask an admin" hint into a link to the grants.
 pub(super) fn render_tool_backend_section(
     backend: &BackendInfo,
     effective: &EffectivePolicy,
     opt_outs: &OptOuts,
+    can_grant: bool,
 ) -> Markup {
     let granted = effective.backends().contains(&backend.name);
     let backend_hidden = opt_outs.hides_backend(&backend.name);
@@ -541,7 +647,12 @@ pub(super) fn render_tool_backend_section(
             }
             @if !granted {
                 p class="card-b muted" {
-                    "No access \u{2014} ask an admin"
+                    @if can_grant {
+                        "No grant yet. "
+                        a href="/ui/admin#grants" class="text-accent underline underline-offset-2" { "Add a grant" }
+                    } @else {
+                        "No access \u{2014} ask an admin"
+                    }
                 }
             } @else {
                 @if backend_hidden {
@@ -586,6 +697,8 @@ pub(super) fn render_my_tools_page(
         .filter(|backend| !backend.tools.is_empty())
         .collect();
     sections.sort_by(|a, b| a.name.cmp(&b.name));
+    let (_, permissions) = resolve(&state.policy.current(), user);
+    let can_grant = permissions.has(Permission::GroupsManage);
 
     let content = html! {
         div class="flex flex-col gap-4" {
@@ -601,6 +714,15 @@ pub(super) fn render_my_tools_page(
                     h2 { "Your groups" }
                 }
                 ul class="card-b m-0 flex list-none flex-col gap-2" {
+                    @if user.user.is_admin {
+                        li {
+                            code class="mono" { "admin" }
+                            span class="pill ml-2" { "from your identity provider" }
+                            span class="muted ml-2" {
+                                "Admin rights come from the provider's admin groups at login, not from a group here."
+                            }
+                        }
+                    }
                     @let policy = state.policy.current();
                     @for group in groups {
                         li {
@@ -621,24 +743,26 @@ pub(super) fn render_my_tools_page(
                 }
             }
             @for backend in sections {
-                (render_tool_backend_section(backend, effective, opt_outs))
+                (render_tool_backend_section(backend, effective, opt_outs, can_grant))
             }
         }
     };
     render_shell(state, user, "My tools", Nav::MyTools, &content)
 }
 
-/// Build/runtime fingerprint shown in page footers.
-pub(super) fn build_fingerprint(state: &AppState) -> String {
-    let started_utc: DateTime<Utc> = state.started_at.into();
-    let started = started_utc.format("%Y-%m-%d %H:%M:%S UTC");
+/// Build fingerprint shown in page footers, public pages included.
+pub(super) fn build_fingerprint(_state: &AppState) -> String {
     let git_sha = option_env!("AXON_GIT_SHA").unwrap_or("dev");
 
-    format!(
-        "v{} | {git_sha} | pid:{} | started:{started}",
-        env!("CARGO_PKG_VERSION"),
-        state.process_id
-    )
+    format!("v{} | {git_sha}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Process id and start time, for gateway admins only.
+pub(super) fn runtime_fingerprint(state: &AppState) -> String {
+    let started_utc: DateTime<Utc> = state.started_at.into();
+    let started = started_utc.format("%Y-%m-%d %H:%M:%S UTC");
+
+    format!("pid:{} | started:{started}", state.process_id)
 }
 
 fn build_mcp_server_url(base_url: &str) -> String {
@@ -722,9 +846,16 @@ pub(super) fn render_backend_panel(status: &DetailedGatewayStatus) -> Markup {
                         span class="pill err" { (down) " down" }
                     }
                     span class="spacer" {}
-                    span class="muted" { (status.backend_count) " active backend actors" }
+                    span class="muted" { (status.backend_count) " running" }
                 }
-                div class="card-b" {
+                div class="card-b flex flex-col gap-3" {
+                    p class="muted" {
+                        "Whether you may use a backend is on "
+                        a href="/ui/tools" class="text-accent underline underline-offset-2" { "My tools" }
+                        "; servers you connect yourself are on "
+                        a href="/ui/catalog" class="text-accent underline underline-offset-2" { "Catalog" }
+                        "."
+                    }
                     @if status.backends.is_empty() {
                         p class="muted" { "No backends currently connected." }
                     } @else {

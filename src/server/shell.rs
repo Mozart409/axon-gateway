@@ -16,7 +16,7 @@ use axum_extra::extract::CookieJar;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
 
-use super::views::{build_fingerprint, csrf_hx_headers};
+use super::views::{build_fingerprint, csrf_hx_headers, runtime_fingerprint};
 use super::{AppState, session};
 use crate::policy::Permission;
 use crate::rbac::resolve;
@@ -243,6 +243,8 @@ struct NavAccess {
     personal_admin: bool,
     /// The first configuration page the user may open
     config_href: Option<&'static str>,
+    /// Gateway settings and the runtime fingerprint (`gateway.admin`)
+    gateway_admin: bool,
 }
 
 /// The brand, the grouped links and the build fingerprint. It renders twice,
@@ -267,11 +269,11 @@ fn nav_contents(state: &AppState, access: &NavAccess, active: Nav, in_drawer: bo
         div class="nav-label" { "Workspace" }
         (nav_item(active, Nav::Overview, "/ui", "layout-dashboard", "Overview"))
         (nav_item(active, Nav::MyTools, "/ui/tools", "wrench", "My tools"))
-        (nav_item(active, Nav::Usage, "/ui/me/usage", "activity", "Usage"))
+        (nav_item(active, Nav::Usage, "/ui/me/usage", "activity", "My usage"))
         div class="nav-label" { "Access" }
         (nav_item(active, Nav::Tokens, "/ui/tokens", "key-round", "Tokens"))
         (nav_item(active, Nav::ConnectedApps, "/ui/me/apps", "app-window", "Connected apps"))
-        (nav_item(active, Nav::Toolsets, "/ui/toolsets", "layers", "Toolsets"))
+        (nav_item(active, Nav::Toolsets, "/ui/toolsets", "layers", "My toolsets"))
         @if access.personal {
             div class="nav-label" { "Servers" }
             (nav_item(active, Nav::MyServers, "/ui/me/backends", "server", "My MCP servers"))
@@ -329,7 +331,7 @@ fn nav_contents(state: &AppState, access: &NavAccess, active: Nav, in_drawer: bo
                 "list",
                 "Tool calls",
             ))
-            (nav_item(active, Nav::AdminUsage, "/ui/admin/usage", "activity", "Usage"))
+            (nav_item(active, Nav::AdminUsage, "/ui/admin/usage", "activity", "All usage"))
             (nav_item(
                 active,
                 Nav::AdminAuditSettings,
@@ -342,8 +344,21 @@ fn nav_contents(state: &AppState, access: &NavAccess, active: Nav, in_drawer: bo
             div class="nav-label" { "Config" }
             (nav_item(active, Nav::Config, href, "sliders-horizontal", "Config"))
         }
+        (side_foot(state, access))
+    }
+}
+
+/// The build fingerprint; gateway admins also see the process id and start.
+fn side_foot(state: &AppState, access: &NavAccess) -> Markup {
+    html! {
         div class="side-foot" {
-            span class="mono muted" { (build_fingerprint(state)) }
+            span class="mono muted" {
+                (build_fingerprint(state))
+                @if access.gateway_admin {
+                    " | "
+                    (runtime_fingerprint(state))
+                }
+            }
         }
     }
 }
@@ -396,6 +411,7 @@ pub(super) fn render_shell(
         read_audit: permissions.has(Permission::AuditRead),
         personal_admin: manage_users && state.personal.is_some(),
         config_href,
+        gateway_admin: permissions.has(Permission::GatewayAdmin),
     };
     let name = user
         .user

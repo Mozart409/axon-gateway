@@ -56,7 +56,7 @@ fn render_fields(toolset: Option<&Toolset>, granted: &[String]) -> Markup {
                 name="name"
                 maxlength="64"
                 pattern="[a-z0-9_\\-]+"
-                placeholder="daily-ops"
+                placeholder="e.g. daily-ops"
                 value=(toolset.map_or("", |toolset| toolset.name.as_str()))
                 required;
         }
@@ -71,7 +71,7 @@ fn render_fields(toolset: Option<&Toolset>, granted: &[String]) -> Markup {
         }
         label class=(LABEL) {
             "Tool globs (one per line, none: no narrowing)"
-            textarea class=(format!("{INPUT} w-72 font-mono")) name="tools" rows="4" placeholder="prom_*" {
+            textarea class=(format!("{INPUT} w-72 font-mono")) name="tools" rows="4" placeholder="e.g. prom_*" {
                 (tools)
             }
         }
@@ -180,7 +180,7 @@ pub(super) fn render_toolsets_page(
         (render_flash_area(false))
         (render_toolsets_section(toolsets, backends))
     };
-    render_layout(state, user, "Toolsets", Nav::Toolsets, &content)
+    render_layout(state, user, "My toolsets", Nav::Toolsets, &content)
 }
 
 #[cfg(test)]

@@ -18,6 +18,19 @@ pub struct StoreCounts {
     pub service_tokens: u64,
 }
 
+/// What the overview's setup checklist looks for in the database
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetupCounts {
+    /// Stored OIDC providers with a non-empty `admin_groups`
+    pub admin_group_providers: u64,
+    /// Stored shared backends and catalog entries
+    pub backends: u64,
+    /// Grants of any group
+    pub grants: u64,
+    /// Tokens neither revoked nor expired, and MCP OAuth grants not revoked
+    pub clients: u64,
+}
+
 /// The connections of the pool, as the pool counts them
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolStats {
@@ -71,6 +84,36 @@ impl Store {
             }
         }
         Ok(counts)
+    }
+
+    /// The rows the setup checklist counts.
+    ///
+    /// # Errors
+    /// Fails when a query fails.
+    pub async fn setup_counts(&self) -> Result<SetupCounts, StoreError> {
+        let row = sqlx::query(
+            "select \
+               (select count(*) from oidc_providers \
+                 where jsonb_typeof(spec -> 'admin_groups') = 'array' \
+                   and jsonb_array_length(spec -> 'admin_groups') > 0) as admin_group_providers, \
+               (select count(*) from gateway_backends) \
+                 + (select count(*) from catalog_entries) as backends, \
+               (select count(*) from rbac_grants) as grants, \
+               (select count(*) from api_tokens \
+                 where revoked_at is null and expires_at > now()) \
+                 + (select count(*) from oauth_grants where revoked_at is null) as clients",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let count = |column: &str| -> Result<u64, sqlx::Error> {
+            Ok(u64::try_from(row.try_get::<i64, _>(column)?).unwrap_or(0))
+        };
+        Ok(SetupCounts {
+            admin_group_providers: count("admin_group_providers")?,
+            backends: count("backends")?,
+            grants: count("grants")?,
+            clients: count("clients")?,
+        })
     }
 
     /// The pool's connections: idle, in use and the configured maximum.
