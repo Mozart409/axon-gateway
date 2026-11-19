@@ -11,3 +11,13 @@ timeout = 20
 # link checker, so skip every private address; only real external URLs are
 # checked.
 exclude_all_private = true
+
+# Named private hosts that `exclude_all_private` cannot know about: the
+# homelab's internal DNS zone, Tailscale tailnets, and Kubernetes in-cluster
+# service names. They appear in the example configs and Helm values on
+# purpose; a link checker can never reach them.
+exclude = [
+  'https?://[^/]*\.homelab\.internal',
+  'https?://[^/]*\.ts\.net',
+  '\.svc(\.cluster\.local)?(:[0-9]+)?/',
+]
