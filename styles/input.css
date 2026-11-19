@@ -371,6 +371,11 @@
   .drawer[popover]:not(:popover-open) { display: none; }
   .drawer[popover]:popover-open { display: flex; }
   .drawer[popover]::backdrop { background: var(--scrim); }
+  .modal { margin: auto; padding: 20px; width: min(480px, calc(100% - 32px)); background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 16px 40px rgba(0,0,0,.25); }
+  .modal[open] { display: flex; flex-direction: column; gap: 12px; }
+  .modal h2 { font-size: 16px; font-weight: 600; }
+  .modal::backdrop { background: var(--scrim); }
+  .modal-f { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 4px; }
   .drawer-form { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
   .field-error { display: none; font-size: 11.5px; color: var(--err); }

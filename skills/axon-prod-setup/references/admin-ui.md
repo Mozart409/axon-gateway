@@ -20,7 +20,7 @@ The "Admin" link in the user bar is shown to users with `groups.manage` or
 | `/ui/admin/tool-calls` (+ detail) | Tool-call records | `audit.read`; stored arguments need `audit.read_sensitive` |
 | `/ui/admin/usage` (+ per-user) | Usage views | `audit.read` |
 | `/ui/admin/audit-settings` | Retention (1–3650 days), capture rules | `audit.read` to see, `gateway.admin` to change |
-| `/ui/admin/config/backends` (+ detail) | Shared backends and catalog entries, Mode column; the form edits every credential mode | write `backends.manage`, read `backends.view`/`backends.manage` |
+| `/ui/admin/config/backends` (+ detail) | Shared backends and catalog entries, Mode column; the form edits every credential mode; switching a stored mode asks for confirmation and deletes the old mode's settings | write `backends.manage`, read `backends.view`/`backends.manage` |
 | `/ui/admin/config/toolsets` | Gateway toolsets (`[[toolsets]]`), tab "Gateway toolsets" | as the backends |
 | `/ui/admin/config/oidc-providers` | OIDC providers; shows "Values for your identity provider" (redirect URI, post-logout redirect URI, upstream OAuth callback) with copy buttons | `gateway.admin` |
 | `/ui/admin/config/settings` | Gateway settings (`rate_limit_per_minute`, `allowed_hosts`, `idle_timeout_secs`, `[personal_backends]`) | `gateway.admin` |

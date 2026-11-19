@@ -292,6 +292,10 @@ pub fn create_router(state: AppState) -> Router {
             "/static/copy-url.js",
             get(|| async { script(COPY_URL_JS, CACHE_ONE_HOUR) }),
         )
+        .route(
+            "/static/backend-form.js",
+            get(|| async { script(BACKEND_FORM_JS, CACHE_ONE_HOUR) }),
+        )
         // Fonts and the icon sprite are embedded too
         .route(
             "/static/fonts/Geist-Variable.woff2",
@@ -371,6 +375,7 @@ pub fn create_router(state: AppState) -> Router {
 const HTMX_JS: &str = include_str!("../static/htmx-2.0.4.min.js");
 const HTMX_SSE_JS: &str = include_str!("../static/htmx-ext-sse-2.2.2.js");
 const COPY_URL_JS: &str = include_str!("../static/copy-url.js");
+const BACKEND_FORM_JS: &str = include_str!("../static/backend-form.js");
 const GEIST_WOFF2: &[u8] = include_bytes!("../static/fonts/Geist-Variable.woff2");
 const GEIST_MONO_WOFF2: &[u8] = include_bytes!("../static/fonts/GeistMono-Variable.woff2");
 const ICONS_SVG: &[u8] = include_bytes!("../static/icons.svg");

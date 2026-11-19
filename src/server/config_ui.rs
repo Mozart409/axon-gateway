@@ -24,9 +24,10 @@ use super::AppState;
 use super::admin_ui::{AdminForm, error_response, flash_response, fragment, not_found, page_error};
 use super::config_api::{Area, BackendInput, ConfigApiError, ConfigCtx, ProviderInput};
 use super::config_views::{
-    FormEnv, PageCtx, render_backend_edit, render_backend_page, render_backends_page,
-    render_provider_edit, render_provider_page, render_providers_page, render_settings_page,
-    render_settings_section, render_toolset_edit, render_toolset_page, render_toolsets_page,
+    FormEnv, PageCtx, mode_name, mode_switch_loss, mode_value, render_backend_edit,
+    render_backend_page, render_backends_page, render_provider_edit, render_provider_page,
+    render_providers_page, render_settings_page, render_settings_section, render_toolset_edit,
+    render_toolset_page, render_toolsets_page,
 };
 use crate::config::{
     BackendConfig, CredentialField, CredentialMode, GatewaySettings, OidcProviderConfig,
@@ -542,6 +543,33 @@ async fn handle_backend_create(
     }
 }
 
+/// The refusal of a form that switches the credential mode away from `stored`
+/// without `confirm_mode_change=yes`; the dialog of the edit form sets it
+fn unconfirmed_mode_switch(
+    stored: CredentialMode,
+    pairs: &[(String, String)],
+) -> Option<AdminError> {
+    let mode = first(pairs, "credential_mode")?;
+    if mode == mode_value(stored) || first(pairs, "confirm_mode_change") == Some("yes") {
+        return None;
+    }
+    // An unknown mode is refused later, with its own message
+    let new = [
+        CredentialMode::Shared,
+        CredentialMode::PerUser,
+        CredentialMode::OAuth,
+        CredentialMode::Passthrough,
+    ]
+    .into_iter()
+    .find(|candidate| mode_value(*candidate) == mode)?;
+    Some(AdminError::Invalid(format!(
+        "Switching the credential mode from {} to {} was not confirmed. {} Save again and confirm the switch in the dialog.",
+        mode_name(stored),
+        mode_name(new),
+        mode_switch_loss(stored),
+    )))
+}
+
 /// Handle POST /ui/actions/admin/config/backends/{name}/update
 async fn handle_backend_update(
     State(state): State<AppState>,
@@ -557,6 +585,9 @@ async fn handle_backend_update(
         Ok(view) => view,
         Err(error) => return action_error(&error),
     };
+    if let Some(error) = unconfirmed_mode_switch(stored.config.credential_mode, &pairs) {
+        return error_response(&error);
+    }
     let input = match backend_input_of(stored.config, &pairs) {
         Ok(input) => input,
         Err(error) => return error_response(&error),
@@ -955,6 +986,28 @@ mod tests {
             secret_of(&cleared, "auth_token", "clear_auth_token"),
             Some(String::new())
         );
+    }
+
+    #[test]
+    fn a_mode_switch_needs_the_confirmation() {
+        let switch = pairs(&[("credential_mode", "oauth")]);
+        let error = unconfirmed_mode_switch(CredentialMode::PerUser, &switch).unwrap();
+        let AdminError::Invalid(message) = error else {
+            panic!("not an invalid-input error");
+        };
+        assert!(message.contains("from per user to OAuth"));
+        assert!(message.contains(mode_switch_loss(CredentialMode::PerUser)));
+        let empty = pairs(&[("credential_mode", "oauth"), ("confirm_mode_change", "")]);
+        assert!(unconfirmed_mode_switch(CredentialMode::PerUser, &empty).is_some());
+        let confirmed = pairs(&[("credential_mode", "oauth"), ("confirm_mode_change", "yes")]);
+        assert!(unconfirmed_mode_switch(CredentialMode::PerUser, &confirmed).is_none());
+    }
+
+    #[test]
+    fn saving_the_same_mode_or_no_mode_needs_no_confirmation() {
+        let same = pairs(&[("credential_mode", "per_user")]);
+        assert!(unconfirmed_mode_switch(CredentialMode::PerUser, &same).is_none());
+        assert!(unconfirmed_mode_switch(CredentialMode::PerUser, &pairs(&[])).is_none());
     }
 
     fn oauth_form() -> FormPairs {

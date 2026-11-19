@@ -116,7 +116,7 @@ fn lines(items: &[String]) -> String {
 }
 
 /// The value of a credential mode, as the form and the JSON API spell it
-fn mode_value(mode: CredentialMode) -> &'static str {
+pub(super) fn mode_value(mode: CredentialMode) -> &'static str {
     match mode {
         CredentialMode::Shared => "shared",
         CredentialMode::PerUser => "per_user",
@@ -126,12 +126,31 @@ fn mode_value(mode: CredentialMode) -> &'static str {
 }
 
 /// The credential mode as a table cell and a note read it
-fn mode_name(mode: CredentialMode) -> &'static str {
+pub(super) fn mode_name(mode: CredentialMode) -> &'static str {
     match mode {
         CredentialMode::Shared => "shared",
         CredentialMode::PerUser => "per user",
         CredentialMode::OAuth => "OAuth",
         CredentialMode::Passthrough => "passthrough",
+    }
+}
+
+/// What switching a backend away from `mode` deletes or stops using, as the
+/// confirmation dialog and the refusal of an unconfirmed switch say it
+pub(super) fn mode_switch_loss(mode: CredentialMode) -> &'static str {
+    match mode {
+        CredentialMode::Shared => {
+            "Nothing stored is deleted, but each user must set up their own access before the tools work for them."
+        }
+        CredentialMode::PerUser => {
+            "The credential fields users fill in are deleted. Credentials users already saved for this backend are no longer used."
+        }
+        CredentialMode::OAuth => {
+            "The OAuth client ID, the scopes and the stored client secret are deleted. Users' upstream sign-ins for this backend are no longer used."
+        }
+        CredentialMode::Passthrough => {
+            "The passthrough settings (grant, provider, audience, scope and resource) are deleted."
+        }
     }
 }
 
@@ -773,12 +792,19 @@ pub(super) fn render_backend_edit(
                 (saved_note())
             }
             @if ctx.can_write {
-                form hx-post=(format!("{base}/update")) hx-target=(EDIT) hx-swap="outerHTML" {
+                form
+                    hx-post=(format!("{base}/update"))
+                    hx-target=(EDIT)
+                    hx-swap="outerHTML"
+                    data-stored-mode=(mode_value(config.credential_mode))
+                {
+                    input type="hidden" name="confirm_mode_change" value="";
                     div class=(FORM_BODY) { (backend_fields(Some(view), ctx, env)) }
                     div class="card-f" {
                         button class="btn primary" type="submit" { "Save backend" }
                     }
                 }
+                (mode_change_dialog(config.credential_mode))
                 div class="card-f" {
                     button
                         class="btn danger"
@@ -796,6 +822,31 @@ pub(super) fn render_backend_edit(
     }
 }
 
+/// The dialog the edit form opens when the saved mode differs from the stored
+/// one; `backend-form.js` fills in the new mode and sends the form on confirm
+fn mode_change_dialog(stored: CredentialMode) -> Markup {
+    let deletes = stored != CredentialMode::Shared;
+    html! {
+        dialog id="mode-change-dialog" class="modal" aria-labelledby="mode-change-title" {
+            h2 id="mode-change-title" { "Switch the credential mode?" }
+            p {
+                "You are switching from " span class="mono" { (mode_name(stored)) }
+                " to " span class="mono" data-new-mode { "" } "."
+            }
+            p { (mode_switch_loss(stored)) }
+            @if deletes {
+                p { "This cannot be undone." }
+            }
+            div class="modal-f" {
+                button class="btn" type="button" data-mode-cancel { "Cancel" }
+                button class="btn danger" type="button" data-mode-confirm {
+                    @if deletes { "Switch and delete settings" } @else { "Switch mode" }
+                }
+            }
+        }
+    }
+}
+
 /// `GET /ui/admin/config/backends/{name}`
 pub(super) fn render_backend_page(
     state: &AppState,
@@ -807,6 +858,7 @@ pub(super) fn render_backend_page(
     let body = html! {
         (back_to("/ui/admin/config/backends", "All backends"))
         (render_backend_edit(view, ctx, env, false))
+        script src="/static/backend-form.js" defer {}
     };
     page(
         state,
@@ -1429,6 +1481,22 @@ mod tests {
         assert!(html.contains("stored; leave empty to keep it"));
         assert!(html.contains("name=\"header_remove\" value=\"X-Key\""));
         assert!(!html.contains("name=\"name\""));
+    }
+
+    #[test]
+    fn the_edit_form_guards_a_mode_switch_with_a_dialog() {
+        let mut stored = view();
+        stored.config.credential_mode = CredentialMode::PerUser;
+        let html = render_backend_edit(&stored, CTX, env(&[]), false).into_string();
+        assert!(html.contains("data-stored-mode=\"per_user\""));
+        assert!(html.contains("name=\"confirm_mode_change\""));
+        assert!(html.contains("id=\"mode-change-dialog\""));
+        assert!(html.contains(mode_switch_loss(CredentialMode::PerUser)));
+        assert!(html.contains("This cannot be undone."));
+        assert!(html.contains("Switch and delete settings"));
+        let shared = render_backend_edit(&view(), CTX, env(&[]), false).into_string();
+        assert!(!shared.contains("This cannot be undone."));
+        assert!(shared.contains("Switch mode"));
     }
 
     #[test]
