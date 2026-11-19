@@ -91,3 +91,22 @@ MCP servers). The ones you will reach for most:
 
 All of these need the dashboard session cookie and, for writes, the
 `X-CSRF-Token` header from the session; they answer 404 outside database mode.
+
+## UI gotchas to tell users
+
+- There are two "Toolsets" pages: `/ui/toolsets` holds a user's own toolsets,
+  which narrow their tokens; `/ui/admin/config/toolsets` holds the gateway
+  toolsets served at `/mcp/toolset/{name}`.
+- There are two "Usage" pages: `/ui/me/usage` (your own) and `/ui/admin/usage`
+  (everyone, needs `audit.read`).
+- The config pages live under the single sidebar entry "Config", with the tabs
+  Backends, Toolsets, OIDC providers and Settings.
+- The bootstrap provider from `AXON_OIDC_*` is listed with source `env` and is
+  read-only.
+- Admin via `admin_groups` is not a role binding: the `admin` role shows
+  Bindings 0 and "Your groups" on `/ui/tools` does not list it. The `admin`
+  badge in the header and the ADMIN column on `/ui/admin/users` are the signs.
+- The OIDC provider page does not show the redirect URI to register; tell the
+  user `{base_url}/auth/callback`.
+- The token form's backend list is a multi-select (Ctrl/Cmd-click); none
+  selected means all backends the user may use.
