@@ -215,8 +215,8 @@ axon-gateway/
 
 ## References
 
-- [MCP Specification](https://spec.modelcontextprotocol.io/)
-- [rmcp crate](https://github.com/anthropics/rmcp)
+- [MCP Specification](https://modelcontextprotocol.io/specification)
+- [rmcp crate](https://github.com/modelcontextprotocol/rust-sdk)
 - [kameo actor framework](https://github.com/tqwewe/kameo)
 - [MCPJungle](https://github.com/mcpjungle/MCPJungle) — Similar project in Go
 - [MetaMCP](https://github.com/metatool-ai/metamcp) — Docker-based aggregator
