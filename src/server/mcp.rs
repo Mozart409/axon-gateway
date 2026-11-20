@@ -425,7 +425,7 @@ fn outcome_of(response: Option<&JsonRpcResponse>) -> (CallOutcome, Option<i32>, 
 impl AxonMcp {
     /// Asks the gateway `method` with `params` on behalf of the caller of the
     /// request, audits it when it is a principal's `tools/call`, and turns the
-    /// answer into the rmcp result type `R`.
+    /// answer into the rmcp result type `R`, marked complete unless it says otherwise.
     async fn forward<P: Serialize, R: DeserializeOwned>(
         &self,
         auth: &McpCaller,
@@ -452,7 +452,15 @@ impl AxonMcp {
         if let Some(audit) = audit {
             audit.finish(&self.state, response.as_ref().ok(), slot);
         }
-        let result = into_result(response?)?;
+        let mut result = into_result(response?)?;
+        // 2026-07-28 requires `resultType` (SEP-2322), and the gateway's JSON has
+        // none; rmcp strips it again for peers on older versions. A `resultType`
+        // the backend already sent is kept.
+        if let Value::Object(fields) = &mut result {
+            fields
+                .entry("resultType")
+                .or_insert_with(|| Value::from("complete"));
+        }
         serde_json::from_value(result).map_err(|error| {
             tracing::error!("Gateway answered {method} with an unexpected result: {error}");
             ErrorData::internal_error("gateway error", None)
@@ -889,6 +897,21 @@ mod tests {
         let payload = call("/mcp", "tools/list", None, json!({})).await;
         assert_eq!(payload["id"], 7);
         assert_eq!(payload["result"]["tools"], json!([]));
+    }
+
+    /// 2026-07-28 (SEP-2322) requires `resultType` on every result; the list
+    /// results also carry rmcp's cache hints.
+    #[rstest::rstest]
+    #[case("tools/list")]
+    #[case("prompts/list")]
+    #[case("resources/list")]
+    #[tokio::test]
+    async fn modern_list_results_are_marked_complete(#[case] method: &str) {
+        let payload = call("/mcp", method, None, json!({})).await;
+        let result = &payload["result"];
+        assert_eq!(result["resultType"], "complete", "{payload}");
+        assert!(result["ttlMs"].is_u64(), "{payload}");
+        assert!(result["cacheScope"].is_string(), "{payload}");
     }
 
     #[tokio::test]

@@ -156,6 +156,36 @@ async fn stateless_requests_work_without_initialize() {
     assert_eq!(backend.call_count("echo"), 1);
 }
 
+/// A 2026-07-28 client gets `resultType: "complete"` on the listing and on a
+/// relayed tool call (SEP-2322).
+#[tokio::test]
+async fn stateless_results_are_marked_complete() {
+    let backend = MockBackend::start(&["echo"]).await;
+    let (server, _) = start_gateway(|bind| {
+        ConfigBuilder::new(bind)
+            .http_backend("mock", &backend.url())
+            .render()
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let mcp = format!("{}/mcp", server.base);
+
+    wait_for_tools(&client, &mcp, None, 1).await;
+    let (status, listed) = mcp_post(&client, &mcp, None, &rpc("tools/list")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["result"]["resultType"], "complete", "{listed}");
+
+    let (status, called) = mcp_post(
+        &client,
+        &mcp,
+        None,
+        &rpc_call("mock_echo", json!({ "value": 7 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{called}");
+    assert_eq!(called["result"]["resultType"], "complete", "{called}");
+}
+
 #[tokio::test]
 async fn stateless_requests_carry_the_bearer_token() {
     let backend = MockBackend::start(&["echo"]).await;
@@ -256,6 +286,8 @@ async fn a_2025_11_25_client_initializes_and_uses_a_session() {
         raw_post(&client, &mcp, None, &rpc("tools/list"), &session_headers).await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert_eq!(listed["result"]["tools"][0]["name"], "mock_echo");
+    // Before 2026-07-28 results have no `resultType`.
+    assert!(listed["result"].get("resultType").is_none(), "{listed}");
 }
 
 #[tokio::test]
