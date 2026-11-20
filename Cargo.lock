@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "axon-gateway"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "aws-lc-rs",

@@ -2,6 +2,13 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## v0.8.1 - 2026-11-20
+#### Features
+- (**deps**) upgrade flake - (fbacce8) - Amadeus Mader
+#### Bug Fixes
+- (**axon**) mark forwarded mcp results as complete for 2026-07-28 clients - (611d384) - Amadeus Mader
+
+- - -
 ## v0.8.0 - 2026-11-19
 #### Features
 - (**axon**) confirm a backend credential mode switch in a dialog and refuse an unconfirmed one - (f83c9b5) - Amadeus Mader
